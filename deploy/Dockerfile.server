@@ -1,0 +1,5 @@
+FROM debian:stable-slim
+COPY publish/linux-musl/starskiff-server /app/starskiff-server
+EXPOSE 24930 24932/tcp 24931/udp
+VOLUME /data
+ENTRYPOINT ["/app/starskiff-server", "serve", "--db", "/data/starskiff.sqlite"]

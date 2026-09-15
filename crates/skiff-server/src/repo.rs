@@ -1,0 +1,958 @@
+//! Repositories over the SQLite schema. Row mapping is hand-written; column
+//! names must match the SQL exactly.
+
+use std::collections::HashSet;
+use std::net::Ipv4Addr;
+use std::path::Path;
+
+use rusqlite::{OptionalExtension, params};
+use skiff_core::crypto::tokens::{make_device_token, make_enroll_token, sha256_hex, split_token};
+use skiff_core::ipam::{Cidr, IpPool};
+use skiff_core::logging::unix_ms;
+use skiff_core::models::{DeviceSettings, NetId};
+
+use crate::db::Db;
+
+// ---------------------------------------------------------------------------
+// Rows
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct NetworkRow {
+    pub id: NetId,
+    pub name: String,
+    pub cidr: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceRow {
+    pub id: u64,
+    pub name: String,
+    pub pubkey_sign: String,
+    pub pubkey_dh: String,
+    pub token_hash: String,
+    pub relay_key: String,
+    pub created_at: i64,
+    pub last_seen: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenRow {
+    pub token: String,
+    pub network_id: NetId,
+    pub uses_left: i64,
+    pub expires_at: i64,
+    pub requested_ip: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MembershipRow {
+    pub network_id: NetId,
+    pub device_id: u64,
+    pub ip: String,
+}
+
+fn map_network(row: &rusqlite::Row<'_>) -> rusqlite::Result<NetworkRow> {
+    let id_blob: Vec<u8> = row.get("id")?;
+    Ok(NetworkRow {
+        id: NetId(id_blob.try_into().expect("network id is 16 bytes")),
+        name: row.get("name")?,
+        cidr: row.get("cidr")?,
+        created_at: row.get("created_at")?,
+    })
+}
+
+fn map_device(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRow> {
+    Ok(DeviceRow {
+        id: row.get::<_, i64>("id")? as u64,
+        name: row.get("name")?,
+        pubkey_sign: row.get("pubkey_sign")?,
+        pubkey_dh: row.get("pubkey_dh")?,
+        token_hash: row.get("token_hash")?,
+        relay_key: row.get("relay_key")?,
+        created_at: row.get("created_at")?,
+        last_seen: row.get("last_seen")?,
+    })
+}
+
+fn map_token(row: &rusqlite::Row<'_>) -> rusqlite::Result<TokenRow> {
+    let network_id: Vec<u8> = row.get("network_id")?;
+    Ok(TokenRow {
+        token: row.get("token")?,
+        network_id: NetId(network_id.try_into().expect("network id is 16 bytes")),
+        uses_left: row.get("uses_left")?,
+        expires_at: row.get("expires_at")?,
+        requested_ip: row.get("requested_ip")?,
+    })
+}
+
+fn map_membership(row: &rusqlite::Row<'_>) -> rusqlite::Result<MembershipRow> {
+    let network_id: Vec<u8> = row.get("network_id")?;
+    Ok(MembershipRow {
+        network_id: NetId(network_id.try_into().expect("network id is 16 bytes")),
+        device_id: row.get::<_, i64>("device_id")? as u64,
+        ip: row.get("ip")?,
+    })
+}
+
+/// Random non-zero device id.
+pub fn new_device_id() -> u64 {
+    use rand_core::{OsRng, RngCore};
+    loop {
+        let id = OsRng.next_u64();
+        if id != 0 {
+            return id;
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RepoError {
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Db(#[from] crate::db::DbError),
+    #[error("{0}")]
+    Conflict(String),
+}
+
+// ---------------------------------------------------------------------------
+// Repo
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct Repo {
+    db: Db,
+}
+
+#[derive(Debug)]
+pub struct EnrollResult {
+    pub device_id: u64,
+    pub device_token: String,
+    pub network: NetworkRow,
+    pub ip: String,
+}
+
+#[derive(Debug)]
+pub struct JoinResult {
+    pub network: NetworkRow,
+    pub ip: String,
+    pub already_member: bool,
+}
+
+impl Repo {
+    pub fn open(path: &Path) -> Result<Repo, crate::db::DbError> {
+        Ok(Repo {
+            db: Db::open(path)?,
+        })
+    }
+
+    pub fn from_db(db: Db) -> Repo {
+        Repo { db }
+    }
+
+    // settings ---------------------------------------------------------------
+
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>, crate::db::DbError> {
+        self.db.with(|c| {
+            c.query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()
+        })
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<(), crate::db::DbError> {
+        self.db.with(|c| {
+            c.execute(
+                "INSERT INTO settings(key, value) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )?;
+            Ok(())
+        })
+    }
+
+    // device_settings ---------------------------------------------------------
+
+    /// 读设备的托管配置；无记录时返回 revision=0 的空配置（全部未托管）。
+    pub fn get_device_settings(&self, device_id: u64) -> Result<DeviceSettings, RepoError> {
+        let row = self.db.with(|c| {
+            c.query_row(
+                "SELECT revision, json FROM device_settings WHERE device_id = ?1",
+                params![device_id as i64],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()
+        })?;
+        match row {
+            Some((revision, json)) => {
+                let mut settings: DeviceSettings =
+                    serde_json::from_str(&json).map_err(|e| RepoError::Conflict(format!("device_settings JSON 无效: {e}")))?;
+                settings.revision = revision; // 列是 revision 的权威来源
+                Ok(settings)
+            }
+            None => Ok(DeviceSettings::default()),
+        }
+    }
+
+    /// 收编（adopt）：仅用候选值填充**当前未托管**的字段（字段级合并），
+    /// 已托管字段保持服务端值不动。用于节点把遗留本地配置零感迁移为
+    /// 服务端托管。返回合并后的最新配置。
+    pub fn adopt_device_settings(
+        &self,
+        device_id: u64,
+        candidate: &DeviceSettings,
+    ) -> Result<DeviceSettings, RepoError> {
+        let current = self.get_device_settings(device_id)?;
+        let mut merged = current.clone();
+        if merged.force_relay.is_none() {
+            merged.force_relay = candidate.force_relay;
+        }
+        if merged.force_direct.is_none() {
+            merged.force_direct = candidate.force_direct;
+        }
+        if merged.mtu.is_none() {
+            merged.mtu = candidate.mtu;
+        }
+        if merged.socks_listen.is_none() {
+            merged.socks_listen = candidate.socks_listen.clone();
+        }
+        if merged.forwards.is_none() {
+            merged.forwards = candidate.forwards.clone();
+        }
+        if merged.exposes.is_none() {
+            merged.exposes = candidate.exposes.clone();
+        } else if let Some(cur) = &mut merged.exposes
+            && let Some(cand) = &candidate.exposes
+        {
+            // 逐网络合并：已有托管规则的网络不动，其余采纳候选。
+            for ne in cand {
+                if !cur.iter().any(|x| x.network_id == ne.network_id) {
+                    cur.push(ne.clone());
+                }
+            }
+        }
+        if merged == current {
+            return Ok(current); // 无可收编项：不产生新 revision
+        }
+        self.set_device_settings(device_id, &merged)
+    }
+
+    /// 保存托管配置：事务内 revision+1 后整体覆盖，返回落库后的值。
+    pub fn set_device_settings(
+        &self,
+        device_id: u64,
+        update: &DeviceSettings,
+    ) -> Result<DeviceSettings, RepoError> {
+        let mut stored = update.clone();
+        stored.revision = 0; // json 内不存 revision，列权威
+        let json = serde_json::to_string(&stored).map_err(|e| RepoError::Conflict(format!("序列化失败: {e}")))?;
+        let next = self.db.with_tx(|tx| -> Result<i64, RepoError> {
+            let current: i64 = tx
+                .query_row(
+                    "SELECT revision FROM device_settings WHERE device_id = ?1",
+                    params![device_id as i64],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            let next = current + 1;
+            tx.execute(
+                "INSERT INTO device_settings(device_id, revision, json, updated_at)
+                 VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(device_id) DO UPDATE SET
+                    revision = excluded.revision, json = excluded.json, updated_at = excluded.updated_at",
+                params![device_id as i64, next, json, unix_ms()],
+            )?;
+            Ok(next)
+        })?;
+        stored.revision = next;
+        Ok(stored)
+    }
+
+    // networks ---------------------------------------------------------------
+
+    pub fn create_network(&self, name: &str, cidr: &str) -> Result<NetworkRow, RepoError> {
+        let now = unix_ms();
+        let id = NetId::random();
+        // 查重与插入之间的竞态由 networks.name UNIQUE 兜底：约束冲突映射为
+        // Conflict（调用方返回 409）而非 500。
+        let inserted = self.db.with(|c| {
+            c.execute(
+                "INSERT INTO networks(id, name, cidr, created_at) VALUES(?1, ?2, ?3, ?4)",
+                params![id.as_bytes(), name, cidr, now],
+            )?;
+            Ok(())
+        });
+        match inserted {
+            Ok(()) => {}
+            Err(crate::db::DbError::Sqlite(rusqlite::Error::SqliteFailure(e, _)))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Err(RepoError::Conflict("同名网络已存在".into()));
+            }
+            Err(e) => return Err(e.into()),
+        }
+        Ok(NetworkRow {
+            id,
+            name: name.to_string(),
+            cidr: cidr.to_string(),
+            created_at: now,
+        })
+    }
+
+    pub fn get_network(&self, id: NetId) -> Result<Option<NetworkRow>, crate::db::DbError> {
+        self.db.with(|c| {
+            c.query_row(
+                "SELECT * FROM networks WHERE id = ?1",
+                params![id.as_bytes()],
+                map_network,
+            )
+            .optional()
+        })
+    }
+
+    pub fn get_network_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<NetworkRow>, crate::db::DbError> {
+        self.db.with(|c| {
+            c.query_row(
+                "SELECT * FROM networks WHERE name = ?1",
+                params![name],
+                map_network,
+            )
+            .optional()
+        })
+    }
+
+    pub fn list_networks(&self) -> Result<Vec<NetworkRow>, crate::db::DbError> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare("SELECT * FROM networks ORDER BY created_at")?;
+            let rows = stmt
+                .query_map([], map_network)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    pub fn delete_network(&self, id: NetId) -> Result<bool, RepoError> {
+        self.db.with_tx(|c| {
+            let n = c.execute(
+                "DELETE FROM memberships WHERE network_id = ?1",
+                params![id.as_bytes()],
+            )?;
+            let _ = n;
+            c.execute(
+                "DELETE FROM enroll_tokens WHERE network_id = ?1",
+                params![id.as_bytes()],
+            )?;
+            let deleted =
+                c.execute("DELETE FROM networks WHERE id = ?1", params![id.as_bytes()])?;
+            Ok(deleted > 0)
+        })
+    }
+
+    // devices ----------------------------------------------------------------
+
+    pub fn create_device(
+        &self,
+        name: &str,
+        sign_pub: &str,
+        dh_pub: &str,
+        device_token: &str,
+    ) -> Result<(u64, i64), crate::db::DbError> {
+        let id = new_device_id();
+        let now = unix_ms();
+        let hash = sha256_hex(device_token);
+        self.db.with(|c| {
+            c.execute(
+                "INSERT INTO devices(id, name, pubkey_sign, pubkey_dh, token_hash, relay_key, created_at, last_seen)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?5, ?6, 0)",
+                params![id as i64, name, sign_pub, dh_pub, hash, now],
+            )?;
+            Ok(())
+        })?;
+        Ok((id, now))
+    }
+
+    pub fn get_device(&self, id: u64) -> Result<Option<DeviceRow>, crate::db::DbError> {
+        self.db.with(|c| {
+            c.query_row(
+                "SELECT * FROM devices WHERE id = ?1",
+                params![id as i64],
+                map_device,
+            )
+            .optional()
+        })
+    }
+
+    pub fn find_device_by_token_hash(
+        &self,
+        hash: &str,
+    ) -> Result<Option<DeviceRow>, crate::db::DbError> {
+        self.db.with(|c| {
+            c.query_row(
+                "SELECT * FROM devices WHERE token_hash = ?1 ORDER BY id LIMIT 1",
+                params![hash],
+                map_device,
+            )
+            .optional()
+        })
+    }
+
+    pub fn list_devices(&self) -> Result<Vec<DeviceRow>, crate::db::DbError> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare("SELECT * FROM devices ORDER BY created_at")?;
+            stmt.query_map([], map_device)?
+                .collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    pub fn delete_device(&self, id: u64) -> Result<bool, RepoError> {
+        self.db.with_tx(|c| {
+            c.execute(
+                "DELETE FROM memberships WHERE device_id = ?1",
+                params![id as i64],
+            )?;
+            let deleted = c.execute("DELETE FROM devices WHERE id = ?1", params![id as i64])?;
+            Ok(deleted > 0)
+        })
+    }
+
+    pub fn touch_device(&self, id: u64) -> Result<(), crate::db::DbError> {
+        self.db.with(|c| {
+            c.execute(
+                "UPDATE devices SET last_seen = ?1 WHERE id = ?2",
+                params![unix_ms(), id as i64],
+            )?;
+            Ok(())
+        })
+    }
+
+    // enroll tokens ----------------------------------------------------------
+
+    pub fn create_token(
+        &self,
+        network_id: NetId,
+        uses: i64,
+        ttl_ms: i64,
+        requested_ip: Option<&str>,
+    ) -> Result<TokenRow, crate::db::DbError> {
+        let token = make_enroll_token();
+        let now = unix_ms();
+        let expires = now + ttl_ms;
+        self.db.with(|c| {
+            c.execute(
+                "INSERT INTO enroll_tokens(token, network_id, uses_left, expires_at, requested_ip, created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                params![token, network_id.as_bytes(), uses, expires, requested_ip, now],
+            )?;
+            Ok(())
+        })?;
+        Ok(TokenRow {
+            token,
+            network_id,
+            uses_left: uses,
+            expires_at: expires,
+            requested_ip: requested_ip.map(String::from),
+        })
+    }
+
+    pub fn get_token(
+        &self,
+        token_with_suffix: &str,
+    ) -> Result<Option<TokenRow>, crate::db::DbError> {
+        let (bare, _) = split_token(token_with_suffix);
+        self.db.with(|c| {
+            c.query_row(
+                "SELECT * FROM enroll_tokens WHERE token = ?1",
+                params![bare],
+                map_token,
+            )
+            .optional()
+        })
+    }
+
+    pub fn list_tokens(&self) -> Result<Vec<TokenRow>, crate::db::DbError> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare("SELECT * FROM enroll_tokens ORDER BY rowid")?;
+            stmt.query_map([], map_token)?
+                .collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    pub fn delete_token(&self, token_with_suffix: &str) -> Result<bool, crate::db::DbError> {
+        let (bare, _) = split_token(token_with_suffix);
+        self.db.with(|c| {
+            Ok(c.execute("DELETE FROM enroll_tokens WHERE token = ?1", params![bare])? > 0)
+        })
+    }
+
+    /// Atomically decrement uses; `true` when a use was consumed.
+    pub fn consume_token_use(
+        tx: &rusqlite::Transaction<'_>,
+        bare_token: &str,
+    ) -> Result<bool, crate::db::DbError> {
+        let n = tx.execute(
+            "UPDATE enroll_tokens SET uses_left = uses_left - 1 WHERE token = ?1 AND uses_left > 0",
+            params![bare_token],
+        )?;
+        Ok(n > 0)
+    }
+
+    // memberships ------------------------------------------------------------
+
+    pub fn memberships_of_network(
+        &self,
+        network_id: NetId,
+    ) -> Result<Vec<MembershipRow>, crate::db::DbError> {
+        self.db.with(|c| {
+            let mut stmt =
+                c.prepare("SELECT * FROM memberships WHERE network_id = ?1 ORDER BY ip")?;
+            stmt.query_map(params![network_id.as_bytes()], map_membership)?
+                .collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    pub fn membership_of(
+        &self,
+        network_id: NetId,
+        device_id: u64,
+    ) -> Result<Option<MembershipRow>, crate::db::DbError> {
+        self.db.with(|c| {
+            c.query_row(
+                "SELECT * FROM memberships WHERE network_id = ?1 AND device_id = ?2",
+                params![network_id.as_bytes(), device_id as i64],
+                map_membership,
+            )
+            .optional()
+        })
+    }
+
+    pub fn memberships_of_device(
+        &self,
+        device_id: u64,
+    ) -> Result<Vec<MembershipRow>, crate::db::DbError> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare("SELECT * FROM memberships WHERE device_id = ?1 ORDER BY network_id")?;
+            stmt.query_map(params![device_id as i64], map_membership)?
+                .collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    pub fn all_memberships(&self) -> Result<Vec<MembershipRow>, crate::db::DbError> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare("SELECT * FROM memberships")?;
+            stmt.query_map([], map_membership)?
+                .collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    pub fn update_membership_ip(
+        &self,
+        network_id: NetId,
+        device_id: u64,
+        ip: &str,
+    ) -> Result<(), crate::db::DbError> {
+        self.db.with(|c| {
+            c.execute(
+                "UPDATE memberships SET ip = ?1 WHERE network_id = ?2 AND device_id = ?3",
+                params![ip, network_id.as_bytes(), device_id as i64],
+            )?;
+            Ok(())
+        })
+    }
+
+    // enroll (the one real transaction) ---------------------------------------
+
+    /// Enroll a new device. IP precedence: requested-by-caller, then the
+    /// token's requested_ip, then sequential pool allocation. Fails with a
+    /// user-facing message.
+    pub fn enroll(
+        &self,
+        enroll_token_with_suffix: &str,
+        name: &str,
+        sign_pubkey: &str,
+        dh_pubkey: &str,
+        requested_ip: Option<&str>,
+    ) -> Result<EnrollResult, RepoError> {
+        let (bare, _) = split_token(enroll_token_with_suffix);
+        let now = unix_ms();
+
+        self.db.with_tx(|tx| {
+            let token: Option<TokenRow> = tx
+                .query_row("SELECT * FROM enroll_tokens WHERE token = ?1", params![bare], map_token)
+                .optional()?;
+            let Some(token) = token else {
+                return Err(RepoError::Conflict("注册令牌不存在".into()));
+            };
+            if token.expires_at < now {
+                return Err(RepoError::Conflict("注册令牌已过期".into()));
+            }
+            if token.uses_left <= 0 {
+                return Err(RepoError::Conflict("注册令牌已用尽".into()));
+            }
+
+            let network: Option<NetworkRow> = tx
+                .query_row("SELECT * FROM networks WHERE id = ?1", params![token.network_id.as_bytes()], map_network)
+                .optional()?;
+            let Some(network) = network else {
+                return Err(RepoError::Conflict("令牌所属网络已不存在".into()));
+            };
+
+            let cidr = Cidr::parse(&network.cidr)
+                .map_err(|_| RepoError::Conflict(format!("网络 {} 的 CIDR 配置无效", network.name)))?;
+            let mut used: HashSet<u32> = HashSet::new();
+            {
+                let mut stmt = tx.prepare("SELECT ip FROM memberships WHERE network_id = ?1")?;
+                let ips = stmt.query_map(params![token.network_id.as_bytes()], |r| r.get::<_, String>(0))?;
+                for ip in ips {
+                    if let Ok(addr) = ip?.parse::<Ipv4Addr>() {
+                        used.insert(u32::from(addr));
+                    }
+                }
+            }
+
+            let chosen: u32 = if let Some(req) = requested_ip.or(token.requested_ip.as_deref()) {
+                IpPool::validate_manual(req, &cidr, &used, None)
+                    .map_err(RepoError::Conflict)?
+            } else {
+                IpPool::allocate(&cidr, &used)
+                    .ok_or_else(|| RepoError::Conflict(format!("网络 {}（{}）已无可分配地址", network.name, network.cidr)))?
+            };
+            let ip_text = Ipv4Addr::from(chosen).to_string();
+
+            let device_token = make_device_token();
+            let device_id = new_device_id();
+            let hash = sha256_hex(&device_token);
+            tx.execute(
+                "INSERT INTO devices(id, name, pubkey_sign, pubkey_dh, token_hash, relay_key, created_at, last_seen)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?5, ?6, 0)",
+                params![device_id as i64, name, sign_pubkey, dh_pubkey, hash, now],
+            )?;
+            tx.execute(
+                "INSERT INTO memberships(network_id, device_id, ip) VALUES(?1, ?2, ?3)",
+                params![token.network_id.as_bytes(), device_id as i64, ip_text],
+            )?;
+            if !Self::consume_token_use(tx, &bare)? {
+                return Err(RepoError::Conflict("注册令牌已用尽".into()));
+            }
+
+            Ok(EnrollResult { device_id, device_token, network, ip: ip_text })
+        })
+    }
+
+    /// An existing device joins another network using an enroll token.
+    /// Idempotent: already-a-member returns the current membership.
+    pub fn join_network(
+        &self,
+        device_id: u64,
+        enroll_token_with_suffix: &str,
+        requested_ip: Option<&str>,
+    ) -> Result<JoinResult, RepoError> {
+        let (bare, _) = split_token(enroll_token_with_suffix);
+        let now = unix_ms();
+
+        self.db.with_tx(|tx| {
+            let token: Option<TokenRow> = tx
+                .query_row("SELECT * FROM enroll_tokens WHERE token = ?1", params![bare], map_token)
+                .optional()?;
+            let Some(token) = token else {
+                return Err(RepoError::Conflict("注册令牌不存在".into()));
+            };
+            if token.expires_at < now {
+                return Err(RepoError::Conflict("注册令牌已过期".into()));
+            }
+            if token.uses_left <= 0 {
+                return Err(RepoError::Conflict("注册令牌已用尽".into()));
+            }
+            let network: Option<NetworkRow> = tx
+                .query_row("SELECT * FROM networks WHERE id = ?1", params![token.network_id.as_bytes()], map_network)
+                .optional()?;
+            let Some(network) = network else {
+                return Err(RepoError::Conflict("令牌所属网络已不存在".into()));
+            };
+
+            // Idempotency: an existing membership is returned as-is (the
+            // token is not consumed).
+            if let Some(m) = tx
+                .query_row(
+                    "SELECT * FROM memberships WHERE network_id = ?1 AND device_id = ?2",
+                    params![token.network_id.as_bytes(), device_id as i64],
+                    map_membership,
+                )
+                .optional()?
+            {
+                return Ok(JoinResult { network, ip: m.ip, already_member: true });
+            }
+
+            let ip_text =
+                Self::insert_membership(tx, &network, device_id, requested_ip, token.requested_ip.as_deref())?;
+            if !Self::consume_token_use(tx, &bare)? {
+                return Err(RepoError::Conflict("注册令牌已用尽".into()));
+            }
+
+            Ok(JoinResult { network, ip: ip_text, already_member: false })
+        })
+    }
+
+    /// 事务内分配并写入一条成员关系（join_network / admin_join_network
+    /// 共用）：优先级 requested_ip > fallback_ip（令牌内嵌 IP）> 顺序分配。
+    fn insert_membership(
+        tx: &rusqlite::Transaction<'_>,
+        network: &NetworkRow,
+        device_id: u64,
+        requested_ip: Option<&str>,
+        fallback_ip: Option<&str>,
+    ) -> Result<String, RepoError> {
+        let cidr = Cidr::parse(&network.cidr)
+            .map_err(|_| RepoError::Conflict(format!("网络 {} 的 CIDR 配置无效", network.name)))?;
+        let mut used: HashSet<u32> = HashSet::new();
+        {
+            let mut stmt = tx.prepare("SELECT ip FROM memberships WHERE network_id = ?1")?;
+            let ips = stmt.query_map(params![network.id.as_bytes()], |r| r.get::<_, String>(0))?;
+            for ip in ips {
+                if let Ok(addr) = ip?.parse::<Ipv4Addr>() {
+                    used.insert(u32::from(addr));
+                }
+            }
+        }
+        let chosen: u32 = if let Some(req) = requested_ip.or(fallback_ip) {
+            IpPool::validate_manual(req, &cidr, &used, None).map_err(RepoError::Conflict)?
+        } else {
+            IpPool::allocate(&cidr, &used)
+                .ok_or_else(|| RepoError::Conflict(format!("网络 {}（{}）已无可分配地址", network.name, network.cidr)))?
+        };
+        let ip_text = Ipv4Addr::from(chosen).to_string();
+        tx.execute(
+            "INSERT INTO memberships(network_id, device_id, ip) VALUES(?1, ?2, ?3)",
+            params![network.id.as_bytes(), device_id as i64, ip_text],
+        )?;
+        Ok(ip_text)
+    }
+
+    /// 管理员强制设备加入网络（绕过注册令牌；幂等：已在网络返回现 IP）。
+    pub fn admin_join_network(
+        &self,
+        device_id: u64,
+        network_id: NetId,
+        requested_ip: Option<&str>,
+    ) -> Result<JoinResult, RepoError> {
+        self.db.with_tx(|tx| -> Result<JoinResult, RepoError> {
+            let network: Option<NetworkRow> = tx
+                .query_row(
+                    "SELECT * FROM networks WHERE id = ?1",
+                    params![network_id.as_bytes()],
+                    map_network,
+                )
+                .optional()?;
+            let Some(network) = network else {
+                return Err(RepoError::Conflict("网络不存在".into()));
+            };
+            if let Some(m) = tx
+                .query_row(
+                    "SELECT * FROM memberships WHERE network_id = ?1 AND device_id = ?2",
+                    params![network_id.as_bytes(), device_id as i64],
+                    map_membership,
+                )
+                .optional()?
+            {
+                return Ok(JoinResult { network, ip: m.ip, already_member: true });
+            }
+            let ip_text = Self::insert_membership(tx, &network, device_id, requested_ip, None)?;
+            Ok(JoinResult { network, ip: ip_text, already_member: false })
+        })
+    }
+
+    /// 管理员强制移除设备的某网络成员关系（最后一个不可移除，同 leave）。
+    pub fn admin_remove_membership(
+        &self,
+        device_id: u64,
+        network_id: NetId,
+    ) -> Result<NetworkRow, RepoError> {
+        let memberships = self.memberships_of_device(device_id)?;
+        if !memberships.iter().any(|m| m.network_id == network_id) {
+            return Err(RepoError::Conflict("设备不属于该网络".into()));
+        }
+        if memberships.len() == 1 {
+            return Err(RepoError::Conflict("不能移除最后一个网络（如需重置请删除设备重新 enroll）".into()));
+        }
+        self.db.with_tx(|tx| -> Result<(), RepoError> {
+            tx.execute(
+                "DELETE FROM memberships WHERE network_id = ?1 AND device_id = ?2",
+                params![network_id.as_bytes(), device_id as i64],
+            )?;
+            Ok(())
+        })?;
+        self.get_network(network_id)?
+            .ok_or_else(|| RepoError::Conflict("网络不存在".into()))
+    }
+
+    /// A device removes its own membership in a network (name or hex id).
+    /// The last membership cannot be removed (re-enroll instead).
+    pub fn leave_network(&self, device_id: u64, network_name_or_id: &str) -> Result<NetworkRow, RepoError> {
+        let memberships = self.memberships_of_device(device_id)?;
+        let net_id = memberships
+            .iter()
+            .find(|m| {
+                self.get_network(m.network_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|n| n.name.eq_ignore_ascii_case(network_name_or_id))
+                    || network_name_or_id.len() == 32
+                        && network_name_or_id.bytes().all(|b| b.is_ascii_hexdigit())
+                        && m.network_id.to_hex() == network_name_or_id.to_ascii_lowercase()
+            })
+            .map(|m| m.network_id)
+            .or_else(|| {
+                if network_name_or_id.len() == 32 && network_name_or_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    NetId::from_hex(network_name_or_id)
+                } else {
+                    None
+                }
+            });
+        let Some(net_id) = net_id else {
+            return Err(RepoError::Conflict("未找到该网络的成员关系".into()));
+        };
+        if memberships.len() == 1 {
+            return Err(RepoError::Conflict("不能移除最后一个网络（如需重置请重新 enroll）".into()));
+        }
+        self.db.with_tx(|tx| -> Result<(), RepoError> {
+            tx.execute(
+                "DELETE FROM memberships WHERE network_id = ?1 AND device_id = ?2",
+                params![net_id.as_bytes(), device_id as i64],
+            )?;
+            Ok(())
+        })?;
+        self.get_network(net_id)?
+            .ok_or_else(|| RepoError::Conflict("网络不存在".into()))
+    }
+
+    /// Admin token bootstrap: get-or-create.
+    pub fn get_or_create_admin_token(&self) -> Result<String, crate::db::DbError> {
+        if let Some(existing) = self.get_setting("admin_token")? {
+            return Ok(existing);
+        }
+        let token = skiff_core::crypto::tokens::make_admin_token();
+        self.set_setting("admin_token", &token)?;
+        Ok(token)
+    }
+
+    pub fn admin_token(&self) -> Option<String> {
+        self.get_setting("admin_token").ok().flatten()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_repo() -> Repo {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "skiff-repo-{}-{}-{}",
+            std::process::id(),
+            unix_ms(),
+            seq
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = Repo::open(&dir.join("test.sqlite")).unwrap();
+        // cleanup is best-effort; temp dirs are per-run
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            let _ = std::fs::remove_dir_all(dir);
+        });
+        repo
+    }
+
+    #[test]
+    fn enroll_flow_assigns_sequential_and_manual_ips() {
+        let repo = temp_repo();
+        let net = repo.create_network("corp", "10.88.0.0/24").unwrap();
+        let token = repo.create_token(net.id, 100, 86_400_000, None).unwrap();
+
+        let a = repo
+            .enroll(&token.token, "a", &"aa".repeat(32), &"bb".repeat(32), None)
+            .unwrap();
+        assert_eq!(a.ip, "10.88.0.1");
+        let b = repo
+            .enroll(
+                &token.token,
+                "b",
+                &"cc".repeat(32),
+                &"dd".repeat(32),
+                Some("10.88.0.200"),
+            )
+            .unwrap();
+        assert_eq!(b.ip, "10.88.0.200");
+        let c = repo
+            .enroll(&token.token, "c", &"ee".repeat(32), &"ff".repeat(32), None)
+            .unwrap();
+        assert_eq!(c.ip, "10.88.0.2");
+
+        // Duplicate manual IP rejected; token survives for retry.
+        let err = repo
+            .enroll(
+                &token.token,
+                "d",
+                &"11".repeat(32),
+                &"22".repeat(32),
+                Some("10.88.0.1"),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("占用"));
+
+        // Token with fingerprint suffix resolves to the same bare token.
+        let with_fp = format!("{}.{}", token.token, "ab".repeat(32));
+        let e = repo
+            .enroll(&with_fp, "e", &"33".repeat(32), &"44".repeat(32), None)
+            .unwrap();
+        assert_eq!(e.ip, "10.88.0.3");
+    }
+
+    #[test]
+    fn expired_or_exhausted_token_rejected() {
+        let repo = temp_repo();
+        let net = repo.create_network("n", "10.1.0.0/24").unwrap();
+        let token = repo.create_token(net.id, 1, 86_400_000, None).unwrap();
+        let _ = repo
+            .enroll(&token.token, "a", &"aa".repeat(32), &"bb".repeat(32), None)
+            .unwrap();
+        let err = repo
+            .enroll(&token.token, "b", &"cc".repeat(32), &"dd".repeat(32), None)
+            .unwrap_err();
+        assert!(err.to_string().contains("用尽"));
+
+        let dead = repo.create_token(net.id, 1, -1, None).unwrap();
+        let err = repo
+            .enroll(&dead.token, "c", &"ee".repeat(32), &"ff".repeat(32), None)
+            .unwrap_err();
+        assert!(err.to_string().contains("过期"));
+    }
+
+    #[test]
+    fn delete_network_cascades() {
+        let repo = temp_repo();
+        let net = repo.create_network("gone", "10.2.0.0/24").unwrap();
+        let token = repo.create_token(net.id, 5, 86_400_000, None).unwrap();
+        let dev = repo
+            .enroll(&token.token, "a", &"aa".repeat(32), &"bb".repeat(32), None)
+            .unwrap();
+        assert!(repo.delete_network(net.id).unwrap());
+        assert!(repo.get_network(net.id).unwrap().is_none());
+        assert!(
+            repo.memberships_of_device(dev.device_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(repo.list_tokens().unwrap().is_empty());
+        assert!(!repo.delete_network(net.id).unwrap());
+    }
+}

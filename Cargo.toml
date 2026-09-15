@@ -1,0 +1,73 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/skiff-core",
+    "crates/skiff-server",
+    "crates/skiff-node",
+    "tests/it",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+skiff-core = { path = "crates/skiff-core" }
+skiff-server = { path = "crates/skiff-server" }
+skiff-node = { path = "crates/skiff-node" }
+
+# async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal", "process", "io-util", "fs"] }
+
+# crypto (pure Rust, static-link friendly)
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+chacha20poly1305 = { version = "0.10" }
+hkdf = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+zeroize = "1"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+base64 = "0.22"
+
+# errors / utils
+anyhow = "1"
+thiserror = "2"
+
+# cli
+clap = { version = "4", features = ["derive", "env"] }
+
+# storage
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# http server / client + tls
+axum = { version = "0.8", features = ["ws"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+
+# concurrency
+dashmap = "6"
+
+# embedded assets
+rust-embed = { version = "8", features = ["compression"] }
+time = "0.3"
+webpki-roots = "1"
+
+# tun
+tun-rs = { version = "2", default-features = false, features = ["async_tokio"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

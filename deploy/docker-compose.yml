@@ -1,0 +1,22 @@
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.server
+    ports:
+      - "24930:24930"
+      - "24931:24931/udp"
+      - "24932:24932"
+    volumes:
+      - starskiff-data:/data
+    restart: unless-stopped
+
+  nodea:
+    image: debian:stable-slim
+    # Build the node binary first (deploy/build-linux-musl.sh), then mount it:
+    # volumes: [ "../publish/linux-musl/starskiff:/app/starskiff:ro" ]
+    command: ["/bin/true"]
+    restart: "no"
+
+volumes:
+  starskiff-data:

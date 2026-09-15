@@ -1,0 +1,14 @@
+/target
+**/target
+Cargo.lock.orig
+*.sqlite
+*.sqlite-*
+publish/
+.idea/
+.vscode/
+*.log
+
+# Vue admin console build output (placeholder index.html stays committed)
+crates/skiff-server/web/node_modules/
+crates/skiff-server/web/dist/*
+!crates/skiff-server/web/dist/index.html

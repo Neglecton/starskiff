@@ -1,0 +1,13 @@
+# Windows (MSVC): link the CRT statically so every build (not just the ones
+# run with RUSTFLAGS on the command line) produces a self-contained exe with
+# no vcruntime dependency. Linux musl targets are statically linked by the
+# toolchain itself and need nothing here.
+
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# musl 交叉（cargo-zigbuild）时 zig 的 lld 会向 stderr 打印
+# "ignoring deprecated linker optimization setting"，rustc 将链接器
+# stderr 提升为 linker_messages 警告。属工具链噪声、与产物无关，屏蔽之。
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-A", "linker_messages"]
