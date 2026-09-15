@@ -126,7 +126,7 @@ async fn tcp_flow_carries_echo_through_relay_when_direct_forbidden() {
     let sa = h.enroll_node("flow-a", None).await;
     let sb = h.enroll_node("flow-b", None).await;
     // 行为配置（force 开关 / exposes）由服务端托管下发。
-    h.set_settings(&sa, serde_json::json!({ "forceRelay": true })).await;
+    h.set_settings(&sa, serde_json::json!({ "pathPolicy": "relayUdp" })).await;
     let net_id = h.network_id_by_name("testnet").await;
     h.set_settings(
         &sb,
@@ -436,12 +436,15 @@ async fn managed_settings_hot_apply_and_pending() {
         resp
     }
 
-    // 1) forceRelay 热应用到 A（引擎每次路由现读运行态开关）。
+    // 1) pathPolicy=relayUdp 热应用到 A（引擎每帧现读生效策略）。
     // 注意 a 已有 socks 托管（revision 1），此处为 revision 2。
-    let saved = admin_put(&h, a_id, serde_json::json!({ "forceRelay": true })).await;
+    let saved = admin_put(&h, a_id, serde_json::json!({ "pathPolicy": "relayUdp" })).await;
     assert_eq!(saved["revision"], 2, "admin PUT 响应异常: {saved}");
     let a_rev = 2;
-    h.until(|| ea.shared.force_relay.load(std::sync::atomic::Ordering::Relaxed)).await;
+    h.until(|| {
+        *ea.shared.path_policy.lock().unwrap() == skiff_core::models::PathPolicy::RelayUdp
+    })
+    .await;
     h.until(|| ea.shared.applied_settings_revision.load(std::sync::atomic::Ordering::Relaxed) >= a_rev)
         .await;
 
@@ -515,7 +518,7 @@ async fn remote_restart_stops_engine_with_restart_reason() {
         .admin
         .put(format!("{}/admin/devices/{id}/settings", h.base_url()))
         .header("X-Admin-Token", &h.admin_token)
-        .json(&serde_json::json!({ "forceRelay": false }))
+        .json(&serde_json::json!({ "pathPolicy": "auto" }))
         .send()
         .await
         .unwrap()
@@ -540,4 +543,163 @@ async fn remote_restart_stops_engine_with_restart_reason() {
         .await
         .expect("引擎按远程指令停止");
     assert_eq!(ea.exit_code(), 3, "重启请求映射为 worker 退出码 3");
+}
+
+/// 路径策略（PathPolicy）热切换：全局 relayTcp 激活 TCP 中继路径且流量
+/// 真实经过服务器 TCP 中继（计数增长）；切回 auto 后按对端覆盖 directTcp
+/// 只影响该对端；directUdp 覆盖同样生效；全局回落 auto 恢复状态机基线。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn path_policy_switches_routes() {
+    let h = TestHarness::create().await;
+
+    // B 的本地 echo（expose 9090/tcp），A 带 SOCKS。
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            if let Ok((mut s, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 || s.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let sa = h.enroll_node("pol-a", None).await;
+    let sb = h.enroll_node("pol-b", None).await;
+    let sc = h.enroll_node("pol-c", None).await;
+    let net_id = h.network_id_by_name("testnet").await;
+    // directTcp 探测需要固定 TCP 监听端口（0=禁用）：预留两个随机端口。
+    fn free_tcp_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+    let a_tcp = free_tcp_port();
+    let b_tcp = free_tcp_port();
+    h.set_settings(&sa, serde_json::json!({ "socksListen": "127.0.0.1:0" })).await;
+    h.set_settings(
+        &sb,
+        serde_json::json!({ "exposes": [{
+            "networkId": net_id.to_hex(),
+            "rules": [{ "port": 9090, "proto": "tcp", "dest": format!("127.0.0.1:{echo_port}") }]
+        }]}),
+    )
+    .await;
+    let ea = h
+        .start_engine(&sa, |c| {
+            c.listen_tcp_port = a_tcp;
+        })
+        .await;
+    let eb = h
+        .start_engine(&sb, |c| {
+            c.listen_tcp_port = b_tcp;
+        })
+        .await;
+    let _ec = h.start_engine(&sc, |_| {}).await;
+    h.until(|| {
+        ea.peers().iter().any(|(_, p)| p.name() == "pol-b" && p.online())
+            && ea.peers().iter().any(|(_, p)| p.name() == "pol-c" && p.online())
+    })
+    .await;
+    let b_id = h.device_id_of(&sb);
+
+    // 1) 双向 relayTcp（模拟 webui 对称快捷设置）：relayTcp 的送达依赖
+    //    接收方持有 TCP 中继连接（服务器按 dst 查连接转发），只 pin 发送
+    //    方会黑洞——所以 B 也 pin。两端预热连接后路径与流量都走 TCP 中继。
+    h.set_settings(&sa, serde_json::json!({ "pathPolicy": "relayTcp" })).await;
+    // 注意 PUT 是全量替换：B 的策略下发必须连同 exposes 一起。
+    h.set_settings(
+        &sb,
+        serde_json::json!({
+            "pathPolicy": "relayTcp",
+            "exposes": [{
+                "networkId": net_id.to_hex(),
+                "rules": [{ "port": 9090, "proto": "tcp", "dest": format!("127.0.0.1:{echo_port}") }]
+            }]
+        }),
+    )
+    .await;
+    let peer_of = |name: &str| {
+        ea.peers()
+            .into_iter()
+            .find(|(_, p)| p.name() == name)
+            .map(|(_, p)| p)
+            .unwrap()
+    };
+    h.until(|| {
+        ea.shared.relay_tcp.is_connected()
+            && eb.shared.relay_tcp.is_connected()
+            && peer_of("pol-b").path() == skiff_node::session::PathKind::RelayTcp
+            && peer_of("pol-c").path() == skiff_node::session::PathKind::RelayTcp
+            && peer_of("pol-b").rtt_ms.load(std::sync::atomic::Ordering::Relaxed) >= 0
+    })
+    .await;
+    let _ = &eb;
+    let before = h.server.state.tcp_relay.forwarded_packets();
+    // SOCKS CONNECT 到 B 的 expose，回显证明数据面仍通。
+    let b_ip = peer_of("pol-b").virtual_ip();
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", ea.socks_port()))
+        .await
+        .unwrap();
+    s.write_all(&[5, 1, 0]).await.unwrap();
+    let mut m = [0u8; 2];
+    s.read_exact(&mut m).await.unwrap();
+    let oct = b_ip.octets();
+    let port = 9090u16.to_be_bytes();
+    s.write_all(&[5, 1, 0, 1, oct[0], oct[1], oct[2], oct[3], port[0], port[1]])
+        .await
+        .unwrap();
+    let mut r = [0u8; 10];
+    s.read_exact(&mut r).await.unwrap();
+    assert_eq!(r[1], 0, "CONNECT ok under relayTcp");
+    s.write_all(b"pol").await.unwrap();
+    let mut got = [0u8; 8];
+    let n = tokio::time::timeout(Duration::from_secs(10), s.read(&mut got))
+        .await
+        .expect("echo via relayTcp")
+        .unwrap();
+    assert_eq!(&got[..n], b"pol");
+    h.until(|| h.server.state.tcp_relay.forwarded_packets() > before).await;
+
+    // 2) 全局回 auto + 对 B 覆盖 directTcp：只有 B 变直连 TCP。
+    h.set_settings(
+        &sa,
+        serde_json::json!({
+            "pathPolicy": "auto",
+            "peerPolicies": [{ "deviceId": b_id, "policy": "directTcp" }]
+        }),
+    )
+    .await;
+    h.until(|| peer_of("pol-b").path() == skiff_node::session::PathKind::DirectTcp).await;
+
+    // 3) 覆盖改 directUdp：同机直连可达，升级为 DirectUdp。
+    h.set_settings(
+        &sa,
+        serde_json::json!({
+            "pathPolicy": "auto",
+            "peerPolicies": [{ "deviceId": b_id, "policy": "directUdp" }]
+        }),
+    )
+    .await;
+    h.until(|| {
+        peer_of("pol-b").path() == skiff_node::session::PathKind::DirectUdp
+            && peer_of("pol-b").direct_endpoint.lock().unwrap().is_some()
+    })
+    .await;
+
+    // 4) 全部清空（未托管）：策略回 Auto，对端覆盖表清空。
+    h.set_settings(&sa, serde_json::json!({})).await;
+    h.until(|| {
+        *ea.shared.path_policy.lock().unwrap() == skiff_core::models::PathPolicy::Auto
+            && ea.shared.peer_policies.is_empty()
+    })
+    .await;
 }

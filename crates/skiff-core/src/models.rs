@@ -117,7 +117,10 @@ pub struct PeerInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeerPathReport {
-    pub device_id: u64,
+    /// 设备 id 以字符串传输：随机 u64 常超 JS Number 的 2^53 精度，
+    /// 管理页（JS）按数字解析会失真。反序列化宽容接受数字（旧格式）。
+    #[serde(deserialize_with = "string_or_number")]
+    pub device_id: String,
     pub path: String,
     /// One-way observation by the reporting node (>= 0); absent when the
     /// peer never answered a probe (or an older node that doesn't report it).
@@ -255,7 +258,8 @@ pub struct AdminDeviceMembership {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdminDevice {
-    pub id: u64,
+    /// 字符串形式的设备 id（u64 超 JS 2^53 精度，管理页按字符串使用）。
+    pub id: String,
     pub name: String,
     pub created_at: i64,
     pub last_seen: i64,
@@ -336,12 +340,65 @@ pub struct NetworkExposes {
     pub rules: Vec<ExposeRule>,
 }
 
+/// 隧道路径策略：手动指定本端出口走哪条路径。只决定本端发送方向——
+/// 接收方在所有路径上收帧（解密分流），两端策略不一致产生非对称路径
+/// 而非连接失败。生效策略 = 对端覆盖 ?? 全局默认 ?? Auto。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PathPolicy {
+    /// 状态机自选（现状行为：UDP 直连优先，探测驱动升级/降级）。
+    #[default]
+    Auto,
+    /// 恒走 UDP 中继（= 原 forceRelay）。
+    RelayUdp,
+    /// 恒走 TCP 中继（失败不回落 UDP——手动模式确定性优先）。
+    RelayTcp,
+    /// 只允许直连（UDP/TCP 均可，= 原 forceDirect；无可用直连丢帧不泄漏）。
+    DirectAny,
+    /// 只允许 UDP 直连（无端点丢帧，持续 UDP 探测重建）。
+    DirectUdp,
+    /// 只允许 TCP 直连（无连接丢帧，TCP 探测重建）。
+    DirectTcp,
+}
+
+/// 按对端覆盖的路径策略条目（覆盖即指定；删除条目=回到全局默认）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerPolicy {
+    /// 字符串形式的设备 id（u64 超 JS 2^53 精度；管理页以字符串提交）。
+    /// 反序列化宽容接受 JSON 数字（Rust 侧调用方/测试习惯）。
+    #[serde(deserialize_with = "string_or_number")]
+    pub device_id: String,
+    pub policy: PathPolicy,
+}
+
+/// 宽容反序列化：JSON 字符串或数字都归一为字符串。
+fn string_or_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = String;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("string or number")
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+    }
+    d.deserialize_any(V)
+}
+
 /// 服务端权威的设备行为配置（device_settings 表，JSON 存储）。
 ///
 /// Option 字段是"逐字段渐进迁移"的载具：`Some(v)` = 该项由服务端托管、
-/// 节点以 v 覆盖本地值；`None` = 未托管，节点沿用本地配置。socks_listen
-/// 的托管值为 `"ip:port"` 或空串（空串 = 禁用 SOCKS）。force 开关与
-/// exposes 热生效；mtu/socks/forwards 写入文件后重启引擎生效。
+/// 节点以 v 覆盖默认值；`None` = 未托管走默认（socks 默认
+/// `"127.0.0.1:1080"`、路径策略默认 Auto）。force 开关与 exposes 热生效；
+/// mtu/socks/forwards 由节点启动时拉取生效、运行中变更置 restartPending。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceSettings {
@@ -349,10 +406,12 @@ pub struct DeviceSettings {
     /// 投递的幂等去重依据）。PUT 时忽略请求中的该字段。
     #[serde(default)]
     pub revision: i64,
+    /// 全局默认路径策略（None=未托管走 Auto）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub force_relay: Option<bool>,
+    pub path_policy: Option<PathPolicy>,
+    /// 按对端覆盖列表（None=未托管；空列表=明确无覆盖）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub force_direct: Option<bool>,
+    pub peer_policies: Option<Vec<PeerPolicy>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -366,9 +425,6 @@ pub struct DeviceSettings {
 impl DeviceSettings {
     /// 托管子集的格式校验（节点在持久化前还会做整体 validate 兜底）。
     pub fn validate(&self) -> Result<(), String> {
-        if self.force_relay == Some(true) && self.force_direct == Some(true) {
-            return Err("forceRelay 与 forceDirect 不能同时开启".into());
-        }
         if let Some(mtu) = self.mtu
             && !(576..=65500).contains(&mtu)
         {
@@ -427,13 +483,25 @@ impl DeviceSettings {
                 }
             }
         }
+        if let Some(list) = &self.peer_policies {
+            if list.len() > 64 {
+                return Err("peerPolicies 最多 64 条".into());
+            }
+            for i in 0..list.len() {
+                for j in (i + 1)..list.len() {
+                    if list[i].device_id == list[j].device_id {
+                        return Err(format!("peerPolicies 中存在重复的对端 {}", list[i].device_id));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
     /// 是否有任何托管字段（全 None = 未管理，等同无记录）。
     pub fn is_empty(&self) -> bool {
-        self.force_relay.is_none()
-            && self.force_direct.is_none()
+        self.path_policy.is_none()
+            && self.peer_policies.is_none()
             && self.mtu.is_none()
             && self.socks_listen.is_none()
             && self.forwards.is_none()
@@ -670,29 +738,49 @@ mod tests {
     fn device_settings_camel_case_and_defaults() {
         let json = r#"{
             "revision": 3,
-            "forceRelay": true,
+            "pathPolicy": "relayTcp",
+            "peerPolicies": [{"deviceId": 42, "policy": "directTcp"}],
             "socksListen": "",
             "exposes": [{"networkId": "0102030405060708090a0b0c0d0e0f10",
                           "rules": [{"port": 8080, "proto": "tcp", "dest": "127.0.0.1:9090"}]}]
         }"#;
         let s: DeviceSettings = serde_json::from_str(json).unwrap();
         assert_eq!(s.revision, 3);
-        assert_eq!(s.force_relay, Some(true));
+        assert_eq!(s.path_policy, Some(PathPolicy::RelayTcp));
+        assert_eq!(s.peer_policies.as_ref().unwrap()[0].policy, PathPolicy::DirectTcp);
+        assert_eq!(s.peer_policies.as_ref().unwrap()[0].device_id, "42");
         assert_eq!(s.socks_listen.as_deref(), Some(""));
         assert_eq!(s.exposes.as_ref().unwrap()[0].rules.len(), 1);
         assert!(s.validate().is_ok());
         assert!(!s.is_empty());
 
-        // 未托管字段缺省（None），序列化时省略。
-        let minimal: DeviceSettings = serde_json::from_str(r#"{"revision":0}"#).unwrap();
+        // 全部六档可往返。
+        for p in [
+            PathPolicy::Auto,
+            PathPolicy::RelayUdp,
+            PathPolicy::RelayTcp,
+            PathPolicy::DirectAny,
+            PathPolicy::DirectUdp,
+            PathPolicy::DirectTcp,
+        ] {
+            let out = serde_json::to_string(&p).unwrap();
+            let back: PathPolicy = serde_json::from_str(&out).unwrap();
+            assert_eq!(back, p);
+        }
+        // 非法档位拒绝。
+        assert!(serde_json::from_str::<DeviceSettings>(r#"{"pathPolicy":"carrierPigeon"}"#).is_err());
+
+        // 未托管字段缺省（None），序列化时省略；旧 forceRelay 键被忽略。
+        let minimal: DeviceSettings =
+            serde_json::from_str(r#"{"revision":0,"forceRelay":true}"#).unwrap();
         assert!(minimal.is_empty());
+        assert!(minimal.path_policy.is_none());
         let out = serde_json::to_string(&minimal).unwrap();
-        assert!(!out.contains("forceRelay"));
+        assert!(!out.contains("pathPolicy"));
+        assert!(!out.contains("peerPolicies"));
         assert!(!out.contains("exposes"));
 
         // 校验规则。
-        let bad: DeviceSettings = serde_json::from_str(r#"{"forceRelay":true,"forceDirect":true}"#).unwrap();
-        assert!(bad.validate().is_err());
         let bad: DeviceSettings =
             serde_json::from_str(r#"{"socksListen":"not-an-addr"}"#).unwrap();
         assert!(bad.validate().is_err());
@@ -702,6 +790,12 @@ mod tests {
         assert!(bad.validate().is_err());
         let bad: DeviceSettings = serde_json::from_str(
             r#"{"exposes":[{"networkId":"0102030405060708090a0b0c0d0e0f10","rules":[{"port":80,"proto":"sctp","dest":"127.0.0.1:80"}]}]}"#,
+        )
+        .unwrap();
+        assert!(bad.validate().is_err());
+        // peerPolicies 重复对端拒绝。
+        let bad: DeviceSettings = serde_json::from_str(
+            r#"{"peerPolicies":[{"deviceId":7,"policy":"auto"},{"deviceId":7,"policy":"relayUdp"}]}"#,
         )
         .unwrap();
         assert!(bad.validate().is_err());
@@ -749,7 +843,7 @@ mod tests {
             r#"{"deviceId":7,"path":"DirectUdp"}"#,
         )
         .unwrap();
-        assert_eq!(legacy.device_id, 7);
+        assert_eq!(legacy.device_id, "7");
         assert!(legacy.rtt_ms.is_none());
         // New form round-trips and omits None on write.
         let full: PeerPathReport = serde_json::from_str(

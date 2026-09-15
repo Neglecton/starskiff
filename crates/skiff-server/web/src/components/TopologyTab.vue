@@ -47,13 +47,15 @@ const selectedId = ref(null);
 function pathRank(p) {
   if (p.startsWith('DirectUdp')) return 0;
   if (p.startsWith('DirectTcp')) return 1;
-  return 2; // Relay*
+  if (p.startsWith('RelayTcp')) return 2;
+  return 3; // RelayUdp / 其它
 }
 
 function edgeStyle(path) {
   if (path.startsWith('DirectUdp')) return { stroke: '#059669', dash: '' };
   if (path.startsWith('DirectTcp')) return { stroke: '#2563EB', dash: '' };
-  return { stroke: '#D97706', dash: '6 4' }; // relay
+  if (path.startsWith('RelayTcp')) return { stroke: '#9333EA', dash: '6 4' };
+  return { stroke: '#D97706', dash: '6 4' }; // RelayUdp
 }
 
 function rebuildGraph() {
@@ -109,7 +111,7 @@ function rebuildGraph() {
   }
   const out = [];
   for (const [key, { a, b }] of map) {
-    const [aId, bId] = key.split(':').map(Number);
+    const [aId, bId] = key.split(':');
     const reports = [a, b].filter(Boolean);
     if (!reports.length) continue;
     // Prefer the report with the best (direct-first) path; diverging

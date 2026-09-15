@@ -78,6 +78,8 @@ pub struct RunningServer {
     pub base_url: String,
     pub cert_fingerprint: Option<String>,
     pub admin_token: String,
+    /// 共享状态（repo/hub/presence/中继句柄），供集成测试断言内部计数。
+    pub state: std::sync::Arc<AppState>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -225,6 +227,7 @@ pub async fn start(opts: ServerOptions) -> anyhow::Result<RunningServer> {
         base_url: format!("{scheme}://127.0.0.1:{api_port}"),
         cert_fingerprint: fingerprint,
         admin_token: state.admin_token.clone(),
+        state,
         tasks,
     })
 }
@@ -881,6 +884,18 @@ async fn admin_put_device_settings(
     if let Err(msg) = payload.validate() {
         return err(StatusCode::BAD_REQUEST, msg);
     }
+    // 对端覆盖的 deviceId 必须是已注册设备（防手滑写错 id；字符串形式，
+    // 解析失败同样拒绝）。
+    if let Some(list) = &payload.peer_policies {
+        for pp in list {
+            let Ok(id) = pp.device_id.parse::<u64>() else {
+                return err(StatusCode::BAD_REQUEST, format!("对端设备 id 无效：{}", pp.device_id));
+            };
+            if state.repo.get_device(id).ok().flatten().is_none() {
+                return err(StatusCode::BAD_REQUEST, format!("对端设备 {} 不存在", pp.device_id));
+            }
+        }
+    }
     let stored = match state.repo.set_device_settings(device_id, &payload) {
         Ok(s) => s,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -1349,7 +1364,7 @@ async fn admin_list_devices(State(state): State<SharedState>, req: Request<Body>
                 .filter(|s| s.revision > 0)
                 .map(|s| s.revision);
             AdminDevice {
-                id: d.id,
+                id: d.id.to_string(),
                 name: d.name,
                 created_at: d.created_at,
                 last_seen: d.last_seen,

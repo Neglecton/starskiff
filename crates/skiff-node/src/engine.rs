@@ -27,7 +27,7 @@ use tokio::sync::{mpsc, watch};
 use crate::control::ControlClient;
 use crate::flow::FlowManager;
 use crate::proxy;
-use crate::session::{PathKind, PeerSession};
+use crate::session::{PathKind, PeerSession, policy_allows};
 use crate::transport::peer_tcp::PeerTcpConnection;
 use crate::transport::relay_tcp::RelayTcpClient;
 use crate::transport::udp_mesh::UdpMesh;
@@ -117,9 +117,11 @@ pub struct EngineShared {
     pub applied_settings_revision: AtomicU64,
     /// 有重启类托管配置已写入文件但尚未重启生效（心跳上报给管理页）。
     pub restart_pending: AtomicBool,
-    /// 热改 force 开关（服务端托管，运行中每次现读）。
-    pub force_relay: AtomicBool,
-    pub force_direct: AtomicBool,
+    /// 生效路径策略：对端覆盖 ?? 全局默认 ?? Auto（服务端托管，热生效，
+    /// 每帧现读）。只决定本端出口；接收方全路径接收。
+    pub path_policy: Mutex<PathPolicy>,
+    /// 按对端覆盖表（device_id → 策略）。
+    pub peer_policies: DashMap<u64, PathPolicy>,
     /// 启动时实际生效的 SOCKS/forwards/MTU（状态展示 + 托管变更的
     /// restart_pending 比对基准）——行为配置不再落文件。
     pub runtime_socks: Mutex<Option<String>>,
@@ -165,35 +167,51 @@ impl EngineShared {
         }
     }
 
-    /// 热改 force 开关：服务端托管值（或默认 false），运行中每次现读。
-    fn force_flags(&self) -> (bool, bool) {
-        (
-            self.force_relay.load(Ordering::Relaxed),
-            self.force_direct.load(Ordering::Relaxed),
-        )
+    fn policy_for(&self, peer_id: u64) -> PathPolicy {
+        if let Some(hit) = self.peer_policies.get(&peer_id) {
+            return *hit;
+        }
+        *self.path_policy.lock().unwrap()
     }
 
-    /// Seal + route one frame to a peer on its network (RouteSealed).
+    /// Seal + route one frame to a peer on its network (RouteSealed)。
+    /// 路径 = 按策略解析；中继回退仅 Auto 允许（手动 pin 确定性优先，
+    /// 资源缺失丢帧并靠探测重建）。
     fn route_sealed(&self, net_id: &NetId, peer: &Arc<PeerSession>, frame: &[u8]) {
         if self.stopping.load(Ordering::Relaxed) {
             return;
         }
         let self_id = self.device_id.load(Ordering::Relaxed);
-        let (force_relay, force_direct) = self.force_flags();
-        if force_direct && !matches!(peer.path(), PathKind::DirectUdp | PathKind::DirectTcp) {
-            let ep = peer
-                .direct_endpoint
-                .lock()
-                .unwrap()
-                .or_else(|| peer.endpoints.lock().unwrap().first().copied());
-            // No direct endpoint: drop rather than leak via relay.
-            if let Some(ep) = ep {
-                self.udp.send_direct(ep, frame);
-                peer.add_tx(frame.len());
-            }
-            return;
-        }
-        let path = if force_relay { PathKind::RelayUdp } else { peer.path() };
+        let policy = self.policy_for(peer.id);
+        // Auto 下允许"直连资源缺失→中继兜底"；策略档不允许。
+        let relay_fallback = policy == PathPolicy::Auto;
+        let path = match policy {
+            PathPolicy::Auto => peer.path(),
+            PathPolicy::RelayUdp => PathKind::RelayUdp,
+            PathPolicy::RelayTcp => PathKind::RelayTcp,
+            PathPolicy::DirectAny => match peer.path() {
+                PathKind::DirectUdp | PathKind::DirectTcp => peer.path(),
+                _ => {
+                    // 无既有直连：优先可用 TCP 连接，其次 UDP 端点；全无丢帧。
+                    let conn = peer.tcp_conn.lock().unwrap().clone();
+                    if conn.as_ref().is_some_and(|c| !c.is_closed()) {
+                        PathKind::DirectTcp
+                    } else if peer
+                        .direct_endpoint
+                        .lock()
+                        .unwrap()
+                        .or_else(|| peer.endpoints.lock().unwrap().first().copied())
+                        .is_some()
+                    {
+                        PathKind::DirectUdp
+                    } else {
+                        return; // No direct resource: drop rather than leak via relay.
+                    }
+                }
+            },
+            PathPolicy::DirectUdp => PathKind::DirectUdp,
+            PathPolicy::DirectTcp => PathKind::DirectTcp,
+        };
         match path {
             PathKind::DirectUdp => {
                 let ep = peer
@@ -203,7 +221,8 @@ impl EngineShared {
                     .or_else(|| peer.endpoints.lock().unwrap().first().copied());
                 match ep {
                     Some(ep) => self.udp.send_direct(ep, frame),
-                    None => self.udp.send_relay(self_id, peer.id, frame),
+                    None if relay_fallback => self.udp.send_relay(self_id, peer.id, frame),
+                    None => {}
                 }
                 peer.add_tx(frame.len());
             }
@@ -214,10 +233,11 @@ impl EngineShared {
                         conn.send(frame);
                         peer.add_tx(frame.len());
                     }
-                    _ => {
+                    _ if relay_fallback => {
                         self.udp.send_relay(self_id, peer.id, frame);
                         peer.add_tx(frame.len());
                     }
+                    _ => {} // pin：无连接丢帧，TCP 探测会重建
                 }
             }
             PathKind::RelayTcp => {
@@ -228,7 +248,8 @@ impl EngineShared {
                 let payload = frame.to_vec();
                 peer.add_tx(frame.len());
                 tokio::spawn(async move {
-                    if !relay.send(dst, &payload, &events).await {
+                    // Auto（残留态）失败回落 UDP 中继；pin 档失败即丢帧。
+                    if !relay.send(dst, &payload, &events).await && relay_fallback {
                         udp.send_relay(self_id, dst, &payload);
                     }
                 });
@@ -288,8 +309,9 @@ impl EngineShared {
             if replace {
                 *slot = Some(Arc::clone(&conn));
             }
-            let (force_relay, _) = self.force_flags();
-            !force_relay && matches!(*peer.current_path.lock().unwrap(), PathKind::RelayUdp | PathKind::RelayTcp)
+            let policy = self.policy_for(peer.id);
+            policy_allows(policy, PathKind::DirectTcp)
+                && matches!(*peer.current_path.lock().unwrap(), PathKind::RelayUdp | PathKind::RelayTcp)
         };
         if should_upgrade {
             *peer.current_path.lock().unwrap() = PathKind::DirectTcp;
@@ -342,16 +364,28 @@ impl EngineShared {
                 }
                 peer.last_pong_ms.store(now, Ordering::Relaxed);
                 if let Arrival::DirectUdp(from) = &arrival {
-                    let (force_relay, _) = self.force_flags();
-                    if !force_relay && peer.path() != PathKind::DirectUdp {
+                    // 策略允许即记录直连端点（pin 档下 path 已被 apply 置为
+                    // DirectUdp，不能以 path 判断是否已建立——端点才是资源）。
+                    let policy = self.policy_for(peer.id);
+                    if policy_allows(policy, PathKind::DirectUdp) {
+                        let was_missing = peer.direct_endpoint.lock().unwrap().is_none();
                         *peer.direct_endpoint.lock().unwrap() = Some(*from);
-                        *peer.current_path.lock().unwrap() = PathKind::DirectUdp;
-                        (self.log)(&format!(
-                            "PATH_UP peer={} net={} type=DirectUdp ep={}",
-                            peer.name(),
-                            self.network_name(&net_id),
-                            from
-                        ));
+                        if peer.path() != PathKind::DirectUdp {
+                            *peer.current_path.lock().unwrap() = PathKind::DirectUdp;
+                            (self.log)(&format!(
+                                "PATH_UP peer={} net={} type=DirectUdp ep={}",
+                                peer.name(),
+                                self.network_name(&net_id),
+                                from
+                            ));
+                        } else if was_missing {
+                            (self.log)(&format!(
+                                "PATH_UP peer={} net={} type=DirectUdp(pinned) ep={}",
+                                peer.name(),
+                                self.network_name(&net_id),
+                                from
+                            ));
+                        }
                     }
                 }
             }
@@ -437,8 +471,8 @@ impl NodeEngine {
             stopping: AtomicBool::new(false),
             applied_settings_revision: AtomicU64::new(0),
             restart_pending: AtomicBool::new(false),
-            force_relay: AtomicBool::new(false),
-            force_direct: AtomicBool::new(false),
+            path_policy: Mutex::new(PathPolicy::Auto),
+            peer_policies: DashMap::new(),
             runtime_socks: Mutex::new(None),
             runtime_forwards: Mutex::new(Vec::new()),
             runtime_mtu: AtomicU32::new(cfg.mtu),
@@ -738,6 +772,11 @@ impl NodeEngine {
 
         // stop.flag watcher (1s).
         {
+            // 启动时清掉残留的 stop.flag：上次进程被硬杀（如 Windows 控制台
+            // Ctrl+C 会同时送达 worker 子进程令其默认终止，来不及删 master
+            // 随后写入的标志）会留下陈旧文件，本次启动 1s 内即被误停。
+            // stop.flag 语义是"停止运行中的引擎"，不是"禁止启动"。
+            let _ = std::fs::remove_file(shared.data_dir().join("stop.flag"));
             let shared2 = Arc::clone(&shared);
             tasks.push(tokio::spawn(async move {
                 loop {
@@ -982,10 +1021,9 @@ fn legacy_seed(path: &std::path::Path) -> DeviceSettings {
     let Ok(text) = std::fs::read_to_string(path) else { return out };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return out };
     if v["forceRelay"].as_bool() == Some(true) {
-        out.force_relay = Some(true);
-    }
-    if v["forceDirect"].as_bool() == Some(true) {
-        out.force_direct = Some(true);
+        out.path_policy = Some(PathPolicy::RelayUdp);
+    } else if v["forceDirect"].as_bool() == Some(true) {
+        out.path_policy = Some(PathPolicy::DirectAny);
     }
     if let Some(mtu) = v["mtu"].as_u64().filter(|m| *m != u64::from(skiff_core::consts::DEFAULT_MTU)) {
         out.mtu = Some(mtu as u32);
@@ -1016,15 +1054,56 @@ fn legacy_seed(path: &std::path::Path) -> DeviceSettings {
     out
 }
 
-/// 把托管配置应用到运行态。热改字段（force 开关 / exposes）立即生效；
+/// 把托管配置应用到运行态。路径策略（全局+对端覆盖）与 exposes 热生效；
 /// 重启类字段（mtu / socks / forwards）不落文件——与启动时实际生效值
 /// 比对，有差异即置 restart_pending，重启时按拉取值重建。
 fn apply_runtime_settings(shared: &Arc<EngineShared>, settings: &DeviceSettings, startup: bool) {
-    if let Some(v) = settings.force_relay {
-        shared.force_relay.store(v, Ordering::Relaxed);
-    }
-    if let Some(v) = settings.force_direct {
-        shared.force_direct.store(v, Ordering::Relaxed);
+    // 路径策略：写全局与覆盖表，按各 peer 的生效策略同步 current_path
+    //（pin 档写入对应值使 status/心跳/管理页真实；Auto 下清掉 pin-only
+    // 的 RelayTcp 残留，状态机回到 RelayUdp 基线）。策略只被托管字段
+    // 驱动：PUT 全量记录，pathPolicy/peerPolicies 缺省即回 Auto/无覆盖。
+    let global = settings.path_policy.unwrap_or_default();
+    {
+        *shared.path_policy.lock().unwrap() = global;
+        shared.peer_policies.clear();
+        for pp in settings.peer_policies.iter().flatten() {
+            match pp.device_id.parse::<u64>() {
+                Ok(id) => {
+                    shared.peer_policies.insert(id, pp.policy);
+                }
+                Err(_) => {
+                    (shared.log)(&format!("peerPolicies 含无效设备 id，已跳过：{}", pp.device_id));
+                }
+            }
+        }
+        let mut any_relay_tcp = global == PathPolicy::RelayTcp;
+        let entries: Vec<Arc<PeerSession>> = shared.peers.iter().map(|e| Arc::clone(e.value())).collect();
+        for peer in &entries {
+            let eff = shared.policy_for(peer.id);
+            any_relay_tcp |= eff == PathPolicy::RelayTcp;
+            let mut path = peer.current_path.lock().unwrap();
+            match eff {
+                PathPolicy::Auto => {
+                    if *path == PathKind::RelayTcp {
+                        *path = PathKind::RelayUdp;
+                    }
+                }
+                PathPolicy::RelayUdp => *path = PathKind::RelayUdp,
+                PathPolicy::RelayTcp => *path = PathKind::RelayTcp,
+                PathPolicy::DirectAny => {} // 保持现状（状态机/对端拉动继续）
+                PathPolicy::DirectUdp => *path = PathKind::DirectUdp,
+                PathPolicy::DirectTcp => *path = PathKind::DirectTcp,
+            }
+        }
+        if any_relay_tcp {
+            // 预热 TCP 中继连接：RelayTcpClient 是懒建连，提前连上消除
+            // pin 切换后的首包丢失（send 与建连竞态会返回 false）。
+            let relay = Arc::clone(&shared.relay_tcp);
+            let events = shared.events.clone();
+            tokio::spawn(async move {
+                relay.ensure_connected(&events).await;
+            });
+        }
     }
     if let Some(list) = &settings.exposes {
         for ne in list {
@@ -1196,10 +1275,10 @@ async fn refresh_one_network(shared: &Arc<EngineShared>, net_id: NetId, name: &s
 }
 
 async fn heartbeat_tick(shared: &Arc<EngineShared>) {
-    let (force_relay, _force_direct) = shared.force_flags();
     // Only report peers we have actually interacted with (rtt recorded):
     // a never-answered peer would report its initial RelayUdp state, which
     // misleads the topology view into drawing phantom relay edges.
+    //（current_path 在策略应用时已同步为真实生效路径，直接上报裸枚举串。）
     let paths: Vec<PeerPathReport> = shared
         .peers
         .iter()
@@ -1208,13 +1287,9 @@ async fn heartbeat_tick(shared: &Arc<EngineShared>) {
             if rtt < 0 {
                 return None;
             }
-            let path = if force_relay {
-                "RelayUdp(forced)".to_string()
-            } else {
-                p.value().path().as_str().to_string()
-            };
+            let path = p.value().path().as_str().to_string();
             Some(PeerPathReport {
-                device_id: p.key().1,
+                device_id: p.key().1.to_string(),
                 path,
                 rtt_ms: Some(rtt),
             })
@@ -1273,13 +1348,33 @@ async fn probe_peer(shared: &Arc<EngineShared>, net_id: NetId, peer: Arc<PeerSes
     // Keep the current path alive.
     shared.route_sealed(&net_id, &peer, &ping);
 
-    let (force_relay, force_direct) = shared.force_flags();
-    if force_relay {
+    // 探测按生效策略裁剪：Relay* 不直连探测；directTcp 只探 TCP；
+    // directUdp 只探 UDP（含邻近端口预测）；Auto/DirectAny 双探测。
+    let policy = shared.policy_for(peer.id);
+    if matches!(policy, PathPolicy::RelayUdp | PathPolicy::RelayTcp) {
         return;
     }
     let path = peer.path();
     let now = unix_ms();
-    if path != PathKind::DirectUdp {
+    // 探测需求按"资源是否就绪"判断，而非 path：策略应用会把 path 置为
+    // pin 值，若以 path 判断"已建立"将永远不再探测（directUdp pin 下
+    // direct_endpoint 永远缺失的死锁即源于此）。
+    let want_udp = match policy {
+        PathPolicy::Auto | PathPolicy::DirectAny => path != PathKind::DirectUdp,
+        PathPolicy::DirectUdp => peer.direct_endpoint.lock().unwrap().is_none(),
+        _ => false,
+    };
+    let want_tcp = match policy {
+        PathPolicy::Auto | PathPolicy::DirectAny => path != PathKind::DirectUdp,
+        PathPolicy::DirectTcp => peer
+            .tcp_conn
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|c| c.is_closed()),
+        _ => false,
+    };
+    if want_udp {
         // Direct UDP probes: known endpoints (up to 4) + neighbour-port
         // prediction around the relay-observed endpoint (symmetric NATs
         // allocate ports sequentially).
@@ -1297,15 +1392,20 @@ async fn probe_peer(shared: &Arc<EngineShared>, net_id: NetId, peer: Arc<PeerSes
                 }
             }
         }
+    }
+    if want_tcp {
+        let endpoints = peer.endpoints.lock().unwrap().clone();
         try_direct_tcp_probe(shared, &peer, &endpoints).await;
-    } else {
+    }
+    if path == PathKind::DirectUdp {
         let dead_after = (skiff_core::consts::PEER_PING_INTERVAL
             * skiff_core::consts::PEER_PING_MISS_LIMIT)
             .as_millis() as i64;
         // 直连升级只在收到 PONG 时发生（升级前必已写入 last_pong_ms），
         // 因此 DirectUdp 路径下 last 恒 > 0；last==0 表示从未直连成功。
+        // 降级仅 Auto 允许（策略档保持 pin，靠丢帧+探测自愈）。
         let last = peer.last_pong_ms.load(Ordering::Relaxed);
-        if last > 0 && now - last > dead_after && !force_direct {
+        if last > 0 && now - last > dead_after && policy == PathPolicy::Auto {
             *peer.current_path.lock().unwrap() = PathKind::RelayUdp;
             *peer.direct_endpoint.lock().unwrap() = None;
             (shared.log)(&format!(

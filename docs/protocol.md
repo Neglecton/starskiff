@@ -138,7 +138,16 @@ ERROR(4):    [msgLen u8][msg utf-8]（截断 200B）
 
 ### 设备托管配置（DeviceSettings）
 
-服务端权威下发、逐字段渐进迁移：`{revision, forceRelay?, forceDirect?, mtu?, socksListen?(空串=禁用), forwards?, exposes?[{networkId, rules}]}`，`Some` = 托管并覆盖默认值，缺省 = 未托管走默认（socks 默认 `127.0.0.1:1080`）。force 开关与 exposes 热生效；mtu/socks/forwards 由节点在启动时拉取生效、运行中变更置 `restartPending`（心跳上报），**不落节点文件**——starskiff.json 只保留连接信息与本机部署参数。推送为 at-most-once：节点在收到 `settings_changed` 与每次 WS `connected` 时自拉，`revision` 单调递增做幂等去重（多网络节点多连接重复投递安全）。`PUT /api/settings`（设备令牌鉴权）为**收编**端点：仅用请求值填充当前未托管的字段（字段级合并、已托管字段不可被节点覆盖、无可收编项不递增 revision），用于旧版文件遗留行为值（非默认）的零感迁移。
+服务端权威下发：`{revision, pathPolicy?, peerPolicies?[{deviceId, policy}], mtu?, socksListen?(空串=禁用), forwards?, exposes?[{networkId, rules}]}`，`Some` = 托管并覆盖默认值，缺省 = 未托管走默认（路径策略默认 `auto`、socks 默认 `127.0.0.1:1080`）。路径策略与 exposes 热生效；mtu/socks/forwards 由节点在启动时拉取生效、运行中变更置 `restartPending`（心跳上报），**不落节点文件**——starskiff.json 只保留连接信息与本机部署参数。推送为 at-most-once：节点在收到 `settings_changed` 与每次 WS `connected` 时自拉，`revision` 单调递增做幂等去重（多网络节点多连接重复投递安全）。`PUT /api/settings`（设备令牌鉴权）为**收编**端点：仅用请求值填充当前未托管的字段（字段级合并、已托管字段不可被节点覆盖、无可收编项不递增 revision），用于旧版文件遗留行为值的零感迁移。
+
+#### 路径策略（PathPolicy）
+
+`auto | relayUdp | relayTcp | directAny | directUdp | directTcp`，生效策略 = 对端覆盖 ?? 全局默认 ?? auto，按对端独立生效。要点：
+
+- **只决定本端出口**：接收方在所有路径上收帧（解密分流），两端不一致产生**非对称路径**而非失败；直连 pin 会经对端 PONG/attach 机制"拉动"对端一起直连，Relay* pin 不被拉动。
+- Relay* 跳过一切直连探测；directUdp/directTcp 只做对应协议探测（按资源是否就绪判断）；探测/超时降级仅 auto 保留。
+- **relayTcp 送达要求接收方持有 TCP 中继连接**（服务器按 dst 查其 TCP 中继连接转发）——单向 pin 会黑洞，应成对设置（管理页保存对端覆盖时提供"同步反向方向"快捷确认）。
+- 中继回退（直连资源缺失→UDP 中继）仅 auto 允许；pin 档丢帧确定性优先，靠探测自愈。
 
 错误响应统一 `{"error":"..."}`。
 
@@ -149,7 +158,7 @@ ERROR(4):    [msgLen u8][msg utf-8]（截断 200B）
      ↘ 探测对端端点（PING 直发：本地地址端点 ×4 + 观测端点 ±1~4 邻近端口预测 + 直连 TCP 3s 超时/60s 冷却）→ 收到直连 PONG → DirectUdp
 DirectUdp 30s 无 PONG（10s × 3 次）→ 回退 RelayUdp
 直连 TCP 连接建立（任一方向）→ DirectTcp
-forceRelay / forceDirect 全局强制（互斥；forceDirect 无直连端点时丢弃帧，绝不经中继泄漏）
+路径策略（PathPolicy，见「设备托管配置」）叠加在状态机之上：路由按生效策略解析、策略应用时同步 current_path、升级经 policy_allows 门控、探测按资源就绪度裁剪
 ```
 
 **PONG 必须沿到达路径回复**（DirectUdp 回真实源端口）——这是对称 NAT 端口预测能升级路径的前提。

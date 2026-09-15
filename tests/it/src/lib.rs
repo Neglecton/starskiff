@@ -161,7 +161,7 @@ impl TestHarness {
         devs.as_array()
             .unwrap()
             .iter()
-            .find(|d| d["id"].as_u64() == Some(id))
+            .find(|d| d["id"].as_str() == Some(&id.to_string()))
             .unwrap()["networks"][0]["ip"]
             .as_str()
             .unwrap()

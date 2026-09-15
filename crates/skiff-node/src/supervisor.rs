@@ -67,21 +67,28 @@ fn data_dir_of(config: &Path) -> PathBuf {
     crate::default_data_dir()
 }
 
-/// 写 stop.flag 并等待 worker 优雅退出；超时强杀。
+/// 写 stop.flag 并等待 worker 优雅退出；超时强杀。退出后删除 stop.flag——
+/// worker 若先于本函数死亡（如 Windows 控制台 Ctrl+C 同时送达子进程、
+/// 默认处理直接终止）就没有机会删标志，残留会导致下次启动被误停。
 async fn graceful_stop(child: &mut tokio::process::Child, config: &Path, log: &LogFn) {
     let flag = data_dir_of(config).join("stop.flag");
     if let Err(e) = std::fs::write(&flag, b"") {
         (log)(&format!("无法写入 stop.flag（{e}），将强制结束 worker"));
     }
     let deadline = Instant::now() + GRACEFUL_TIMEOUT;
-    while Instant::now() < deadline {
+    loop {
         match tokio::time::timeout(Duration::from_secs(1), child.wait()).await {
-            Ok(_) => return, // 已退出（Ok 或 Err 都不再等）
-            Err(_) => continue,
+            Ok(_) => break, // 已退出（Ok 或 Err 都不再等）
+            Err(_) if Instant::now() < deadline => continue,
+            Err(_) => break,
         }
     }
-    (log)("worker 优雅停止超时，强制结束");
-    let _ = child.kill().await;
+    if Instant::now() >= deadline {
+        (log)("worker 优雅停止超时，强制结束");
+        let _ = child.kill().await;
+    }
+    // 无论 worker 如何退出，标志都由 master 兜底清理。
+    let _ = std::fs::remove_file(&flag);
 }
 
 /// 运行 master 监督循环，返回 master 进程退出码（正常路径恒 0——

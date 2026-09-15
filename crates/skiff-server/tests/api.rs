@@ -484,11 +484,18 @@ async fn admin_settings_roundtrip_and_ws_push() {
             .send()
     };
 
-    // 校验失败：force 互斥。
-    let resp = put(serde_json::json!({ "forceRelay": true, "forceDirect": true }))
-        .await
-        .unwrap();
+    // 校验失败：非法策略档位（serde 拒绝）/ 对端覆盖重复。
+    let resp = put(serde_json::json!({ "pathPolicy": "carrierPigeon" })).await.unwrap();
     assert_eq!(resp.status(), 400);
+    let resp = put(serde_json::json!({ "pathPolicy": "auto" })).await.unwrap();
+    assert_eq!(resp.status(), 200, "auto 合法");
+    let resp = put(serde_json::json!({
+        "peerPolicies": [{"deviceId": a.device_id, "policy": "relayUdp"},
+                          {"deviceId": a.device_id, "policy": "relayTcp"}]
+    }))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 400, "重复对端拒绝");
 
     // WS 连接（settings_changed 经 send_to_device 定向推给设备）。
     use futures_util::{SinkExt, StreamExt};
@@ -502,12 +509,19 @@ async fn admin_settings_roundtrip_and_ws_push() {
     let (mut write, mut read) = ws.split();
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // 保存合法配置 → revision 1。
-    let resp = put(serde_json::json!({ "forceRelay": true })).await.unwrap();
+    // 保存合法配置 → revision（含对端覆盖回读）。
+    let resp = put(serde_json::json!({
+        "pathPolicy": "relayUdp",
+        "peerPolicies": [{"deviceId": a.device_id, "policy": "directTcp"}]
+    }))
+    .await
+    .unwrap();
     assert_eq!(resp.status(), 200);
     let v: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(v["revision"], 1);
-    assert_eq!(v["forceRelay"], true);
+    assert!(v["revision"].as_i64().unwrap() >= 1);
+    assert_eq!(v["pathPolicy"], "relayUdp");
+    assert_eq!(v["peerPolicies"][0]["policy"], "directTcp");
+    let main_rev = v["revision"].as_i64().unwrap();
 
     let mut saw_settings = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -521,7 +535,11 @@ async fn admin_settings_roundtrip_and_ws_push() {
             let v: serde_json::Value = serde_json::from_str(&text).unwrap();
             if v["type"] == "settings_changed" {
                 saw_settings = true;
-                assert_eq!(v["message"], "1", "message carries the new revision");
+                assert_eq!(
+                    v["message"].as_str().and_then(|m| m.parse::<i64>().ok()),
+                    Some(main_rev),
+                    "message carries the new revision"
+                );
             }
         }
     }
@@ -539,8 +557,9 @@ async fn admin_settings_roundtrip_and_ws_push() {
         .json()
         .await
         .unwrap();
-    assert_eq!(v["revision"], 1);
-    assert_eq!(v["forceRelay"], true);
+    assert_eq!(v["revision"], main_rev);
+    assert_eq!(v["pathPolicy"], "relayUdp");
+    assert_eq!(v["peerPolicies"].as_array().unwrap().len(), 1);
     let v: serde_json::Value = srv
         .client
         .get(format!(
@@ -554,24 +573,21 @@ async fn admin_settings_roundtrip_and_ws_push() {
         .json()
         .await
         .unwrap();
-    assert_eq!(v["revision"], 1);
+    assert_eq!(v["revision"], main_rev);
 
-    // 全量替换：socksListen 空串=禁用；未包含的 forceRelay 回到未托管。
-    let v: serde_json::Value = put(serde_json::json!({ "socksListen": "" }))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(v["revision"], 2);
-    assert!(v.get("forceRelay").is_none());
+    // 全量替换：socksListen 空串=禁用；未包含的 pathPolicy/peerPolicies 回到未托管。
+    let resp = put(serde_json::json!({ "socksListen": "" })).await.unwrap();
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["revision"], main_rev + 1, "socks PUT 响应: {v}");
+    assert!(v.get("pathPolicy").is_none());
+    assert!(v.get("peerPolicies").is_none());
 
     // 心跳上报 revision/pending 后设备列表可见（管理页收敛状态）。
     let resp = srv
         .client
         .post(format!("{}/api/heartbeat", srv.base_url))
         .bearer_auth(&a.device_token)
-        .json(&serde_json::json!({ "settingsRevision": 2, "restartPending": true }))
+        .json(&serde_json::json!({ "settingsRevision": main_rev + 1, "restartPending": true }))
         .send()
         .await
         .unwrap();
@@ -590,10 +606,10 @@ async fn admin_settings_roundtrip_and_ws_push() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|d| d["id"].as_u64() == Some(a.device_id))
+        .find(|d| d["id"].as_str() == Some(&a.device_id.to_string()))
         .unwrap();
-    assert_eq!(me["settingsRevision"], 2);
-    assert_eq!(me["appliedRevision"], 2);
+    assert_eq!(me["settingsRevision"], main_rev + 1);
+    assert_eq!(me["appliedRevision"], main_rev + 1);
     assert_eq!(me["restartPending"], true);
 
     // 鉴权：无 admin 令牌 PUT/POST 指令端点均 401。
@@ -696,26 +712,25 @@ async fn settings_adopt_fills_only_unmanaged_fields() {
     let token = create_token(&srv, "net").await;
     let a = enroll(&srv, &token, "a", None).await.unwrap();
 
-    // 初始：forceRelay 已被管理员托管，其余未托管。
+    // 初始：pathPolicy 已被管理员托管，其余未托管。
     let resp = srv
         .client
         .put(format!("{}/admin/devices/{}/settings", srv.base_url, a.device_id))
         .header("X-Admin-Token", &srv.admin_token)
-        .json(&serde_json::json!({ "forceRelay": true }))
+        .json(&serde_json::json!({ "pathPolicy": "relayUdp" }))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
 
     // 节点收编遗留本地值：只填未托管字段（socks/forwards），已托管的
-    // forceRelay 不被节点覆盖。
+    // pathPolicy 不被节点覆盖。
     let v: serde_json::Value = srv
         .client
         .put(format!("{}/api/settings", srv.base_url))
         .bearer_auth(&a.device_token)
         .json(&serde_json::json!({
-            "forceRelay": false,
-            "forceDirect": true,
+            "pathPolicy": "directUdp",
             "socksListen": "127.0.0.1:19090",
             "forwards": [{ "listen": "127.0.0.1:13306", "proto": "tcp", "dest": "10.56.0.5:3306" }]
         }))
@@ -725,7 +740,7 @@ async fn settings_adopt_fills_only_unmanaged_fields() {
         .json()
         .await
         .unwrap();
-    assert_eq!(v["forceRelay"], true, "已托管字段不被收编覆盖");
+    assert_eq!(v["pathPolicy"], "relayUdp", "已托管字段不被收编覆盖");
     assert_eq!(v["socksListen"], "127.0.0.1:19090");
     assert_eq!(v["forwards"].as_array().unwrap().len(), 1);
 

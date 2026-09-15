@@ -2,6 +2,7 @@
 //! init-config / service.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
@@ -59,7 +60,10 @@ enum Cmd {
         log_file: Option<PathBuf>,
     },
     /// 内部命令：由 master（supervisor）拉起的 worker 子进程，勿手动调用
-    #[command(hide = true)]
+    // name 必须显式指定：clap 默认把变体名转成 kebab-case（Worker→worker），
+    // 与 supervisor.rs 的 WORKER_SUBCOMMAND="__worker" 不一致会让 worker
+    // 永远启动失败（曾因此循环崩溃重启）。
+    #[command(name = "__worker", hide = true)]
     Worker {
         #[arg(short, long, default_value = "starskiff.json")]
         config: PathBuf,
@@ -153,6 +157,18 @@ fn main() -> anyhow::Result<()> {
             let code = runtime.block_on(async move {
                 match skiff_node::start_engine(config, cfg, log).await {
                     Ok(engine) => {
+                        // 控制台 Ctrl+C 会同时送达 worker 子进程（Windows
+                        // console / 终端进程组）：默认处理直接终止进程，跳过
+                        // 优雅收尾。注册处理器改为按正常停止处理，与 master
+                        // 的 stop.flag 路径汇合（谁先到都幂等）。
+                        let e2 = Arc::clone(&engine);
+                        tokio::spawn(async move {
+                            let _ = tokio::signal::ctrl_c().await;
+                            skiff_node::engine::request_stop(
+                                &e2.shared,
+                                skiff_node::engine::StopReason::Stopped,
+                            );
+                        });
                         engine.stopped().await;
                         engine.exit_code()
                     }

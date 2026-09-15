@@ -63,6 +63,8 @@ Rust 实现的 mesh VPN：**控制面中心化、数据面去中心化**。业�
 
 ## 快速开始
 
+> **快捷方式**：`deploy/deploy-server.sh` 与 `deploy/deploy-node.sh` 可与对应可执行文件放在同一目录直接运行（Linux / Windows Git Bash 通用）——交互式提问、回车即用默认值完成部署并在前台运行，同时打印（但不执行）安装为系统服务的命令。
+
 ### 1. 启动服务器（有公网 IP 的机器）
 
 ```bash
@@ -124,7 +126,7 @@ starskiff up -c starskiff.json                                  # 双网络同�
 }
 ```
 
-**其余一切网络行为配置由服务器权威下发**：网络成员（管理页或 CLI `device network add/remove`）、`forceRelay`/`forceDirect`/`exposes`/`socksListen`/`forwards`/托管 `mtu`（管理页「设备配置」；热改项立即生效，其余重启生效）。节点启动时拉取名单位置与托管配置；旧版本文件中的遗留行为字段会在首次启动时自动收编为服务端托管值。`starskiff up` 与服务模式均为 master/worker 架构：管理页的重启指令由 master 以最新配置重新拉起 worker。
+**其余一切网络行为配置由服务器权威下发**：网络成员（管理页或 CLI `device network add/remove`）、路径策略（`pathPolicy` 全局 + `peerPolicies` 按对端覆盖：自动/强制 UDP 中继/强制 TCP 中继/只许直连/强制 UDP 直连/强制 TCP 直连，热生效、只控本端出口）、`exposes`/`socksListen`/`forwards`/托管 `mtu`（管理页「设备配置」；热改项立即生效，其余重启生效）。节点启动时拉取名单位置与托管配置；旧版本文件中的遗留行为字段会在首次启动时自动收编为服务端托管值。`starskiff up` 与服务模式均为 master/worker 架构：管理页的重启指令由 master 以最新配置重新拉起 worker。
 
 ```json
 {

@@ -164,6 +164,10 @@ async fn read_loop(
                                 let _ = tx.send(framed);
                             }
                         }
+                        // REGISTER 的 ACK：忽略即可继续读（曾落入 `_ => return`
+                        // 导致读循环首包即退出——发送正常、接收永久失效的
+                        // 僵尸连接，RelayTcp 从未被路由所以一直没暴露）。
+                        Some(RelayTcpMsg::Ack { .. }) => {}
                         Some(RelayTcpMsg::Error { body }) => {
                             let _ = events.send(EngineEvent::Log(format!(
                                 "中继 TCP 错误: {}",

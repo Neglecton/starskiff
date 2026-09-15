@@ -43,7 +43,7 @@ tests/it              Harness（进程内 server+节点）+ mesh.rs 六场景
 
 0. **多网络不变式**：`peers` 按 `(network, device)` 双键组织（每网络独立 codec——密钥以 networkId 为派生盐）；**`PacketCodec::try_open` 必须解密成功后才推进重放窗口**（多 codec 试解零副作用的前提，wire.rs 有注释与单测锁定）；**starskiff.json 是瘦配置**（server/mode/mtu/dataDir/listen 端口/identity——启动名单唯一来源是 GET /api/memberships、行为配置唯一来源是 GET /api/settings，文件不再有 networks/socks/forwards/force 字段；遗留文件的非默认值在首次启动经 PUT /api/settings adopt 收编，之后文件被重写、遗留键消失）；TUN 模式限单网络（服务端强制 join 预检 + 节点启动兜底）；WS 每网络一条连接，事件按 networkId 路由；**join/leave 双通道**：CLI join 走 /api/join，管理端强制 join/leave 走 /admin/devices/{id}/networks 并推 networks_changed（节点对账 roster：离开即时修剪、加入置 restartPending；推送丢失由 WS 重连自拉兜底）。
 1. **首字节 magic 是协议级判别**：wire `0x0A`（version=2，帧头 11B 明文头进 AEAD AAD——头部可见但不可篡改，勿改回无 AAD）、中继 `0x0B`（version=1，未知版本静默丢弃）。两个 magic 必须落在 **0x04–0x13** 区间（避 QUIC/STUN/DTLS/IKE/ASCII，见 docs/protocol.md 判别表）。改任一值 = 破坏兼容；新增隧道协议复用现有端口按首字节分流。
-2. **所有 JSON 走 serde camelCase + null 省略**（DTO 在 skiff-core/src/models.rs，全部双向 derive）；错误响应统一 `{"error":"..."}`；API DTO 放 core（两端共享）。
+2. **所有 JSON 走 serde camelCase + null 省略**（DTO 在 skiff-core/src/models.rs，全部双向 derive）；错误响应统一 `{"error":"..."}`；API DTO 放 core（两端共享）；**设备 id 在管理面 JSON 中以字符串传输**（AdminDevice.id / PeerPathReport.deviceId / PeerPolicy.deviceId——随机 u64 常超 JS Number 的 2^53 精度，按数字解析会失真导致"设备不存在"；节点内部仍按 u64 用，边界 parse）。
 3. **存储是 rusqlite 手写 ADO**（单连接 Mutex + WAL，无 ORM）；行映射列名必须与 SQL 一致；enroll 是唯一事务（IP 分配优先级 requestedIp > token.requestedIp > 顺序）。
 4. **UDP flow 有方向性**：发起方与响应方对同一 flowId 各持 `FlowCtx::Udp`，DATAGRAM 按 `outbound` 标志分流（flow.rs）——曾因 clippy fix 折叠掉方向检查引入 bug，改动此区域后必跑 `udp_forward_carries_datagrams` 测试。
 5. **DashMap 引用不可重叠同 key**（分片读写锁自死锁）——UdpRelay 的 RELAY 分支曾因此冻结整个 current-thread runtime；同 key 的 get/get_mut 必须顺序化（先 drop 再取）。
@@ -59,7 +59,7 @@ tests/it              Harness（进程内 server+节点）+ mesh.rs 六场景
 15. **探测 PING 可能误入同机其它 UDP 端口**（邻近端口预测副作用，sealed 帧被 forwarder 转发是预期噪声）——测试断言注意。
 16. Git Bash 下 docker 的容器内路径加 `export MSYS_NO_PATHCONV=1`。
 17. **默认端口 24930-24933**（API/RelayUdp/RelayTcp/节点监听）；防火墙规则名 `Starskiff {name} UDP/TCP`，remove 按名删除——改名要两处同步。
-18. **设备托管配置（DeviceSettings）走 revision 收敛**：服务端权威递增 revision，节点只在 `settings_changed` 推送与每次 WS `connected` 时自拉并按 `revision` 幂等应用（多网络节点多连接重复投递必须安全）；PUT 是全量替换，字段缺省=未托管走默认值（socks 默认开启 127.0.0.1:1080）；节点侧 `PUT /api/settings`（adopt）仅填未托管字段（遗留值收编，幂等无新值不递增 revision）；Secret/身份/listen 端口/mode 永不进该通道；**重启类字段（mtu/socks/forwards）不落文件**——以 EngineShared.runtime_* 为生效基准做 restart_pending 比对，重启按拉取值重建。
+18. **设备托管配置（DeviceSettings）走 revision 收敛**：服务端权威递增 revision，节点只在 `settings_changed` 推送与每次 WS `connected` 时自拉并按 `revision` 幂等应用（多网络节点多连接重复投递必须安全）；PUT 是全量替换，字段缺省=未托管走默认值（socks 默认开启 127.0.0.1:1080）；节点侧 `PUT /api/settings`（adopt）仅填未托管字段（遗留值收编，幂等无新值不递增 revision）；Secret/身份/listen 端口/mode 永不进该通道；**重启类字段（mtu/socks/forwards）不落文件**——以 EngineShared.runtime_* 为生效基准做 restart_pending 比对，重启按拉取值重建。**路径策略（PathPolicy：auto/relayUdp/relayTcp/directAny/directUdp/directTcp，全局+按对端覆盖）热生效且只控本端出口**：中继回退与超时降级仅 auto；探测/升级以"资源是否就绪"判断而非 path（pin 下 apply 已把 path 置为 pin 值，以 path 判断会死锁）；**relayTcp 送达要求接收方持有 TCP 中继连接**（单向 pin 黑洞，管理页提供成对设置）；RelayTcpClient 收到 REGISTER ACK 必须继续读（曾 `_ => return` 僵尸——发送正常接收全失）。
 19. **WS 握手请求必须经 `into_client_request()` 从 URL 生成**（control.rs run_ws_once）：手工 `Request::builder().uri()` 构造的请求缺 sec-websocket-key 等握手头，握手必被拒——曾因此引擎事件订阅整体静默失效，全靠 5s probe 轮询兜底。
 
 ## 结构化日志（稳定性/性能分析）

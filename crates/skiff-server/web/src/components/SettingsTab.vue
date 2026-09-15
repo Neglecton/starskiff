@@ -21,16 +21,16 @@ const joinIp = ref('');
 
 // 托管开关：未勾选 = 该项沿用节点本地配置（PUT 时省略字段）。
 const managed = ref({
-  forceRelay: false,
-  forceDirect: false,
+  pathPolicy: false,
+  peerPolicies: false,
   mtu: false,
   socks: false,
   forwards: false,
   exposes: {}, // networkId -> bool
 });
 const form = ref({
-  forceRelay: false,
-  forceDirect: false,
+  pathPolicy: 'auto',
+  peerPolicies: [], // { deviceId, policy }
   mtu: 1300,
   socksEnabled: true,
   socksAddr: '127.0.0.1:1080',
@@ -59,6 +59,22 @@ const statusTag = computed(() => {
 });
 
 const networkList = computed(() => current.value?.networks ?? []);
+
+// 路径策略六档（PathPolicy）与对端设备下拉（排除自己）。
+const policyOptions = computed(() =>
+  ['auto', 'relayUdp', 'relayTcp', 'directAny', 'directUdp', 'directTcp'].map((v) => ({
+    value: v,
+    label: t(`settings.policy.${v}`),
+  })),
+);
+const peerDeviceOptions = computed(() =>
+  devices.value.filter((d) => d.id !== deviceId.value).map((d) => ({ value: d.id, label: d.name })),
+);
+const nameOf = (id) => devices.value.find((d) => d.id === id)?.name || String(id);
+
+function addPeerPolicy() {
+  form.value.peerPolicies.push({ deviceId: null, policy: 'directTcp' });
+}
 
 // 可加入的网络 = 全部网络 - 已加入（按 id）。
 const joinOptions = computed(() => {
@@ -132,21 +148,21 @@ async function loadSettings() {
   try {
     const s = await api('GET', `/admin/devices/${deviceId.value}/settings`);
     const m = {
-      forceRelay: false,
-      forceDirect: false,
+      pathPolicy: false,
+      peerPolicies: false,
       mtu: false,
       socks: false,
       forwards: false,
       exposes: {},
     };
-    const f = { ...form.value, exposes: {} };
-    if (s.forceRelay != null) {
-      m.forceRelay = true;
-      f.forceRelay = s.forceRelay;
+    const f = { ...form.value, exposes: {}, peerPolicies: [] };
+    if (s.pathPolicy != null) {
+      m.pathPolicy = true;
+      f.pathPolicy = s.pathPolicy;
     }
-    if (s.forceDirect != null) {
-      m.forceDirect = true;
-      f.forceDirect = s.forceDirect;
+    if (s.peerPolicies != null) {
+      m.peerPolicies = true;
+      f.peerPolicies = s.peerPolicies.map((x) => ({ ...x }));
     }
     if (s.mtu != null) {
       m.mtu = true;
@@ -185,8 +201,12 @@ watch(deviceId, () => loadSettings());
 
 function buildBody() {
   const body = {};
-  if (managed.value.forceRelay) body.forceRelay = form.value.forceRelay;
-  if (managed.value.forceDirect) body.forceDirect = form.value.forceDirect;
+  if (managed.value.pathPolicy) body.pathPolicy = form.value.pathPolicy || 'auto';
+  if (managed.value.peerPolicies) {
+    body.peerPolicies = form.value.peerPolicies
+      .filter((p) => p.deviceId != null)
+      .map((p) => ({ deviceId: p.deviceId, policy: p.policy || 'auto' }));
+  }
   if (managed.value.mtu) body.mtu = Number(form.value.mtu);
   if (managed.value.socks) {
     body.socksListen = form.value.socksEnabled ? String(form.value.socksAddr).trim() : '';
@@ -224,12 +244,53 @@ async function pollStatus(times = 4) {
   }
 }
 
-async function save() {
+// 需要提示对称设置的对端覆盖（非 auto 才有方向意义）。
+function overridesNeedingReverse() {
+  if (!managed.value.peerPolicies) return [];
+  return form.value.peerPolicies.filter((p) => p.deviceId != null && p.policy && p.policy !== 'auto');
+}
+
+// 在对端设备上写入反向覆盖（peer → 本机），保留对端其它托管字段。
+async function applyReverse(overrides) {
+  const me = deviceId.value;
+  for (const ov of overrides) {
+    const target = await api('GET', `/admin/devices/${ov.deviceId}/settings`);
+    const { revision: _rev, ...rest } = target;
+    const list = (target.peerPolicies || []).filter((x) => x.deviceId !== me);
+    list.push({ deviceId: me, policy: ov.policy });
+    await api('PUT', `/admin/devices/${ov.deviceId}/settings`, { ...rest, peerPolicies: list });
+  }
+}
+
+function save() {
   if (!deviceId.value) return;
+  const overrides = overridesNeedingReverse();
+  if (overrides.length) {
+    dialog.warning({
+      title: t('settings.reverseTitle'),
+      content: t('settings.reversePrompt', { list: overrides.map((o) => nameOf(o.deviceId)).join('、') }),
+      positiveText: t('settings.reverseYes'),
+      negativeText: t('settings.reverseNo'),
+      onPositiveClick: () => doSave(overrides),
+      onNegativeClick: () => {
+        doSave([]);
+      },
+    });
+  } else {
+    doSave([]);
+  }
+}
+
+async function doSave(reverseList) {
   saving.value = true;
   try {
     const saved = await api('PUT', `/admin/devices/${deviceId.value}/settings`, buildBody());
-    message.success(t('settings.saved') + ` (r${saved.revision})`);
+    let msg = t('settings.saved') + ` (r${saved.revision})`;
+    if (reverseList.length) {
+      await applyReverse(reverseList);
+      msg += `；${t('settings.reverseDone')}`;
+    }
+    message.success(msg);
     pollStatus();
   } catch (e) {
     message.error(e.message);
@@ -362,15 +423,37 @@ onMounted(load);
       <!-- 热生效区 -->
       <n-card size="small" :title="t('settings.hotSection')" style="margin-bottom: 12px">
         <div class="field-row">
-          <n-checkbox v-model:checked="managed.forceRelay" />
-          <n-switch v-model:value="form.forceRelay" size="small" :disabled="!managed.forceRelay" />
-          <span>{{ t('settings.forceRelay') }}</span>
+          <n-checkbox v-model:checked="managed.pathPolicy" />
+          <n-select
+            v-model:value="form.pathPolicy"
+            :options="policyOptions"
+            :disabled="!managed.pathPolicy"
+            size="small"
+            style="width: 230px"
+          />
+          <span class="hint">{{ t('settings.policyHint') }}</span>
         </div>
         <div class="field-row">
-          <n-checkbox v-model:checked="managed.forceDirect" />
-          <n-switch v-model:value="form.forceDirect" size="small" :disabled="!managed.forceDirect" />
-          <span>{{ t('settings.forceDirect') }}</span>
+          <n-checkbox v-model:checked="managed.peerPolicies" />
+          <span>{{ t('settings.peerPolicies') }}</span>
         </div>
+        <template v-if="managed.peerPolicies">
+          <div v-for="(pp, i) in form.peerPolicies" :key="i" class="rule-row">
+            <n-select
+              v-model:value="pp.deviceId"
+              :options="peerDeviceOptions"
+              :placeholder="t('settings.pickPeer')"
+              filterable
+              size="small"
+              style="width: 220px"
+            />
+            <n-select v-model:value="pp.policy" :options="policyOptions" size="small" style="width: 210px" />
+            <n-button size="tiny" quaternary type="error" @click="form.peerPolicies.splice(i, 1)">
+              {{ t('settings.del') }}
+            </n-button>
+          </div>
+          <n-button size="tiny" dashed @click="addPeerPolicy">{{ t('settings.addPeerPolicy') }}</n-button>
+        </template>
 
         <div class="section-label">{{ t('settings.exposes') }}</div>
         <div v-for="net in networkList" :key="net.networkId" class="net-block">

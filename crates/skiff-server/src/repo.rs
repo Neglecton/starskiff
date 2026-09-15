@@ -209,11 +209,20 @@ impl Repo {
     ) -> Result<DeviceSettings, RepoError> {
         let current = self.get_device_settings(device_id)?;
         let mut merged = current.clone();
-        if merged.force_relay.is_none() {
-            merged.force_relay = candidate.force_relay;
+        if merged.path_policy.is_none() {
+            merged.path_policy = candidate.path_policy;
         }
-        if merged.force_direct.is_none() {
-            merged.force_direct = candidate.force_direct;
+        if merged.peer_policies.is_none() {
+            merged.peer_policies = candidate.peer_policies.clone();
+        } else if let Some(cur) = &mut merged.peer_policies
+            && let Some(cand) = &candidate.peer_policies
+        {
+            // 逐对端合并：已有覆盖的对端不动，其余采纳候选。
+            for pp in cand {
+                if !cur.iter().any(|x| x.device_id == pp.device_id) {
+                    cur.push(pp.clone());
+                }
+            }
         }
         if merged.mtu.is_none() {
             merged.mtu = candidate.mtu;
