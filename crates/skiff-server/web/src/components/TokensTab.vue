@@ -34,13 +34,14 @@ function openDetail(token) {
   showDetail.value = true;
 }
 
-async function copyText(text) {
+async function copyText(text, notify = true) {
   try {
     await navigator.clipboard.writeText(text);
-    message.success(t('tokens.copied'));
+    if (notify) message.success(t('tokens.copied'));
+    return true;
   } catch {
-    // Clipboard may be unavailable (insecure context); the modal still
-    // shows the full value for manual selection.
+    // Clipboard may be unavailable; the modal still allows manual selection.
+    return false;
   }
 }
 
@@ -118,8 +119,13 @@ async function generate() {
       expiresInHours: form.value.hours,
       requestedIp: form.value.ip.trim() || null,
     });
-    message.success(t('tokens.generated'));
-    if (created?.token) openDetail(created.token);
+    if (created?.token) {
+      openDetail(created.token);
+      const copied = await copyText(created.token, false);
+      message[copied ? 'success' : 'info'](t(copied ? 'tokens.generated' : 'tokens.generatedManual'));
+    } else {
+      message.success(t('tokens.generated'));
+    }
     await load();
   } catch (e) {
     message.error(e.message);
@@ -153,20 +159,20 @@ onMounted(load);
 
 <template>
   <div>
-    <n-form inline label-placement="top" style="margin-bottom: 14px" @submit.prevent="generate">
-      <n-form-item :label="$t('tabs.networks')">
-        <n-select v-model:value="form.network" :options="networks" style="width: 200px" />
+    <n-form class="form-toolbar token-toolbar" inline label-placement="top" @submit.prevent="generate">
+      <n-form-item class="token-field token-network" :label="$t('tabs.networks')">
+        <n-select v-model:value="form.network" :options="networks" />
       </n-form-item>
-      <n-form-item :label="$t('tokens.usesLabel')">
-        <n-input-number v-model:value="form.uses" :min="1" :max="1000" style="width: 110px" />
+      <n-form-item class="token-field token-number" :label="$t('tokens.usesLabel')">
+        <n-input-number v-model:value="form.uses" :min="1" :max="1000" />
       </n-form-item>
-      <n-form-item :label="$t('tokens.hoursLabel')">
-        <n-input-number v-model:value="form.hours" :min="1" :max="8760" style="width: 110px" />
+      <n-form-item class="token-field token-number" :label="$t('tokens.hoursLabel')">
+        <n-input-number v-model:value="form.hours" :min="1" :max="8760" />
       </n-form-item>
-      <n-form-item :label="$t('tokens.ipLabel')">
-        <n-input v-model:value="form.ip" :placeholder="$t('tokens.ipPh')" style="width: 140px" @keyup.enter="generate" />
+      <n-form-item class="token-field token-ip" :label="$t('tokens.ipLabel')">
+        <n-input v-model:value="form.ip" :placeholder="$t('tokens.ipPh')" @keyup.enter="generate" />
       </n-form-item>
-      <n-form-item label=" ">
+      <n-form-item class="form-action" label=" ">
         <n-button type="primary" :loading="generating" :disabled="!form.network" @click="generate">
           {{ generating ? $t('tokens.generating') : $t('tokens.generate') }}
         </n-button>
@@ -179,7 +185,11 @@ onMounted(load);
       :row-key="(r) => r.token"
       size="small"
       :bordered="false"
-    />
+    >
+      <template #empty>
+        <div class="table-empty">{{ $t('tokens.empty') }}</div>
+      </template>
+    </n-data-table>
 
     <n-modal
       v-model:show="showDetail"
@@ -204,3 +214,45 @@ onMounted(load);
     </n-modal>
   </div>
 </template>
+
+<style scoped>
+.token-field {
+  margin-bottom: 0;
+}
+
+.token-network {
+  width: min(100%, 220px);
+}
+
+.token-number {
+  width: 120px;
+}
+
+.token-ip {
+  width: min(100%, 160px);
+}
+
+.token-field :deep(.n-input-number),
+.token-field :deep(.n-select),
+.token-field :deep(.n-input) {
+  width: 100%;
+}
+
+.token-modal :deep(.n-card__content) {
+  background: var(--sk-surface);
+}
+
+.token-full {
+  padding: 12px;
+  border: 1px solid var(--sk-border);
+  border-radius: 8px;
+  background: var(--sk-surface-soft);
+}
+
+@media (max-width: 640px) {
+  .token-field,
+  .form-action {
+    width: 100%;
+  }
+}
+</style>

@@ -2,6 +2,9 @@ export default {
   app: {
     subtitle: 'Admin Console',
     logout: 'Disconnect',
+    language: 'Switch language',
+    themeLight: 'Switch to light theme',
+    themeDark: 'Switch to dark theme',
   },
   login: {
     title: 'Sign in to the admin console',
@@ -31,6 +34,7 @@ export default {
     noPaths: 'No path data yet (waiting for heartbeats)',
     noReport: 'not reported',
     hint: 'Drag nodes to rearrange · scroll to zoom · drag background to pan · click a node for its path view',
+    graphLabel: 'Network topology graph; drag, pan, and zoom to explore',
   },
   tabs: {
     topology: 'Topology',
@@ -146,6 +150,7 @@ export default {
     empty: 'No devices yet',
     noNetwork: 'Not in any network',
     removed: 'Device removed',
+    separator: ', ',
     confirmRemove: 'Remove this device? All its network memberships will be deleted.',
     confirmRemoveTitle: 'Remove device',
     ipUpdated: 'IP updated (the device will be notified of the config change)',
@@ -170,6 +175,7 @@ export default {
     actions: 'Actions',
     empty: 'No tokens yet',
     generated: 'Token generated and copied to clipboard',
+    generatedManual: 'Token generated; copy it manually from the dialog',
     revoked: 'Token revoked',
     showFull: 'Show full token',
     copy: 'Copy',

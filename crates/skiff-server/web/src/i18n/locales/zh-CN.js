@@ -2,6 +2,9 @@ export default {
   app: {
     subtitle: '管理控制台',
     logout: '断开',
+    language: '切换语言',
+    themeLight: '切换到浅色主题',
+    themeDark: '切换到深色主题',
   },
   login: {
     title: '登录管理控制台',
@@ -31,6 +34,7 @@ export default {
     noPaths: '暂无到其它节点的路径数据（等待心跳上报）',
     noReport: '未上报',
     hint: '拖拽节点调整布局 · 滚轮缩放 · 空白处拖动平移 · 点击节点查看其到各对端的路径视角',
+    graphLabel: '网络拓扑图，可拖拽节点、平移和缩放',
   },
   tabs: {
     topology: '拓扑',
@@ -146,6 +150,7 @@ export default {
     empty: '暂无设备',
     noNetwork: '未加入网络',
     removed: '设备已移除',
+    separator: '、',
     confirmRemove: '移除该设备？其所有网络成员关系将删除。',
     confirmRemoveTitle: '移除设备',
     ipUpdated: 'IP 已更新（设备将收到配置变更通知）',
@@ -169,7 +174,8 @@ export default {
     revoke: '吊销',
     actions: '操作',
     empty: '暂无令牌',
-    generated: '令牌已生成，已复制到剪贴板',
+    generated: '令牌已生成并复制到剪贴板',
+    generatedManual: '令牌已生成，请从弹窗中手动复制',
     revoked: '令牌已吊销',
     showFull: '查看完整令牌',
     copy: '复制',

@@ -35,7 +35,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <n-card class="login-card" :bordered="true" style="width: 400px; max-width: 92vw">
+  <n-card class="login-card" :bordered="true">
     <template #header>{{ $t('login.title') }}</template>
     <n-form label-placement="top" @submit.prevent="connect">
       <n-form-item :label="$t('login.serverUrl')">
@@ -53,7 +53,7 @@ onMounted(() => {
       <n-button type="primary" block :loading="connecting" :disabled="!token.trim()" @click="connect">
         {{ connecting ? $t('login.connecting') : $t('login.connect') }}
       </n-button>
-      <n-p depth="3" style="font-size: 12px; margin: 14px 0 0">
+      <n-p class="login-hint" depth="3">
         {{ $t('login.hint') }}
       </n-p>
     </n-form>
@@ -62,6 +62,14 @@ onMounted(() => {
 
 <style scoped>
 .login-card {
-  border-radius: 12px;
+  width: min(400px, 100%);
+  border-radius: 16px;
+  box-shadow: var(--sk-shadow);
+}
+
+.login-hint {
+  margin: 14px 0 0;
+  font-size: 12px;
+  line-height: 1.65;
 }
 </style>

@@ -1,8 +1,66 @@
-/* Global tweaks on top of Naive UI; theming itself is token-driven in App.vue. */
+/* Semantic tokens keep custom UI consistent with Naive UI in both themes. */
+:root {
+  color-scheme: light;
+  --sk-page-bg: #f8fafc;
+  --sk-header-bg: rgba(255, 255, 255, 0.92);
+  --sk-surface: #ffffff;
+  --sk-surface-soft: #f1f5f9;
+  --sk-border: #e2e8f0;
+  --sk-border-strong: #cbd5e1;
+  --sk-text: #1e293b;
+  --sk-text-muted: #64748b;
+  --sk-topology-grid: rgba(100, 116, 139, 0.12);
+  --sk-brand: #2563eb;
+  --sk-topology-label: #475569;
+  --sk-topology-rtt: #64748b;
+  --sk-direct-udp: #047857;
+  --sk-direct-tcp: #1d4ed8;
+  --sk-relay-tcp: #7e22ce;
+  --sk-relay-udp: #b45309;
+  --sk-offline: #64748b;
+  --sk-shadow: 0 12px 32px rgba(15, 23, 42, 0.08);
+}
+
+.theme-dark {
+  color-scheme: dark;
+  --sk-page-bg: #0c111c;
+  --sk-header-bg: rgba(16, 22, 35, 0.94);
+  --sk-surface: #151d2d;
+  --sk-surface-soft: #1b2638;
+  --sk-border: #2a3348;
+  --sk-border-strong: #3a4861;
+  --sk-text: #f8fafc;
+  --sk-text-muted: #94a3b8;
+  --sk-topology-grid: rgba(148, 163, 184, 0.1);
+  --sk-brand: #60a5fa;
+  --sk-topology-label: #cbd5e1;
+  --sk-topology-rtt: #94a3b8;
+  --sk-direct-udp: #34d399;
+  --sk-direct-tcp: #60a5fa;
+  --sk-relay-tcp: #c084fc;
+  --sk-relay-udp: #fbbf24;
+  --sk-offline: #94a3b8;
+  --sk-shadow: 0 14px 36px rgba(0, 0, 0, 0.28);
+}
 
 html, body {
   margin: 0;
   padding: 0;
+  background: var(--sk-page-bg);
+  color: var(--sk-text);
+}
+
+body {
+  transition: background-color 180ms ease, color 180ms ease;
+}
+
+button, input, textarea, select {
+  font: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid #3b82f6;
+  outline-offset: 2px;
 }
 
 /* Monospace for ids / tokens / CIDRs. */
@@ -11,15 +69,7 @@ html, body {
   font-size: 13px;
 }
 
-/* Dense two-line membership cell in the devices table. */
-.member-cell {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-  padding: 2px 0;
-}
-
+.member-cell,
 .path-cell {
   display: flex;
   align-items: center;
@@ -43,19 +93,22 @@ html, body {
   vertical-align: middle;
 }
 
-.page {
-  padding: 20px 28px 48px;
-}
-
 .app-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 16px;
   flex-wrap: wrap;
-  padding: 14px 24px;
+  min-height: 65px;
+  box-sizing: border-box;
+  padding: 12px clamp(16px, 4vw, 40px);
   border-bottom: 1px solid var(--sk-border);
   background: var(--sk-header-bg);
+  backdrop-filter: blur(14px);
+  color: var(--sk-text);
 }
 
 .app-title {
@@ -65,16 +118,72 @@ html, body {
   margin: 0;
   font-size: 19px;
   font-weight: 700;
+  letter-spacing: -0.02em;
 }
 
 .app-title .sub {
   font-size: 13px;
   font-weight: 400;
-  opacity: 0.6;
+  color: var(--sk-text-muted);
 }
 
 .header-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.page-content .n-tabs {
+  min-width: 0;
+}
+
+.page-content .n-tab-pane {
+  min-width: 0;
+  padding-top: 18px;
+}
+
+.page-content .n-data-table {
+  border: 1px solid var(--sk-border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--sk-surface);
+}
+
+.table-empty {
+  padding: 28px 16px;
+  color: var(--sk-text-muted);
+  text-align: center;
+}
+
+.toolbar,
+.form-toolbar {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 640px) {
+  .toolbar,
+  .form-toolbar {
+    align-items: stretch;
+  }
+
+  .toolbar > *,
+  .form-toolbar > * {
+    max-width: 100%;
+  }
+
+  .page-content .n-tabs .n-tabs-nav {
+    overflow-x: auto;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
 }

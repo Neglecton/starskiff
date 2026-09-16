@@ -13,7 +13,8 @@ function initialLang() {
 function initialTheme() {
   const saved = localStorage.getItem(LS_THEME);
   if (saved === 'light' || saved === 'dark') return saved;
-  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  // The console opens in a predictable light theme until the user chooses otherwise.
+  return 'light';
 }
 
 export const store = reactive({

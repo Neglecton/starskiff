@@ -162,13 +162,17 @@ onMounted(load);
 </script>
 
 <template>
-  <n-data-table
-    :columns="columns"
-    :data="rows"
-    :loading="loading"
-    :row-key="(r) => r.id"
-    size="small"
-    :bordered="false"
-    :scroll-x="1050"
-  />
+    <n-data-table
+      :columns="columns"
+      :data="rows"
+      :loading="loading"
+      :row-key="(r) => r.id"
+      size="small"
+      :bordered="false"
+      :scroll-x="1050"
+    >
+      <template #empty>
+        <div class="table-empty">{{ $t('devices.empty') }}</div>
+      </template>
+    </n-data-table>
 </template>

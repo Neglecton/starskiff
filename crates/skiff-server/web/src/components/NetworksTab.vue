@@ -91,14 +91,14 @@ onMounted(load);
 
 <template>
   <div>
-    <n-form inline label-placement="top" style="margin-bottom: 14px" @submit.prevent="create">
-      <n-form-item :label="$t('networks.name')">
-        <n-input v-model:value="form.name" :placeholder="$t('networks.namePh')" style="width: 190px" @keyup.enter="create" />
+    <n-form class="form-toolbar" inline label-placement="top" @submit.prevent="create">
+      <n-form-item class="form-field" :label="$t('networks.name')">
+        <n-input v-model:value="form.name" :placeholder="$t('networks.namePh')" @keyup.enter="create" />
       </n-form-item>
-      <n-form-item :label="$t('networks.cidr')">
-        <n-input v-model:value="form.cidr" :placeholder="$t('networks.cidrPh')" style="width: 190px" @keyup.enter="create" />
+      <n-form-item class="form-field" :label="$t('networks.cidr')">
+        <n-input v-model:value="form.cidr" :placeholder="$t('networks.cidrPh')" @keyup.enter="create" />
       </n-form-item>
-      <n-form-item label=" ">
+      <n-form-item class="form-action" label=" ">
         <n-button type="primary" :loading="creating" :disabled="!form.name.trim() || !form.cidr.trim()" @click="create">
           {{ creating ? $t('networks.creating') : $t('networks.create') }}
         </n-button>
@@ -111,6 +111,28 @@ onMounted(load);
       :row-key="(r) => r.id"
       size="small"
       :bordered="false"
-    />
+    >
+      <template #empty>
+        <div class="table-empty">{{ $t('networks.empty') }}</div>
+      </template>
+    </n-data-table>
   </div>
 </template>
+
+<style scoped>
+.form-field {
+  width: min(100%, 230px);
+}
+
+.form-action {
+  margin-left: auto;
+}
+
+@media (max-width: 640px) {
+  .form-field,
+  .form-action {
+    width: 100%;
+    margin-left: 0;
+  }
+}
+</style>

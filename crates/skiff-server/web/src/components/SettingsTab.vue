@@ -297,7 +297,7 @@ function save() {
   if (overrides.length) {
     dialog.warning({
       title: t('settings.reverseTitle'),
-      content: t('settings.reversePrompt', { list: overrides.map((o) => nameOf(o.deviceId)).join('、') }),
+      content: t('settings.reversePrompt', { list: overrides.map((o) => nameOf(o.deviceId)).join(t('devices.separator')) }),
       positiveText: t('settings.reverseYes'),
       negativeText: t('settings.reverseNo'),
       onPositiveClick: () => doSave(overrides),
@@ -658,36 +658,77 @@ onMounted(load);
 
 <style scoped>
 .settings-tab {
-  max-width: 860px;
+  width: min(100%, 900px);
 }
-.toolbar {
+
+.settings-tab :deep(.n-card) {
+  border-color: var(--sk-border);
+  background: var(--sk-surface);
+}
+
+.settings-tab .toolbar {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-bottom: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
 }
-.toolbar .spacer {
-  flex: 1;
-}
-.field-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: 6px 0;
-}
-.section-label {
-  font-weight: 600;
-  margin: 12px 0 4px;
-}
-.net-block {
-  padding: 4px 0 4px 12px;
-  border-left: 2px solid rgba(128, 128, 128, 0.2);
-  margin: 6px 0;
-}
+
+.toolbar .spacer { flex: 1; }
+
+.field-row,
 .rule-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin: 4px 0;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 8px 0;
+}
+
+.field-row > .hint,
+.rule-row > .hint {
+  color: var(--sk-text-muted);
+  font-size: 12px;
+}
+
+.section-label {
+  margin: 18px 0 6px;
+  color: var(--sk-text);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.net-block {
+  padding: 6px 0 6px 12px;
+  border-left: 2px solid var(--sk-border);
+  margin: 8px 0;
+}
+
+.rule-row :deep(.n-input),
+.rule-row :deep(.n-input-number),
+.rule-row :deep(.n-select) {
+  max-width: 100%;
+}
+
+@media (max-width: 640px) {
+  .settings-tab .toolbar > :not(.spacer),
+  .field-row > :not(.spacer),
+  .rule-row > :not(.spacer) {
+    max-width: 100%;
+  }
+
+  .settings-tab .toolbar > .n-select,
+  .field-row > .n-select,
+  .field-row > .n-input,
+  .field-row > .n-input-number,
+  .rule-row > .n-input,
+  .rule-row > .n-input-number,
+  .rule-row > .n-select {
+    width: min(100%, 360px) !important;
+  }
+
+  .net-block {
+    padding-left: 8px;
+  }
 }
 </style>

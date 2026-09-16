@@ -1049,9 +1049,10 @@ mod tests {
     }
 
     fn settings_with_socks(port: u16) -> DeviceSettings {
-        let mut s = DeviceSettings::default();
-        s.socks_listen = Some(format!("127.0.0.1:{port}"));
-        s
+        DeviceSettings {
+            socks_listen: Some(format!("127.0.0.1:{port}")),
+            ..DeviceSettings::default()
+        }
     }
 
     fn last_good_json(repo: &Repo, device_id: u64) -> Option<String> {

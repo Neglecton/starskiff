@@ -66,73 +66,139 @@ const autoToken = store.token;
     :theme-overrides="themeOverrides"
     :locale="naiveLocale"
     :date-locale="naiveDateLocale"
-    style="min-height: 100vh"
   >
     <n-message-provider placement="top">
       <n-dialog-provider>
-        <div v-if="!store.connected" class="login-wrap" :class="{ dark: isDark }">
-          <LoginPanel :auto-token="autoToken" @login="onLogin" />
+        <div class="app-shell" :class="{ 'theme-dark': isDark }">
+          <div v-if="!store.connected" class="login-wrap">
+            <LoginPanel :auto-token="autoToken" @login="onLogin" />
+          </div>
+          <template v-else>
+            <header class="app-header">
+              <div class="brand-lockup">
+                <span class="brand-mark" aria-hidden="true">S</span>
+                <h1 class="app-title">
+                  Starskiff <span class="sub">{{ $t('app.subtitle') }}</span>
+                </h1>
+              </div>
+              <div class="header-actions">
+                <n-button
+                  quaternary
+                  size="small"
+                  :aria-label="$t('app.language')"
+                  @click="setLang(store.lang === 'zh-CN' ? 'en-US' : 'zh-CN')"
+                >
+                  {{ store.lang === 'zh-CN' ? 'EN' : '中文' }}
+                </n-button>
+                <n-button
+                  quaternary
+                  size="small"
+                  :aria-label="$t(isDark ? 'app.themeLight' : 'app.themeDark')"
+                  @click="toggleTheme"
+                >
+                  <template #icon>
+                    <NIcon><SunnyOutline v-if="isDark" /><MoonOutline v-else /></NIcon>
+                  </template>
+                </n-button>
+                <n-button secondary size="small" @click="logout">{{ $t('app.logout') }}</n-button>
+              </div>
+            </header>
+            <main class="page">
+              <div class="page-content">
+                <StatCards />
+                <n-tabs type="line" animated>
+                  <n-tab-pane name="topology" :tab="$t('tabs.topology')">
+                    <TopologyTab />
+                  </n-tab-pane>
+                  <n-tab-pane name="networks" :tab="$t('tabs.networks')">
+                    <NetworksTab />
+                  </n-tab-pane>
+                  <n-tab-pane name="devices" :tab="$t('tabs.devices')">
+                    <DevicesTab />
+                  </n-tab-pane>
+                  <n-tab-pane name="tokens" :tab="$t('tabs.tokens')">
+                    <TokensTab />
+                  </n-tab-pane>
+                  <n-tab-pane name="settings" :tab="$t('tabs.settings')">
+                    <SettingsTab />
+                  </n-tab-pane>
+                </n-tabs>
+              </div>
+            </main>
+          </template>
         </div>
-        <template v-else>
-          <header
-            class="app-header"
-            :style="{
-              '--sk-border': isDark ? '#2A3348' : '#E2E8F0',
-              '--sk-header-bg': isDark ? '#101623' : '#FFFFFF',
-              '--sk-header-fg': isDark ? '#F8FAFC' : '#1E293B',
-            }"
-          >
-            <h1 class="app-title">
-              Starskiff <span class="sub">{{ $t('app.subtitle') }}</span>
-            </h1>
-            <div class="header-actions">
-              <n-button quaternary size="small" @click="setLang(store.lang === 'zh-CN' ? 'en-US' : 'zh-CN')">
-                {{ store.lang === 'zh-CN' ? 'EN' : '中文' }}
-              </n-button>
-              <n-button quaternary size="small" :aria-label="isDark ? 'light mode' : 'dark mode'" @click="toggleTheme">
-                <template #icon>
-                  <NIcon><SunnyOutline v-if="isDark" /><MoonOutline v-else /></NIcon>
-                </template>
-              </n-button>
-              <n-button secondary size="small" @click="logout">{{ $t('app.logout') }}</n-button>
-            </div>
-          </header>
-          <main class="page" :style="{ background: isDark ? '#0C111C' : '#F8FAFC', minHeight: 'calc(100vh - 61px)' }">
-            <StatCards />
-            <n-tabs type="line" animated>
-              <n-tab-pane name="topology" :tab="$t('tabs.topology')">
-                <TopologyTab />
-              </n-tab-pane>
-              <n-tab-pane name="networks" :tab="$t('tabs.networks')">
-                <NetworksTab />
-              </n-tab-pane>
-              <n-tab-pane name="devices" :tab="$t('tabs.devices')">
-                <DevicesTab />
-              </n-tab-pane>
-              <n-tab-pane name="tokens" :tab="$t('tabs.tokens')">
-                <TokensTab />
-              </n-tab-pane>
-              <n-tab-pane name="settings" :tab="$t('tabs.settings')">
-                <SettingsTab />
-              </n-tab-pane>
-            </n-tabs>
-          </main>
-        </template>
       </n-dialog-provider>
     </n-message-provider>
   </n-config-provider>
 </template>
 
 <style scoped>
+.app-shell {
+  min-height: 100vh;
+  color: var(--sk-text);
+  background: var(--sk-page-bg);
+}
+
 .login-wrap {
   min-height: 100vh;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #F8FAFC;
-  padding: 16px;
+  padding: clamp(20px, 5vw, 64px) 16px;
+  background:
+    radial-gradient(circle at 50% 0%, rgba(37, 99, 235, 0.08), transparent 42%),
+    var(--sk-page-bg);
 }
-.login-wrap.dark {
-  background: #0C111C;
+
+.brand-lockup {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.brand-mark {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border-radius: 9px;
+  color: #fff;
+  background: linear-gradient(135deg, #2563EB, #4F46E5);
+  box-shadow: 0 6px 14px rgba(37, 99, 235, 0.25);
+  font-size: 15px;
+  font-weight: 800;
+}
+
+.app-title {
+  min-width: 0;
+}
+
+.page {
+  min-height: calc(100vh - 65px);
+  background: var(--sk-page-bg);
+}
+
+.page-content {
+  width: min(100%, 1440px);
+  margin: 0 auto;
+  padding: clamp(18px, 3vw, 32px) clamp(16px, 4vw, 40px) 56px;
+}
+
+@media (max-width: 640px) {
+  .app-header {
+    align-items: flex-start;
+  }
+
+  .app-title .sub {
+    display: block;
+    margin-top: 2px;
+  }
+
+  .header-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
 }
 </style>

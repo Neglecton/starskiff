@@ -52,10 +52,10 @@ function pathRank(p) {
 }
 
 function edgeStyle(path) {
-  if (path.startsWith('DirectUdp')) return { stroke: '#059669', dash: '' };
-  if (path.startsWith('DirectTcp')) return { stroke: '#2563EB', dash: '' };
-  if (path.startsWith('RelayTcp')) return { stroke: '#9333EA', dash: '6 4' };
-  return { stroke: '#D97706', dash: '6 4' }; // RelayUdp
+  if (path.startsWith('DirectUdp')) return { stroke: 'var(--sk-direct-udp)', dash: '' };
+  if (path.startsWith('DirectTcp')) return { stroke: 'var(--sk-direct-tcp)', dash: '' };
+  if (path.startsWith('RelayTcp')) return { stroke: 'var(--sk-relay-tcp)', dash: '6 4' };
+  return { stroke: 'var(--sk-relay-udp)', dash: '6 4' }; // RelayUdp
 }
 
 function rebuildGraph() {
@@ -388,14 +388,14 @@ onBeforeUnmount(() => {
         {{ lastUpdated ? `${t('topology.lastUpdated')} ${lastUpdated.toLocaleTimeString()}` : '' }}
       </span>
       <div class="topo-legend">
-        <span class="lg"><i class="sw" style="background: #059669" />{{ t('topology.directUdp') }}</span>
-        <span class="lg"><i class="sw" style="background: #2563EB" />{{ t('topology.directTcp') }}</span>
-        <span class="lg"><i class="sw dashed" style="background: #D97706" />{{ t('topology.relay') }}</span>
-        <span class="lg"><i class="sw" style="background: #94A3B8" />{{ t('devices.offline') }}</span>
+        <span class="lg"><i class="sw direct-udp" />{{ t('topology.directUdp') }}</span>
+        <span class="lg"><i class="sw direct-tcp" />{{ t('topology.directTcp') }}</span>
+        <span class="lg"><i class="sw relay-udp dashed" />{{ t('topology.relay') }}</span>
+        <span class="lg"><i class="sw offline" />{{ t('devices.offline') }}</span>
       </div>
       <div style="display: flex; align-items: center; gap: 10px">
-        <label class="muted" style="font-size: 13px; display: flex; align-items: center; gap: 6px">
-          {{ t('topology.autoRefresh') }}
+        <label class="muted refresh-control">
+          <span>{{ t('topology.autoRefresh') }}</span>
           <n-switch size="small" :value="autoRefresh" @update:value="autoRefresh = $event; restartPolling()" />
         </label>
         <n-button size="small" :loading="loading" @click="load">{{ t('topology.refresh') }}</n-button>
@@ -407,6 +407,9 @@ onBeforeUnmount(() => {
         ref="svgEl"
         :viewBox="`0 0 ${W} ${H}`"
         class="topo-svg"
+        role="img"
+        :aria-label="t('topology.graphLabel')"
+        tabindex="0"
         @pointerdown="onSvgDown"
         @pointermove="onSvgMove"
         @pointerup="onSvgUp"
@@ -447,9 +450,9 @@ onBeforeUnmount(() => {
             <title>{{ nodeTooltip(n) }}</title>
             <circle
               :r="n.isServer ? 26 : NODE_R"
-              :fill="n.isServer ? '#2563EB' : n.online ? '#059669' : '#94A3B8'"
+              :fill="n.isServer ? 'var(--sk-brand)' : n.online ? 'var(--sk-direct-udp)' : 'var(--sk-offline)'"
               fill-opacity="0.15"
-              :stroke="n.isServer ? '#2563EB' : n.online ? '#059669' : '#94A3B8'"
+              :stroke="n.isServer ? 'var(--sk-brand)' : n.online ? 'var(--sk-direct-udp)' : 'var(--sk-offline)'"
               stroke-width="2"
             />
             <text class="node-glyph" dy="4" text-anchor="middle">{{ n.isServer ? 'S' : n.name.slice(0, 2).toUpperCase() }}</text>
@@ -483,8 +486,9 @@ onBeforeUnmount(() => {
 .topo {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
 }
+
 .topo-toolbar {
   display: flex;
   align-items: center;
@@ -492,118 +496,160 @@ onBeforeUnmount(() => {
   gap: 12px;
   flex-wrap: wrap;
 }
+
+.topo-toolbar > * {
+  min-width: 0;
+}
+
 .topo-legend {
   display: flex;
   gap: 14px;
+  color: var(--sk-text-muted);
   font-size: 12px;
-  color: #64748B;
   flex-wrap: wrap;
 }
-.topo-legend .lg {
+
+.topo-legend .lg,
+.refresh-control {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
 }
+
 .topo-legend .sw {
   display: inline-block;
   width: 18px;
   height: 3px;
   border-radius: 2px;
 }
-.topo-legend .sw.dashed {
-  background: linear-gradient(90deg, #D97706 55%, transparent 45%);
+
+.topo-legend .sw.direct-udp { background: var(--sk-direct-udp); }
+.topo-legend .sw.direct-tcp { background: var(--sk-direct-tcp); }
+.topo-legend .sw.offline { background: var(--sk-offline); }
+.topo-legend .sw.relay-udp {
+  background: linear-gradient(90deg, var(--sk-relay-udp) 55%, transparent 45%);
   background-size: 8px 3px;
 }
+
 .topo-body {
   position: relative;
-  border: 1px solid #E2E8F0;
-  border-radius: 10px;
+  border: 1px solid var(--sk-border);
+  border-radius: 12px;
   background:
-    radial-gradient(circle at 1px 1px, rgba(100, 116, 139, 0.12) 1px, transparent 0) 0 0 / 22px 22px;
+    radial-gradient(circle at 1px 1px, var(--sk-topology-grid) 1px, transparent 0) 0 0 / 22px 22px,
+    var(--sk-surface);
   overflow: hidden;
 }
+
 .topo-svg {
   width: 100%;
-  height: 560px;
+  height: clamp(400px, 58vw, 560px);
   display: block;
+  color: var(--sk-text);
   cursor: grab;
   touch-action: none;
   user-select: none;
 }
-.topo-svg:active {
-  cursor: grabbing;
+
+.topo-svg:focus-visible {
+  outline: 2px solid #3b82f6;
+  outline-offset: -2px;
 }
+
+.topo-svg:active { cursor: grabbing; }
+
 .rtt-label {
   font-size: 10px;
-  fill: #64748B;
+  fill: var(--sk-topology-rtt);
   text-anchor: middle;
   pointer-events: none;
 }
+
 .node-glyph {
   font-size: 12px;
   font-weight: 600;
   fill: currentColor;
   pointer-events: none;
 }
+
 .node-name {
   font-size: 11px;
-  fill: #475569;
+  fill: var(--sk-topology-label);
   pointer-events: none;
 }
+
 .topo-node {
   cursor: pointer;
   transition: opacity 0.15s ease;
 }
-.topo-node.dimmed {
-  opacity: 0.2;
+
+.topo-node:focus-visible {
+  outline: 2px solid #3b82f6;
 }
+
+.topo-node.dimmed { opacity: 0.2; }
+
 .topo-node.selected circle {
   stroke-width: 3.5;
   filter: drop-shadow(0 0 4px rgba(37, 99, 235, 0.6));
 }
+
 .topo-panel {
   position: absolute;
   top: 12px;
   right: 12px;
-  width: 320px;
-  max-width: calc(100% - 24px);
+  width: min(320px, calc(100% - 24px));
   max-height: calc(100% - 24px);
   overflow: auto;
-  background: rgba(255, 255, 255, 0.94);
-  border: 1px solid #E2E8F0;
+  box-sizing: border-box;
+  background: color-mix(in srgb, var(--sk-surface) 94%, transparent);
+  border: 1px solid var(--sk-border);
   border-radius: 10px;
   padding: 10px 12px;
-  box-shadow: 0 6px 24px rgba(15, 23, 42, 0.12);
+  box-shadow: var(--sk-shadow);
 }
+
 .topo-panel-title {
   font-weight: 600;
   margin-bottom: 8px;
   font-size: 13px;
 }
+
 .topo-panel-row {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 0;
-  border-bottom: 1px dashed #E2E8F0;
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--sk-border);
   font-size: 12px;
 }
-.topo-panel-row:last-child {
-  border-bottom: none;
-}
+
+.topo-panel-row:last-child { border-bottom: none; }
+
 .dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
   flex: none;
 }
-.dot.on {
-  background: #059669;
-}
-.dot.off {
-  background: #94A3B8;
-}
-.topo-hint {
-  font-size: 12px;
+
+.dot.on { background: var(--sk-direct-udp); }
+.dot.off { background: var(--sk-offline); }
+.topo-hint { font-size: 12px; }
+
+@media (max-width: 640px) {
+  .topo-toolbar > div:last-child {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .topo-panel {
+    top: auto;
+    right: 8px;
+    bottom: 8px;
+    left: 8px;
+    width: auto;
+    max-height: 46%;
+  }
 }
 </style>

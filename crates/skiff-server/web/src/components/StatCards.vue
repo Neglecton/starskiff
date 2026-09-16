@@ -20,7 +20,7 @@ onMounted(load);
 </script>
 
 <template>
-  <n-grid v-if="summary" :cols="'1 s:2 m:4'" responsive="screen" :x-gap="14" :y-gap="14" style="margin-bottom: 20px">
+  <n-grid v-if="summary" class="summary-grid" :cols="'1 s:2 m:4'" responsive="screen" :x-gap="14" :y-gap="14">
     <n-gi>
       <n-card size="small">
         <n-statistic :label="$t('summary.networks')" :value="summary.networks" />
@@ -47,3 +47,20 @@ onMounted(load);
     </n-gi>
   </n-grid>
 </template>
+
+<style scoped>
+.summary-grid {
+  margin-bottom: 22px;
+}
+
+.summary-grid :deep(.n-card) {
+  height: 100%;
+  border: 1px solid var(--sk-border);
+  background: var(--sk-surface);
+  box-shadow: none;
+}
+
+.summary-grid :deep(.n-statistic .n-statistic-value__content) {
+  letter-spacing: -0.02em;
+}
+</style>

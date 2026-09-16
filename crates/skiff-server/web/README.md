@@ -31,6 +31,6 @@ src/
 ## 约定
 
 - 用户可见文案一律走 i18n（`src/i18n/locales/`），禁止硬编码中英文；Naive UI 组件文案随 `n-config-provider` 的 locale 同步。
-- 主题默认浅色，`prefers-color-scheme` 自动初选，手动切换持久化；颜色通过 `themeOverrides`（App.vue）统一管理。
+- 主题默认浅色；手动切换后持久化，颜色通过 `themeOverrides`（App.vue）和页面语义 token 统一管理。
 - 表格列的 render 用 `computed` 包裹 `t()`，保证切换语言即时生效。
 - 图标用 `@vicons/ionicons5`（内联打包），不用 emoji。
