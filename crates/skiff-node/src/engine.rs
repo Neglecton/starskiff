@@ -34,15 +34,17 @@ use crate::transport::udp_mesh::UdpMesh;
 
 /// How a frame arrived — determines the PONG return path and upgrade rules.
 pub enum Arrival {
-    DirectUdp(SocketAddr),
+    /// (对端地址, 本地绑定地址)——PONG 沿到达 socket 回复、直连数据经
+    /// 学习到端点的 socket 发送（多绑定下保持 NAT 映射一致）。
+    DirectUdp(SocketAddr, SocketAddr),
     DirectTcp(Arc<PeerTcpConnection>),
     RelayUdp,
     RelayTcp,
 }
 
 impl Arrival {
-    pub fn direct_udp(from: SocketAddr) -> Arrival {
-        Arrival::DirectUdp(from)
+    pub fn direct_udp(from: SocketAddr, local_bind: SocketAddr) -> Arrival {
+        Arrival::DirectUdp(from, local_bind)
     }
     pub fn direct_tcp(conn: Arc<PeerTcpConnection>) -> Arrival {
         Arrival::DirectTcp(conn)
@@ -127,6 +129,11 @@ pub struct EngineShared {
     pub runtime_socks: Mutex<Option<String>>,
     pub runtime_forwards: Mutex<Vec<ForwardRule>>,
     pub runtime_mtu: AtomicU32,
+    /// 启动时实际生效的运行模式与监听地址（托管 diff 的比对基准）。
+    pub runtime_mode: Mutex<ClientMode>,
+    pub runtime_listen: Mutex<Vec<String>>,
+    /// primary TCP 监听端口（心跳上报实际值；0=无监听）。
+    pub tcp_listen_port: AtomicU16,
     /// 停止原因（首次触发时锁定）；worker 宿主据此映射退出码。
     pub stop_reason: Mutex<Option<StopReason>>,
     /// 服务端权威的网络名单（启动与 networks_changed 时刷新；prune 与
@@ -196,13 +203,7 @@ impl EngineShared {
                     let conn = peer.tcp_conn.lock().unwrap().clone();
                     if conn.as_ref().is_some_and(|c| !c.is_closed()) {
                         PathKind::DirectTcp
-                    } else if peer
-                        .direct_endpoint
-                        .lock()
-                        .unwrap()
-                        .or_else(|| peer.endpoints.lock().unwrap().first().copied())
-                        .is_some()
-                    {
+                    } else if peer.direct_endpoint.lock().unwrap().is_some() {
                         PathKind::DirectUdp
                     } else {
                         return; // No direct resource: drop rather than leak via relay.
@@ -214,17 +215,22 @@ impl EngineShared {
         };
         match path {
             PathKind::DirectUdp => {
-                let ep = peer
-                    .direct_endpoint
-                    .lock()
-                    .unwrap()
-                    .or_else(|| peer.endpoints.lock().unwrap().first().copied());
-                match ep {
-                    Some(ep) => self.udp.send_direct(ep, frame),
-                    None if relay_fallback => self.udp.send_relay(self_id, peer.id, frame),
-                    None => {}
+                // 学习到的端点带本地绑定：直连数据经学习到它的 socket 发送
+                //（保持 NAT 映射一致）；无端点时用观测端点兜底（primary）。
+                let learned = peer.direct_endpoint.lock().unwrap().is_some();
+                if learned {
+                    let (ep, local) = peer.direct_endpoint.lock().unwrap().unwrap();
+                    self.udp.send_direct_from(local, ep, frame);
+                    peer.add_tx(frame.len());
+                } else {
+                    let ep = peer.endpoints.lock().unwrap().first().copied();
+                    match ep {
+                        Some(ep) => self.udp.send_direct(ep, frame),
+                        None if relay_fallback => self.udp.send_relay(self_id, peer.id, frame),
+                        None => {}
+                    }
+                    peer.add_tx(frame.len());
                 }
-                peer.add_tx(frame.len());
             }
             PathKind::DirectTcp => {
                 let conn = peer.tcp_conn.lock().unwrap().clone();
@@ -267,7 +273,7 @@ impl EngineShared {
     /// NAT mapping the request used).
     fn reply_on_arrival(&self, peer: &Arc<PeerSession>, arrival: &Arrival, frame: &[u8]) {
         match arrival {
-            Arrival::DirectUdp(ep) => self.udp.send_direct(*ep, frame),
+            Arrival::DirectUdp(ep, local) => self.udp.send_direct_from(*local, *ep, frame),
             Arrival::DirectTcp(conn) => {
                 let _ = conn.send(frame);
             }
@@ -363,13 +369,13 @@ impl EngineShared {
                     }
                 }
                 peer.last_pong_ms.store(now, Ordering::Relaxed);
-                if let Arrival::DirectUdp(from) = &arrival {
+                if let Arrival::DirectUdp(from, local) = &arrival {
                     // 策略允许即记录直连端点（pin 档下 path 已被 apply 置为
                     // DirectUdp，不能以 path 判断是否已建立——端点才是资源）。
                     let policy = self.policy_for(peer.id);
                     if policy_allows(policy, PathKind::DirectUdp) {
                         let was_missing = peer.direct_endpoint.lock().unwrap().is_none();
-                        *peer.direct_endpoint.lock().unwrap() = Some(*from);
+                        *peer.direct_endpoint.lock().unwrap() = Some((*from, *local));
                         if peer.path() != PathKind::DirectUdp {
                             *peer.current_path.lock().unwrap() = PathKind::DirectUdp;
                             (self.log)(&format!(
@@ -409,6 +415,57 @@ pub struct NodeEngine {
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
+/// 启动期生效值：托管配置预拉的解析结果（mode/listen）。
+pub struct EffectiveListen {
+    pub udp: Vec<SocketAddr>,
+    pub tcp: Vec<SocketAddr>,
+    /// 原始 URL 列表（托管值或文件默认，用于运行时 diff）。
+    pub raw: Vec<String>,
+}
+
+/// 生效监听：托管 listen 全量替换文件默认；逐条解析 URL，按协议分组
+/// （保持列表顺序，primary=首个）。
+pub fn effective_listen_addrs(settings: &DeviceSettings, cfg: &NodeConfig) -> anyhow::Result<EffectiveListen> {
+    let raw: Vec<String> = match settings.listen.as_ref() {
+        Some(list) if !list.is_empty() => list.clone(),
+        _ => cfg.listen.clone(),
+    };
+    let mut udp = Vec::new();
+    let mut tcp = Vec::new();
+    for item in &raw {
+        let (proto, addr) =
+            skiff_core::models::parse_listen_url(item).map_err(|e| anyhow::anyhow!(e))?;
+        match proto {
+            skiff_core::models::ListenProto::Udp => udp.push(addr),
+            skiff_core::models::ListenProto::Tcp => tcp.push(addr),
+        }
+    }
+    if udp.is_empty() {
+        anyhow::bail!("监听列表中没有任何 UDP 地址");
+    }
+    Ok(EffectiveListen { udp, tcp, raw })
+}
+
+/// 托管 mode 字符串 → ClientMode（合法值穷举；未知值 None——服务端
+/// validate 已拒绝非法取值，此处防御）。启动与运行时 diff 两路径共用，
+/// 禁止各自内联解析（曾因两处语义相反引入"托管 proxy 不生效"缺陷）。
+fn managed_mode(v: &str) -> Option<ClientMode> {
+    match v {
+        "tun" => Some(ClientMode::Tun),
+        "proxy" => Some(ClientMode::Proxy),
+        _ => None,
+    }
+}
+
+/// 生效运行模式：托管 mode 覆盖文件默认（"tun"/"proxy" 均为显式托管值）。
+pub fn effective_mode_of(settings: &DeviceSettings, cfg: &NodeConfig) -> ClientMode {
+    settings
+        .mode
+        .as_deref()
+        .and_then(managed_mode)
+        .unwrap_or(cfg.mode)
+}
+
 impl NodeEngine {
     pub async fn start(
         config_path: PathBuf,
@@ -417,6 +474,26 @@ impl NodeEngine {
         log: LogFn,
     ) -> anyhow::Result<Arc<NodeEngine>> {
         cfg.validate().map_err(|e| anyhow::anyhow!(e))?;
+        // 监听/模式的生效值依赖托管配置：lib.rs 已预拉的场景由
+        // start_with_settings 直传；此处自拉一次（测试 harness 直调路径）。
+        let control0 = ControlClient::new(
+            &cfg.server,
+            cfg.identity.device_token.expose(),
+            cfg.identity.server_cert_pin.as_deref(),
+        );
+        let settings = bootstrap_settings(&control0, &config_path, &log).await;
+        Self::start_with_settings(config_path, cfg, data_sink, settings, log).await
+    }
+
+    pub async fn start_with_settings(
+        config_path: PathBuf,
+        cfg: NodeConfig,
+        data_sink: DataSink,
+        settings: DeviceSettings,
+        log: LogFn,
+    ) -> anyhow::Result<Arc<NodeEngine>> {
+        cfg.validate().map_err(|e| anyhow::anyhow!(e))?;
+        let effective_mode = effective_mode_of(&settings, &cfg);
         let dh_priv: [u8; 32] = hex::decode(cfg.identity.dh_private_key.expose())
             .map_err(|_| anyhow::anyhow!("身份中的 DH 私钥无效"))?
             .try_into()
@@ -430,13 +507,17 @@ impl NodeEngine {
 
         let (stopped_tx, stopped_rx) = watch::channel(false);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel::<EngineEvent>();
-        let udp = UdpMesh::bind(cfg.listen_udp_port, events_tx.clone()).await?;
-        if udp.fallback_used() {
-            (log)(&format!("UDP 端口 {} 已被占用，已回退随机端口 {}", cfg.listen_udp_port, udp.local_port));
-        }
         let control = Arc::new(ControlClient::new(&server_url, cfg.identity.device_token.expose(), cfg.identity.server_cert_pin.as_deref()));
         if control.insecure_http {
             (log)("警告：控制面使用明文 http://（服务器 --no-tls 模式？）");
+        }
+        let effective_listen = effective_listen_addrs(&settings, &cfg)?;
+        let udp = UdpMesh::bind(&effective_listen.udp, events_tx.clone()).await?;
+        if udp
+            .used_fallback_port
+            .load(Ordering::Relaxed)
+        {
+            (log)(&format!("UDP 通配端口被占用，已部分回退随机端口（primary={}）", udp.local_port));
         }
 
         let relay_key = skiff_core::protocol::relay_udp::relay_key_from_token(cfg.identity.device_token.expose());
@@ -476,6 +557,9 @@ impl NodeEngine {
             runtime_socks: Mutex::new(None),
             runtime_forwards: Mutex::new(Vec::new()),
             runtime_mtu: AtomicU32::new(cfg.mtu),
+            runtime_mode: Mutex::new(effective_mode),
+            runtime_listen: Mutex::new(effective_listen.raw.clone()),
+            tcp_listen_port: AtomicU16::new(0),
             stop_reason: Mutex::new(None),
             roster: Mutex::new(std::collections::HashSet::new()),
             stopped_tx: stopped_tx.clone(),
@@ -488,7 +572,7 @@ impl NodeEngine {
             anyhow::bail!("配置中没有网络");
         };
         // TUN 限单网络（服务端名单口径；服务端强制 join 已预检，兜底）。
-        if shared.cfg.lock().unwrap().mode == ClientMode::Tun && configs.len() > 1 {
+        if effective_mode == ClientMode::Tun && configs.len() > 1 {
             anyhow::bail!(
                 "TUN 模式当前仅支持单网络，但服务端名单包含 {} 个网络（请在管理页移出多余网络后重启）",
                 configs.len()
@@ -505,26 +589,37 @@ impl NodeEngine {
 
         warn_overlapping_cidrs(&shared);
 
-        // Optional direct TCP listener (disabled on bind failure — no fallback).
-        let tcp_listener = if cfg.listen_tcp_port > 0 {
-            match tokio::net::TcpListener::bind(("0.0.0.0", cfg.listen_tcp_port)).await {
-                Ok(l) => Some(l),
-                Err(_) => {
-                    (log)(&format!("TCP 端口 {} 已被占用，直连 TCP 监听已禁用", cfg.listen_tcp_port));
-                    None
+        // 直连 TCP 监听（多地址）：通配绑定失败跳过（容错）；指定 IP
+        // 绑定失败为致命错误（显式意图，走配置回滚）。
+        let mut tcp_listeners = Vec::new();
+        for addr in &effective_listen.tcp {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => {
+                    if tcp_listeners.is_empty() {
+                        shared.tcp_listen_port.store(l.local_addr()?.port(), Ordering::Relaxed);
+                    }
+                    tcp_listeners.push(l);
+                }
+                Err(e) if addr.ip().is_unspecified() => {
+                    (log)(&format!("TCP 通配端口 {addr} 绑定失败，已跳过（{e}）"));
+                }
+                Err(e) => {
+                    anyhow::bail!("TCP 监听绑定失败 {addr}: {e}");
                 }
             }
-        } else {
-            None
-        };
+        }
 
         refresh_peers(&shared).await;
 
-        // 托管配置收敛：遗留文件值收编（仅填未托管字段）→ 拉取权威值 →
-        // 应用运行态。SOCKS/forwarders/MTU 以生效值在此确定——行为配置
-        // 不落文件，重启时重新拉取。
-        let settings = bootstrap_settings(&shared).await;
-        apply_runtime_settings(&shared, &settings, true);
+        // 应用运行态（settings 已在绑定前预拉）。SOCKS/forwarders/MTU 以
+        // 生效值在此确定——行为配置不落文件，重启时重新拉取。
+        let _: bool = apply_runtime_settings(&shared, &settings, true);
+        // 启动成功即应答：写 applied revision 并立即心跳上报（管理页的
+        // 下发闭环靠它确认成功；不再等 WS 首连才追平）。
+        shared
+            .applied_settings_revision
+            .store(settings.revision.max(0) as u64, Ordering::Relaxed);
+        heartbeat_tick(&shared).await;
         let effective_socks = match settings.socks_listen.as_deref() {
             // 托管空串 = 显式禁用；未托管沿用默认开启。
             Some("") => None,
@@ -537,7 +632,7 @@ impl NodeEngine {
         shared.runtime_mtu.store(settings.mtu.unwrap_or(cfg.mtu), Ordering::Relaxed);
 
         // Proxy-mode listeners: SOCKS5 + forwarders.
-        if cfg.mode == ClientMode::Proxy {
+        if effective_mode == ClientMode::Proxy {
             if let Some(socks) = &effective_socks {
                 match proxy::socks5::spawn(socks, Arc::clone(&shared)).await {
                     Ok(port) => shared.socks_port.store(port, Ordering::Relaxed),
@@ -552,8 +647,8 @@ impl NodeEngine {
 
         let mut tasks = Vec::new();
 
-        // Inbound direct TCP accept loop.
-        if let Some(listener) = tcp_listener {
+        // Inbound direct TCP accept loops（每地址一个监听）。
+        for listener in tcp_listeners {
             let events = events_tx.clone();
             tasks.push(tokio::spawn(async move {
                 loop {
@@ -995,20 +1090,33 @@ async fn apply_config_change(shared: &Arc<EngineShared>, net: Option<NetId>) {
 /// 启动时的托管配置收敛：先尝试把遗留文件值收编为服务端托管（仅填
 /// 未托管字段，收编响应即合并后的权威值），失败或无遗留则直接拉取。
 /// 无限重试——行为配置已不落文件，拉不到就无法确定 SOCKS/forwards。
-async fn bootstrap_settings(shared: &Arc<EngineShared>) -> DeviceSettings {
-    let candidate = legacy_seed(&shared.config_path);
+/// 公开包装：lib.rs 启动链路预拉托管配置用。
+pub async fn bootstrap_settings_pub(
+    control: &ControlClient,
+    config_path: &std::path::Path,
+    log: &LogFn,
+) -> DeviceSettings {
+    bootstrap_settings(control, config_path, log).await
+}
+
+async fn bootstrap_settings(
+    control: &ControlClient,
+    config_path: &std::path::Path,
+    log: &LogFn,
+) -> DeviceSettings {
+    let candidate = legacy_seed(config_path);
     if !candidate.is_empty()
-        && let Some(merged) = shared.control.adopt_settings(&candidate).await
+        && let Some(merged) = control.adopt_settings(&candidate).await
     {
-        (shared.log)("遗留本地配置已收编为服务端托管");
+        (log)("遗留本地配置已收编为服务端托管");
         return merged;
     }
     // 收编失败（罕见）：继续走拉取，下次启动再收编。
     loop {
-        if let Some(s) = shared.control.get_settings().await {
+        if let Some(s) = control.get_settings().await {
             return s;
         }
-        (shared.log)("cannot fetch settings; retrying in 3s");
+        (log)("cannot fetch settings; retrying in 3s");
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 }
@@ -1057,7 +1165,7 @@ fn legacy_seed(path: &std::path::Path) -> DeviceSettings {
 /// 把托管配置应用到运行态。路径策略（全局+对端覆盖）与 exposes 热生效；
 /// 重启类字段（mtu / socks / forwards）不落文件——与启动时实际生效值
 /// 比对，有差异即置 restart_pending，重启时按拉取值重建。
-fn apply_runtime_settings(shared: &Arc<EngineShared>, settings: &DeviceSettings, startup: bool) {
+fn apply_runtime_settings(shared: &Arc<EngineShared>, settings: &DeviceSettings, startup: bool) -> bool {
     // 路径策略：写全局与覆盖表，按各 peer 的生效策略同步 current_path
     //（pin 档写入对应值使 status/心跳/管理页真实；Auto 下清掉 pin-only
     // 的 RelayTcp 残留，状态机回到 RelayUdp 基线）。策略只被托管字段
@@ -1113,28 +1221,57 @@ fn apply_runtime_settings(shared: &Arc<EngineShared>, settings: &DeviceSettings,
             }
         }
     }
+    if startup {
+        // 启动基准：生效模式与监听地址（重启类 diff 的比对基准）。
+        *shared.runtime_listen.lock().unwrap() =
+            crate::engine::effective_listen_raw(settings, &shared.cfg.lock().unwrap().clone());
+    }
+    let mut restart_needed = false;
     if !startup {
         let mut pending = shared.restart_pending.load(Ordering::Relaxed);
         if let Some(v) = settings.mtu
             && v != shared.runtime_mtu.load(Ordering::Relaxed)
         {
             pending = true;
+            restart_needed = true;
         }
         if let Some(v) = settings.socks_listen.as_deref() {
             let desired = if v.is_empty() { None } else { Some(v.to_string()) };
             if *shared.runtime_socks.lock().unwrap() != desired {
                 pending = true;
-            }
+                restart_needed = true;
+                }
         }
         if let Some(v) = &settings.forwards
             && &*shared.runtime_forwards.lock().unwrap() != v
         {
             pending = true;
+            restart_needed = true;
+        }
+        // mode / listen：与生效基准不同即需重启应用（TUN 权限、端口占用等
+        // 失败由 worker 启动失败上报 → 服务端回滚闭环处理）。
+        if let Some(desired) = settings.mode.as_deref().and_then(managed_mode)
+            && *shared.runtime_mode.lock().unwrap() != desired
+        {
+            pending = true;
+            restart_needed = true;
+        }
+        if let Some(v) = settings.listen.as_ref()
+            && *shared.runtime_listen.lock().unwrap() != *v
+        {
+            pending = true;
+            restart_needed = true;
         }
         shared.restart_pending.store(pending, Ordering::Relaxed);
-        if pending {
-            (shared.log)("托管配置已更新：mtu/socks/forwards 将在引擎重启后生效");
-        }
+    }
+    restart_needed
+}
+
+/// 生效监听原始 URL 列表（托管全量替换文件默认；空列表视为未托管走默认）。
+pub fn effective_listen_raw(settings: &DeviceSettings, cfg: &NodeConfig) -> Vec<String> {
+    match settings.listen.as_ref() {
+        Some(list) if !list.is_empty() => list.clone(),
+        _ => cfg.listen.clone(),
     }
 }
 
@@ -1147,7 +1284,17 @@ async fn apply_settings(shared: &Arc<EngineShared>) {
     if shared.applied_settings_revision.load(Ordering::Relaxed) >= rev as u64 {
         return; // 已应用（重复投递 / 旧版本晚到）
     }
-    apply_runtime_settings(shared, &settings, false);
+    let restart_needed = apply_runtime_settings(shared, &settings, false);
+    if restart_needed {
+        // 重启类变更（mode/listen/mtu/socks/forwards）**不在此应答**：此刻
+        // 新值尚未真正生效，提前上报 applied 会让服务端把未验证的配置
+        // 固化为回滚锚点（last_good），失败回滚将回到坏配置自身、形成
+        // 失败循环。应答由重启后的新 worker 启动成功时给出；启动失败则
+        // worker 上报 fail，服务端回滚到真正的上一版成功配置。
+        (shared.log)("托管配置含重启类变更，自动重启引擎应用……");
+        request_stop(shared, StopReason::Restart);
+        return;
+    }
     shared.applied_settings_revision.store(rev as u64, Ordering::Relaxed);
     // 立即上报一次心跳，让管理页快速看到 appliedRevision 收敛。
     heartbeat_tick(shared).await;
@@ -1295,17 +1442,12 @@ async fn heartbeat_tick(shared: &Arc<EngineShared>) {
             })
         })
         .collect();
-    let (listen_tcp_port, mode_str) = {
-        let cfg = shared.cfg.lock().unwrap();
-        (
-            if cfg.listen_tcp_port > 0 { Some(cfg.listen_tcp_port) } else { None },
-            cfg.mode.as_str().to_string(),
-        )
-    };
+    let mode_str = shared.runtime_mode.lock().unwrap().as_str().to_string();
+    let tcp_port = shared.tcp_listen_port.load(Ordering::Relaxed);
     let req = HeartbeatRequest {
         local_addrs: crate::local_ipv4_addrs(),
         listen_udp_port: Some(shared.udp.local_port),
-        listen_tcp_port,
+        listen_tcp_port: (tcp_port > 0).then_some(tcp_port),
         paths: Some(paths),
         settings_revision: Some(shared.applied_settings_revision.load(Ordering::Relaxed) as i64),
         restart_pending: Some(shared.restart_pending.load(Ordering::Relaxed)),
@@ -1380,15 +1522,15 @@ async fn probe_peer(shared: &Arc<EngineShared>, net_id: NetId, peer: Arc<PeerSes
         // allocate ports sequentially).
         let endpoints = peer.endpoints.lock().unwrap().clone();
         for ep in endpoints.iter().take(4) {
-            shared.udp.send_direct(*ep, &ping);
+            shared.udp.send_direct_all(*ep, &ping);
         }
         if let Some(observed) = endpoints.first() {
             for d in 1u16..=4 {
                 if let Some(p) = observed.port().checked_add(d) {
-                    shared.udp.send_direct(SocketAddr::new(observed.ip(), p), &ping);
+                    shared.udp.send_direct_all(SocketAddr::new(observed.ip(), p), &ping);
                 }
                 if observed.port() > d + 1024 {
-                    shared.udp.send_direct(SocketAddr::new(observed.ip(), observed.port() - d), &ping);
+                    shared.udp.send_direct_all(SocketAddr::new(observed.ip(), observed.port() - d), &ping);
                 }
             }
         }
@@ -1508,7 +1650,7 @@ fn write_status(shared: &Arc<EngineShared>, path: &std::path::Path) {
                 .direct_endpoint
                 .lock()
                 .unwrap()
-                .map(|e| e.to_string())
+                .map(|(e, _local)| e.to_string())
                 .unwrap_or_else(|| "relay".to_string());
             PeerStatus {
                 network: shared.network_name(&p.network_id_hint),
@@ -1567,7 +1709,7 @@ fn log_stats(shared: &Arc<EngineShared>) {
             .direct_endpoint
             .lock()
             .unwrap()
-            .map(|e| e.to_string())
+            .map(|(e, _local)| e.to_string())
             .unwrap_or_else(|| "relay".to_string());
         (shared.log)(&format!(
             "STATS peer={} net={} ip={} online={} path={} ep={} rtt_ms={} tx={} rx={} tx_pkts={} rx_pkts={} uptime_s={}",
@@ -1584,5 +1726,65 @@ fn log_stats(shared: &Arc<EngineShared>) {
             p.rx_packets.load(Ordering::Relaxed),
             uptime,
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_cfg(mode: ClientMode) -> NodeConfig {
+        NodeConfig {
+            server: "http://127.0.0.1:1".into(),
+            mode,
+            mtu: 1280,
+            data_dir: String::new(),
+            listen: vec!["udp://0.0.0.0:0".into()],
+            log_file: None,
+            identity: skiff_core::models::Identity {
+                device_id: 1,
+                name: "t".into(),
+                device_token: skiff_core::secret::Secret::new("x"),
+                sign_public_key: String::new(),
+                sign_private_key: skiff_core::secret::Secret::new("x"),
+                dh_public_key: String::new(),
+                dh_private_key: skiff_core::secret::Secret::new("x"),
+                server_cert_pin: None,
+            },
+        }
+    }
+
+    fn settings_with_mode(mode: Option<&str>) -> DeviceSettings {
+        DeviceSettings {
+            mode: mode.map(str::to_string),
+            ..DeviceSettings::default()
+        }
+    }
+
+    /// 托管 "proxy" 必须覆盖文件 tun（曾落入 `_` 分支沿用文件值——
+    /// 见 AGENTS.md #21：合法值穷举，双向变更都要测）。
+    #[test]
+    fn managed_proxy_overrides_file_tun() {
+        assert_eq!(
+            effective_mode_of(&settings_with_mode(Some("proxy")), &test_cfg(ClientMode::Tun)),
+            ClientMode::Proxy
+        );
+    }
+
+    #[test]
+    fn managed_tun_overrides_file_proxy() {
+        assert_eq!(
+            effective_mode_of(&settings_with_mode(Some("tun")), &test_cfg(ClientMode::Proxy)),
+            ClientMode::Tun
+        );
+    }
+
+    /// 未托管（None）沿用文件值。
+    #[test]
+    fn unmanaged_mode_falls_back_to_file() {
+        assert_eq!(
+            effective_mode_of(&settings_with_mode(None), &test_cfg(ClientMode::Tun)),
+            ClientMode::Tun
+        );
     }
 }

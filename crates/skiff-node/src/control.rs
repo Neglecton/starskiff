@@ -110,6 +110,18 @@ impl ControlClient {
         resp.json().await.ok()
     }
 
+    /// worker 启动失败上报：服务端收到后自动回滚到上一版成功配置
+    ///（revision 不匹配当前版时忽略——过期/重复上报天然幂等）。
+    pub async fn report_settings_fail(&self, revision: i64, error: &str) {
+        let _ = self
+            .http
+            .post(self.url("/api/settings/fail"))
+            .bearer_auth(&self.device_token)
+            .json(&serde_json::json!({ "revision": revision, "error": error }))
+            .send()
+            .await;
+    }
+
     /// 把遗留本地配置值收编为服务端托管（仅填充未托管字段；返回合并
     /// 后的最新配置）。
     pub async fn adopt_settings(&self, candidate: &DeviceSettings) -> Option<DeviceSettings> {

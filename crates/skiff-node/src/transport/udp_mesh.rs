@@ -1,10 +1,24 @@
-//! UdpMesh: a single UDP socket serving both the relay (REGISTER/RELAY and
-//! relayed frames) and direct peer traffic. Port binding falls back to a
-//! random port when the configured port is taken — never a hard error
-//! (multi-node hosts and parallel tests rely on this).
+//! UdpMesh: a set of UDP sockets serving both the relay (REGISTER/RELAY and
+//! relayed frames) and direct peer traffic. 支持多地址监听（绑定指定网卡/
+//! IPv6，每协议由 DeviceSettings.listen / NodeConfig.listen 描述，本模块
+//! 只管 UDP 条目）。
+//!
+//! 绑定失败语义：通配地址（0.0.0.0/[::]）失败沿用容错——非 0 端口回退
+//! 随机端口（同机多节点与并行测试依赖），端口 0 失败直接 Err；**指定 IP
+//! 绑定失败为致命错误**（显式意图，由上层走配置回滚）。
+//!
+//! 发送选路：中继注册/RELAY 与默认发送走 primary（首个 socket）；PONG
+//! 沿到达路径回复（携带收到 PING 的那个 socket 的本地绑定地址）；DirectUdp
+//! 数据帧经学习到该端点的 socket 发送，保持 NAT 映射一致。
+//!
+//! 入站分类（AGENTS.md #20）：判据是**来源地址**（from == relay_addr），
+//! 不是包格式——中继转发的是剥壳后的内层 wire 帧（0x0A），parse 中继
+//! 协议必然失败；若按"能否 parse 成中继协议"分流，中继流量会被全部
+//! 误判为直连（PONG 裸发中继被丢、RTT 永测不到）。classify 为纯函数，
+//! 分支语义由单测锁定。
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use skiff_core::consts::UDP_BUFFER_SIZE;
@@ -14,82 +28,98 @@ use tokio::net::UdpSocket;
 use crate::engine::EngineEvent;
 
 pub struct UdpMesh {
-    socket: Arc<UdpSocket>,
+    /// 全部 UDP socket；primary = 首项（中继注册/默认发送用）。
+    sockets: Vec<Arc<UdpSocket>>,
+    /// 与 sockets 一一对应的本地绑定地址（发送选路用）。
+    binds: Vec<SocketAddr>,
     pub local_port: u16,
     pub used_fallback_port: AtomicBool,
-    relay_addr: Mutex<Option<SocketAddr>>,
+    /// 读循环与发送侧共享的中继地址（读循环闭包在 bind 时创建、
+    /// configure_relay 写入，故必须经 Arc 共享同一 cell）。
+    relay_addr: Arc<Mutex<Option<SocketAddr>>>,
     /// REGISTER 凭据。每次发送生成新 nonce——服务端记忆已用 nonce 防重放，
     /// 缓存整个报文会导致重注册被拒。
     register_creds: Mutex<Option<(u64, [u8; 32])>>,
 }
 
 impl UdpMesh {
+    /// 按地址列表绑定（去重保序）。至少要有一个成功绑定的 socket。
     pub async fn bind(
-        listen_port: u16,
+        addrs: &[SocketAddr],
         events: tokio::sync::mpsc::UnboundedSender<EngineEvent>,
     ) -> anyhow::Result<Arc<UdpMesh>> {
-        let (socket, fallback) = match UdpSocket::bind(("0.0.0.0", listen_port)).await {
-            Ok(s) => (s, false),
-            Err(_) if listen_port != 0 => {
-                // Occupied: fall back to a random port.
-                (UdpSocket::bind(("0.0.0.0", 0)).await?, true)
+        if addrs.is_empty() {
+            anyhow::bail!("UDP 监听地址列表为空");
+        }
+        let relay_cell = Arc::new(Mutex::new(None::<SocketAddr>));
+        let mut sockets: Vec<Arc<UdpSocket>> = Vec::new();
+        let mut binds: Vec<SocketAddr> = Vec::new();
+        let mut used_fallback = false;
+        for want in addrs {
+            // 同一地址只绑一次（调用方可能给出重复项）。
+            if binds.contains(want) {
+                continue;
             }
-            Err(e) => return Err(e.into()),
-        };
-        let socket = Arc::new(socket);
-        let local_port = socket.local_addr()?.port();
-        let mesh = Arc::new(UdpMesh {
-            socket: Arc::clone(&socket),
-            local_port,
-            used_fallback_port: AtomicBool::new(fallback),
-            relay_addr: Mutex::new(None),
-            register_creds: Mutex::new(None),
-        });
-        let reader = Arc::clone(&mesh);
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; UDP_BUFFER_SIZE];
-            loop {
-                match socket.recv_from(&mut buf).await {
-                    Ok((len, from)) => reader.handle(from, &buf[..len], &events),
-                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+            let primary_empty = sockets.is_empty();
+            match UdpSocket::bind(want).await {
+                Ok(s) => {
+                    let local = s.local_addr()?;
+                    let s = Arc::new(s);
+                    spawn_reader(Arc::clone(&s), events.clone(), Arc::clone(&relay_cell));
+                    sockets.push(s);
+                    binds.push(local);
+                }
+                Err(e) => {
+                    let wildcard = want.ip().is_unspecified();
+                    if wildcard && want.port() != 0 {
+                        // 通配 + 固定端口：回退随机端口（同机多节点容错）。
+                        let s = UdpSocket::bind(SocketAddr::new(want.ip(), 0)).await?;
+                        let local = s.local_addr()?;
+                        let s = Arc::new(s);
+                        spawn_reader(Arc::clone(&s), events.clone(), Arc::clone(&relay_cell));
+                        sockets.push(s);
+                        binds.push(local);
+                        used_fallback = true;
+                    } else if wildcard && want.port() == 0 && !primary_empty {
+                        // 端口 0 通配失败且已有 socket：跳过（无需回退目标）。
+                        continue;
+                    } else {
+                        // 指定 IP 失败 / 首个通配端口 0 失败：致命。
+                        anyhow::bail!("UDP 监听绑定失败 {want}: {e}");
+                    }
                 }
             }
-        });
-        Ok(mesh)
+        }
+        if sockets.is_empty() {
+            anyhow::bail!("UDP 监听全部绑定失败");
+        }
+        let local_port = sockets[0].local_addr()?.port();
+        Ok(Arc::new(UdpMesh {
+            sockets,
+            binds,
+            local_port,
+            used_fallback_port: AtomicBool::new(used_fallback),
+            relay_addr: relay_cell,
+            register_creds: Mutex::new(None),
+        }))
     }
 
-    fn handle(
-        &self,
-        from: SocketAddr,
-        packet: &[u8],
-        events: &tokio::sync::mpsc::UnboundedSender<EngineEvent>,
-    ) {
-        let is_relay = *self.relay_addr.lock().unwrap() == Some(from);
-        if is_relay {
-            if packet.first() == Some(&relay_udp::RELAY_MAGIC) {
-                match relay_udp::parse(packet) {
-                    Some(relay_udp::RelayPacket::Ack { ip, port }) => {
-                        let ep = format!("{ip}:{port}");
-                        let _ = events.send(EngineEvent::ObservedEndpoint(ep));
-                    }
-                    Some(relay_udp::RelayPacket::Error { msg }) => {
-                        let _ = events.send(EngineEvent::Log(format!("中继注册被拒绝: {msg}")));
-                    }
-                    _ => {}
-                }
-            } else {
-                // A wire frame forwarded by the relay.
-                let _ = events.send(EngineEvent::Frame {
-                    arrival: crate::engine::Arrival::relay_udp(),
-                    packet: packet.to_vec(),
-                });
-            }
-        } else {
-            let _ = events.send(EngineEvent::Frame {
-                arrival: crate::engine::Arrival::direct_udp(from),
-                packet: packet.to_vec(),
-            });
-        }
+    fn primary(&self) -> &Arc<UdpSocket> {
+        &self.sockets[0]
+    }
+
+    /// 与本地绑定地址匹配的 socket（找不到回退 primary）。
+    fn socket_for(&self, local: SocketAddr) -> &Arc<UdpSocket> {
+        self.binds
+            .iter()
+            .position(|b| *b == local)
+            .map(|i| &self.sockets[i])
+            .unwrap_or(&self.sockets[0])
+    }
+
+    /// 全部本地绑定地址（探测从所有 socket 喷射）。
+    pub fn local_binds(&self) -> &[SocketAddr] {
+        &self.binds
     }
 
     pub fn configure_relay(&self, relay_addr: SocketAddr, device_id: u64, relay_key: &[u8; 32]) {
@@ -107,7 +137,7 @@ impl UdpMesh {
             return;
         };
         let pkt = relay_udp::build_register(device_id, &key).to_vec();
-        let socket = Arc::clone(&self.socket);
+        let socket = Arc::clone(self.primary());
         tokio::spawn(async move {
             let _ = socket.send_to(&pkt, relay).await;
         });
@@ -118,29 +148,227 @@ impl UdpMesh {
             return;
         };
         let pkt = relay_udp::build_relay(src_id, dst_id, frame);
-        let socket = Arc::clone(&self.socket);
+        let socket = Arc::clone(self.primary());
         tokio::spawn(async move {
             let _ = socket.send_to(&pkt, relay).await;
         });
     }
 
+    /// 默认直发（primary socket）。
     pub fn send_direct(&self, endpoint: SocketAddr, frame: &[u8]) {
-        let socket = Arc::clone(&self.socket);
+        let socket = Arc::clone(self.primary());
         let frame = frame.to_vec();
         tokio::spawn(async move {
             let _ = socket.send_to(&frame, endpoint).await;
         });
     }
 
-    pub fn observed_sender(&self) -> Option<SocketAddr> {
-        *self.relay_addr.lock().unwrap()
+    /// 经指定本地绑定的 socket 直发（PONG 沿到达路径 / 直连数据保持
+    /// NAT 映射一致；未知绑定回退 primary）。
+    pub fn send_direct_from(&self, local: SocketAddr, endpoint: SocketAddr, frame: &[u8]) {
+        let socket = Arc::clone(self.socket_for(local));
+        let frame = frame.to_vec();
+        tokio::spawn(async move {
+            let _ = socket.send_to(&frame, endpoint).await;
+        });
     }
 
-    pub fn bound_socket(&self) -> Arc<UdpSocket> {
-        Arc::clone(&self.socket)
+    /// 从每个 socket 各直发一次（探测 PING 喷射：对端可沿任一路径回 PONG）。
+    pub fn send_direct_all(&self, endpoint: SocketAddr, frame: &[u8]) {
+        for socket in &self.sockets {
+            let socket = Arc::clone(socket);
+            let frame = frame.to_vec();
+            tokio::spawn(async move {
+                let _ = socket.send_to(&frame, endpoint).await;
+            });
+        }
+    }
+}
+
+/// 单 socket 读循环：收包按 classify 分流后上抛事件。
+fn spawn_reader(
+    reader: Arc<UdpSocket>,
+    events: tokio::sync::mpsc::UnboundedSender<EngineEvent>,
+    relay_cell: Arc<Mutex<Option<SocketAddr>>>,
+) {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; UDP_BUFFER_SIZE];
+        loop {
+            match reader.recv_from(&mut buf).await {
+                Ok((len, from)) => {
+                    let relay = *relay_cell.lock().unwrap();
+                    handle(from, local_bind_of(&reader), &buf[..len], &events, relay);
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+            }
+        }
+    });
+}
+
+/// 读循环回调：中继控制包在此消化（ACK/ERROR），中继转发帧与对端直发
+/// wire 帧作为 Frame 事件上抛（RelayUdp / DirectUdp 到达，携带来源地址
+/// 与收包 socket 的本地绑定地址）。
+fn handle(
+    from: SocketAddr,
+    local_bind: SocketAddr,
+    packet: &[u8],
+    events: &tokio::sync::mpsc::UnboundedSender<EngineEvent>,
+    relay: Option<SocketAddr>,
+) {
+    match classify(from, relay, packet) {
+        UdpInbound::ObservedEndpoint(ep) => {
+            let _ = events.send(EngineEvent::ObservedEndpoint(ep));
+        }
+        UdpInbound::RelayFrame(frame) => {
+            let _ = events.send(EngineEvent::Frame {
+                arrival: crate::engine::Arrival::relay_udp(),
+                packet: frame,
+            });
+        }
+        UdpInbound::Direct(frame) => {
+            let _ = events.send(EngineEvent::Frame {
+                arrival: crate::engine::Arrival::direct_udp(from, local_bind),
+                packet: frame,
+            });
+        }
+        UdpInbound::Ignore => {}
+    }
+}
+
+/// 入站单包分类（纯函数，分支语义由单测锁定）。判据 = 来源地址是否为
+/// 中继地址（见模块注释），包格式只用于区分中继控制类型。
+#[derive(Debug)]
+enum UdpInbound {
+    /// 中继 REGISTER ACK：观测端点回存（仅信任中继来源——任意来源的
+    /// 0x0B ACK 可伪造 ObservedEndpoint、污染探测目标）。
+    ObservedEndpoint(String),
+    /// 中继转发的帧（剥壳内层 wire 帧，或 RELAY 壳内层——后者真实
+    /// 服务器不发送，防御性保留）。
+    RelayFrame(Vec<u8>),
+    /// 对端直发的 wire 帧（或无法解析的噪声，交上层 codec 丢弃）。
+    Direct(Vec<u8>),
+    /// 丢弃：中继 ERROR / 非中继来源的 0x0B（伪造或噪声）。
+    Ignore,
+}
+
+fn classify(from: SocketAddr, relay: Option<SocketAddr>, packet: &[u8]) -> UdpInbound {
+    let from_relay = relay == Some(from);
+    match (from_relay, relay_udp::parse(packet)) {
+        (true, Some(RelayPacket::Ack { ip, port })) => {
+            // observed endpoint 回存（服务端视角的公网映射）。
+            let ep = if ip.contains(':') && !ip.starts_with('[') {
+                format!("[{ip}]:{port}")
+            } else {
+                format!("{ip}:{port}")
+            };
+            UdpInbound::ObservedEndpoint(ep)
+        }
+        (true, Some(RelayPacket::Relay { frame, .. })) => UdpInbound::RelayFrame(frame.to_vec()),
+        (true, Some(RelayPacket::Error { .. })) | (true, Some(RelayPacket::Register { .. })) => {
+            UdpInbound::Ignore
+        }
+        // 中继转发的内层 wire 帧：parse 中继协议必然失败，这正是中继
+        // 数据面的到达形态——必须分类为 RelayUdp（PONG 沿中继回程的
+        // 前提），绝不能落入直连分支。
+        (true, None) => UdpInbound::RelayFrame(packet.to_vec()),
+        (false, Some(_)) => UdpInbound::Ignore,
+        (false, None) => UdpInbound::Direct(packet.to_vec()),
+    }
+}
+
+use skiff_core::protocol::relay_udp::RelayPacket;
+
+/// 读循环里拿不到 UdpMesh 的 binds 表——把 local_bind 的查询改为通过
+/// local_addr()：socket 的本地地址即绑定地址（随机回退后也是真实绑定）。
+fn local_bind_of(socket: &UdpSocket) -> SocketAddr {
+    socket
+        .local_addr()
+        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
     }
 
-    pub fn fallback_used(&self) -> bool {
-        self.used_fallback_port.load(Ordering::Relaxed)
+    /// 中继转发的内层 wire 帧（0x0A 头）：来自中继地址 → RelayFrame。
+    #[test]
+    fn relayed_wire_frame_from_relay_is_relay() {
+        let relay = addr("203.0.113.1:24931");
+        let frame = [0x0Au8, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 7, 7, 7];
+        assert!(relay_udp::parse(&frame).is_none(), "前提：内层帧不是中继协议");
+        match classify(relay, Some(relay), &frame) {
+            UdpInbound::RelayFrame(f) => assert_eq!(f, frame),
+            other => panic!("中继地址来的 wire 帧必须是 RelayFrame: {other:?}"),
+        }
+    }
+
+    /// 同样的 wire 帧来自陌生地址 → Direct（对端直发）。
+    #[test]
+    fn wire_frame_from_stranger_is_direct() {
+        let frame = [0x0Au8, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3];
+        match classify(addr("10.0.0.2:5000"), Some(addr("203.0.113.1:24931")), &frame) {
+            UdpInbound::Direct(f) => assert_eq!(f, frame),
+            other => panic!("陌生地址来的 wire 帧必须是 Direct: {other:?}"),
+        }
+    }
+
+    /// ACK 只信任中继来源：中继来的 ACK → 观测端点（IPv6 加方括号）。
+    #[test]
+    fn ack_from_relay_is_observed_endpoint() {
+        let relay = addr("203.0.113.1:24931");
+        let pkt = relay_udp::build_ack_packet("2001:db8::1", 41234);
+        match classify(relay, Some(relay), &pkt) {
+            UdpInbound::ObservedEndpoint(ep) => assert_eq!(ep, "[2001:db8::1]:41234"),
+            other => panic!("中继 ACK 必须是 ObservedEndpoint: {other:?}"),
+        }
+        let pkt = relay_udp::build_ack_packet("198.51.100.9", 24933);
+        match classify(relay, Some(relay), &pkt) {
+            UdpInbound::ObservedEndpoint(ep) => assert_eq!(ep, "198.51.100.9:24933"),
+            other => panic!("中继 ACK 必须是 ObservedEndpoint: {other:?}"),
+        }
+    }
+
+    /// 伪造的 ACK（非中继来源）→ 丢弃。
+    #[test]
+    fn ack_from_stranger_is_ignored() {
+        let pkt = relay_udp::build_ack_packet("6.6.6.6", 6666);
+        assert!(matches!(
+            classify(addr("10.0.0.2:5000"), Some(addr("203.0.113.1:24931")), &pkt),
+            UdpInbound::Ignore
+        ));
+    }
+
+    /// RELAY 壳来自中继（真实服务器不发送，防御性）→ 取内层帧。
+    #[test]
+    fn relay_shell_from_relay_unwraps_inner_frame() {
+        let relay = addr("203.0.113.1:24931");
+        let pkt = relay_udp::build_relay(7, 8, b"inner");
+        match classify(relay, Some(relay), &pkt) {
+            UdpInbound::RelayFrame(f) => assert_eq!(f, b"inner".to_vec()),
+            other => panic!("RELAY 壳必须是 RelayFrame: {other:?}"),
+        }
+    }
+
+    /// 中继 ERROR / REGISTER 出现在中继地址上 → 丢弃。
+    #[test]
+    fn error_from_relay_is_ignored() {
+        let relay = addr("203.0.113.1:24931");
+        let pkt = relay_udp::build_error_packet("unknown device or bad auth");
+        assert!(matches!(classify(relay, Some(relay), &pkt), UdpInbound::Ignore));
+    }
+
+    /// 中继未配置（None）时：wire 帧按直连处理（与配置前现状一致，
+    /// 未注册中继前不会有中继流量到达）。
+    #[test]
+    fn unconfigured_relay_defaults_to_direct() {
+        let frame = [0x0Au8, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 9];
+        assert!(matches!(
+            classify(addr("10.0.0.2:5000"), None, &frame),
+            UdpInbound::Direct(_)
+        ));
     }
 }

@@ -154,6 +154,8 @@ fn main() -> anyhow::Result<()> {
                 }
             };
             let log = skiff_node::make_logger(log_file.as_deref(), &cfg, true);
+            // 失败上报需要 server/token：start_engine 按值吃掉 cfg，先留副本。
+            let report_cfg = cfg.clone();
             let code = runtime.block_on(async move {
                 match skiff_node::start_engine(config, cfg, log).await {
                     Ok(engine) => {
@@ -174,6 +176,17 @@ fn main() -> anyhow::Result<()> {
                     }
                     Err(e) => {
                         eprintln!("引擎启动失败: {e}");
+                        // 新配置启动失败 → 上报服务端触发自动回滚（服务端
+                        // 不可达则跳过：master 退避重启后重试，回滚会在
+                        // 控制面恢复后的下一次失败上报时完成）。
+                        let control = ControlClient::new(
+                            &report_cfg.server,
+                            report_cfg.identity.device_token.expose(),
+                            report_cfg.identity.server_cert_pin.as_deref(),
+                        );
+                        if let Some(s) = control.get_settings().await {
+                            control.report_settings_fail(s.revision, &format!("{e:#}")).await;
+                        }
                         skiff_node::supervisor::EXIT_ERROR
                     }
                 }
@@ -259,8 +272,7 @@ async fn cmd_enroll(
         mode: skiff_core::models::ClientMode::Proxy,
         mtu: resp.mtu,
         data_dir: String::new(),
-        listen_udp_port: skiff_core::consts::DEFAULT_LISTEN_PORT,
-        listen_tcp_port: skiff_core::consts::DEFAULT_LISTEN_PORT,
+        listen: skiff_node::default_listen(),
         log_file: None,
         identity: Identity {
             device_id: resp.device_id,
@@ -330,8 +342,7 @@ fn cmd_init_config(out: PathBuf, force: bool) -> anyhow::Result<()> {
   "mode": "proxy",
   "mtu": 1300,
   "dataDir": "",
-  "listenUdpPort": 24933,
-  "listenTcpPort": 24933,
+  "listen": ["udp://0.0.0.0:24933", "tcp://0.0.0.0:24933"],
   "logFile": null,
   "identity": null
 }

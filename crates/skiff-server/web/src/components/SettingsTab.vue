@@ -23,6 +23,8 @@ const joinIp = ref('');
 const managed = ref({
   pathPolicy: false,
   peerPolicies: false,
+  mode: false,
+  listen: false,
   mtu: false,
   socks: false,
   forwards: false,
@@ -31,12 +33,23 @@ const managed = ref({
 const form = ref({
   pathPolicy: 'auto',
   peerPolicies: [], // { deviceId, policy }
+  mode: 'proxy',
+  listen: [], // URL 字符串列表
   mtu: 1300,
   socksEnabled: true,
   socksAddr: '127.0.0.1:1080',
   forwards: [], // { listen, proto, dest }
   exposes: {}, // networkId -> [{ port, proto, dest }]
 });
+
+const modeOptions = computed(() => [
+  { value: 'proxy', label: t('settings.modeProxy') },
+  { value: 'tun', label: t('settings.modeTun') },
+]);
+
+function addListen() {
+  form.value.listen.push('udp://0.0.0.0:24933');
+}
 
 const deviceOptions = computed(() =>
   devices.value.map((d) => ({
@@ -50,6 +63,10 @@ const current = computed(() => devices.value.find((d) => d.id === deviceId.value
 const statusTag = computed(() => {
   const d = current.value;
   if (!d) return null;
+  if (d.settingsError) {
+    const rev = d.settingsErrorRevision != null ? ` · r${d.settingsErrorRevision}` : '';
+    return { type: 'error', text: `${t('settings.applyFailed')}${rev}：${d.settingsError}` };
+  }
   if (d.restartPending) return { type: 'warning', text: t('settings.restartPending') };
   if (d.settingsRevision == null) return { type: 'default', text: t('settings.unmanaged') };
   if (d.appliedRevision == null) return { type: 'info', text: `${t('settings.notReported')} · r${d.settingsRevision}` };
@@ -155,7 +172,15 @@ async function loadSettings() {
       forwards: false,
       exposes: {},
     };
-    const f = { ...form.value, exposes: {}, peerPolicies: [] };
+    const f = { ...form.value, exposes: {}, peerPolicies: [], listen: [] };
+    if (s.mode != null) {
+      m.mode = true;
+      f.mode = s.mode;
+    }
+    if (s.listen != null) {
+      m.listen = true;
+      f.listen = s.listen.map((x) => String(x));
+    }
     if (s.pathPolicy != null) {
       m.pathPolicy = true;
       f.pathPolicy = s.pathPolicy;
@@ -201,6 +226,10 @@ watch(deviceId, () => loadSettings());
 
 function buildBody() {
   const body = {};
+  if (managed.value.mode) body.mode = form.value.mode || 'proxy';
+  if (managed.value.listen) {
+    body.listen = form.value.listen.map((x) => String(x).trim()).filter(Boolean);
+  }
   if (managed.value.pathPolicy) body.pathPolicy = form.value.pathPolicy || 'auto';
   if (managed.value.peerPolicies) {
     body.peerPolicies = form.value.peerPolicies
@@ -281,17 +310,51 @@ function save() {
   }
 }
 
+/// 等待下发闭环：轮询 /admin/devices 直至节点确认（appliedRevision 追平）、
+/// 失败（settingsErrorRevision 匹配，已自动回滚）或超时。
+async function waitApplyOutcome(rev, timeoutMs = 45000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 1500));
+    let d;
+    try {
+      const list = await api('GET', '/admin/devices');
+      devices.value = list;
+      d = list.find((x) => x.id === deviceId.value);
+    } catch {
+      continue;
+    }
+    if (!d) return { kind: 'timeout' };
+    if (d.settingsErrorRevision != null && d.settingsErrorRevision >= rev) {
+      return { kind: 'failed', error: d.settingsError || '?' };
+    }
+    if (d.appliedRevision != null && d.appliedRevision >= rev) {
+      return { kind: 'ok', applied: d.appliedRevision };
+    }
+  }
+  return { kind: 'timeout' };
+}
+
 async function doSave(reverseList) {
   saving.value = true;
   try {
     const saved = await api('PUT', `/admin/devices/${deviceId.value}/settings`, buildBody());
-    let msg = t('settings.saved') + ` (r${saved.revision})`;
+    const rev = saved.revision;
     if (reverseList.length) {
       await applyReverse(reverseList);
-      msg += `；${t('settings.reverseDone')}`;
     }
-    message.success(msg);
-    pollStatus();
+    // 下发闭环：等待节点应用确认 / 失败回滚 / 超时。
+    const out = await waitApplyOutcome(rev);
+    if (out.kind === 'ok') {
+      let msg = t('settings.applyOk') + ` (r${out.applied})`;
+      if (reverseList.length) msg += `；${t('settings.reverseDone')}`;
+      message.success(msg);
+    } else if (out.kind === 'failed') {
+      message.error(`${t('settings.applyFailed')} (r${rev})：${out.error}`);
+    } else {
+      message.warning(`${t('settings.applyNoResp')} (r${rev})`);
+    }
+    pollStatus(2);
   } catch (e) {
     message.error(e.message);
   } finally {
@@ -492,6 +555,38 @@ onMounted(load);
 
       <!-- 重启生效区 -->
       <n-card size="small" :title="t('settings.restartSection')" style="margin-bottom: 12px">
+        <div class="field-row">
+          <n-checkbox v-model:checked="managed.mode" />
+          <n-select
+            v-model:value="form.mode"
+            :options="modeOptions"
+            :disabled="!managed.mode"
+            size="small"
+            style="width: 260px"
+          />
+          <span>{{ t('settings.mode') }}</span>
+        </div>
+        <div class="field-row">
+          <n-checkbox v-model:checked="managed.listen" />
+          <span>{{ t('settings.listen') }}</span>
+        </div>
+        <template v-if="managed.listen">
+          <div v-for="(u, i) in form.listen" :key="i" class="rule-row">
+            <n-input
+              v-model:value="form.listen[i]"
+              size="small"
+              :placeholder="t('settings.listenPh')"
+              style="width: 320px"
+            />
+            <n-button size="tiny" quaternary type="error" @click="form.listen.splice(i, 1)">
+              {{ t('settings.del') }}
+            </n-button>
+          </div>
+          <n-button size="tiny" dashed @click="addListen">{{ t('settings.addListen') }}</n-button>
+        </template>
+        <div class="field-row" style="margin-top: 8px">
+          <span class="hint">{{ t('settings.restartNote') }}</span>
+        </div>
         <div class="field-row">
           <n-checkbox v-model:checked="managed.socks" />
           <n-checkbox

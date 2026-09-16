@@ -126,7 +126,7 @@ starskiff up -c starskiff.json                                  # 双网络同�
 }
 ```
 
-**其余一切网络行为配置由服务器权威下发**：网络成员（管理页或 CLI `device network add/remove`）、路径策略（`pathPolicy` 全局 + `peerPolicies` 按对端覆盖：自动/强制 UDP 中继/强制 TCP 中继/只许直连/强制 UDP 直连/强制 TCP 直连，热生效、只控本端出口）、`exposes`/`socksListen`/`forwards`/托管 `mtu`（管理页「设备配置」；热改项立即生效，其余重启生效）。节点启动时拉取名单位置与托管配置；旧版本文件中的遗留行为字段会在首次启动时自动收编为服务端托管值。`starskiff up` 与服务模式均为 master/worker 架构：管理页的重启指令由 master 以最新配置重新拉起 worker。
+**其余一切网络行为配置由服务器权威下发**：网络成员（管理页或 CLI `device network add/remove`）、路径策略（`pathPolicy` 全局 + `peerPolicies` 按对端覆盖：自动/强制 UDP 中继/强制 TCP 中继/只许直连/强制 UDP 直连/强制 TCP 直连，热生效、只控本端出口）、**运行模式（`mode`：tun 需管理员/root，无权限自动回滚并显示原因）**、**监听地址（`listen`：URL 数组，每协议可多条、可绑定指定网卡/IPv6）**、`exposes`/`socksListen`/`forwards`/托管 `mtu`（管理页「设备配置」）。热改项立即生效；重启类变更**自动重启应用并等待节点应答**，配置启动失败（端口占用/无 TUN 权限等）自动回滚到上一版成功配置并在页面显示原因。节点启动时拉取名单位置与托管配置；旧版本文件中的遗留行为字段会在首次启动时自动收编为服务端托管值。`starskiff up` 与服务模式均为 master/worker 架构：管理页的重启指令由 master 以最新配置重新拉起 worker。
 
 ```json
 {
@@ -169,6 +169,7 @@ starskiff up -c starskiff.json                                  # 双网络同�
 - 探测包含对观测端点的**邻近端口**（±1~4）尝试，覆盖端口递增型对称 NAT
 - 对端通告 TCP 监听时，UDP 被阻断的网络里会自动尝试**直连 TCP**隧道
 - Windows 下 `service install` 自动放行防火墙入站规则（按程序+端口，随服务卸载删除）；Linux 下同样自动放行（ufw → firewalld → 裸 iptables 探测级联，按端口，随服务卸载删除；裸 iptables 为运行时规则会提示持久化建议，云厂商安全组需在控制台放行 24930-24933）；前台运行请自行放行或用服务方式
+- 注意：防火墙规则按**安装时的监听端口**创建；之后在 Web 管理页修改节点监听地址（listen）时规则不会自动更新，需重新执行 `service install` 或手动调整放行端口
 - `forceRelay` / `forceDirect` 可全局强制
 - 完整 UDP 打洞（对称↔对称）未实现，此类节点保持中继（设计内行为）；Web 管理页"设备"表可查看每个节点到各对端的实际路径分布
 

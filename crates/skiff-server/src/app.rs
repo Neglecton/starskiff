@@ -335,6 +335,7 @@ fn router(state: SharedState) -> Router {
         .route("/api/config", get(get_config))
         .route("/api/peers", get(get_peers))
         .route("/api/settings", get(get_device_settings).put(adopt_device_settings))
+        .route("/api/settings/fail", post(report_settings_fail))
         .route("/api/memberships", get(list_memberships))
         .route("/api/heartbeat", post(heartbeat))
         .route("/api/join", post(join_network))
@@ -632,6 +633,13 @@ async fn heartbeat(State(state): State<SharedState>, req: Request<Body>) -> Resp
     };
     state.presence.touch_heartbeat(device.id, &hb);
     let _ = state.repo.touch_device(device.id);
+    // 下发成功应答：节点上报的 appliedRevision 追平当前 revision 时，
+    // 把该版内容固化为回滚锚点（last_good）并清除错误记录。条件写带
+    // revision 守卫（repo 层单条原子 UPDATE）：与并发管理员 PUT 交错时
+    // 未验证的新版本不会被固化（AGENTS.md #22）。
+    if let Some(applied) = hb.settings_revision {
+        let _ = state.repo.mark_settings_applied(device.id, applied);
+    }
     Json(HeartbeatResponse {
         observed_udp_endpoint: state.presence.observed_endpoint(device.id),
     })
@@ -646,6 +654,45 @@ async fn get_device_settings(State(state): State<SharedState>, req: Request<Body
     };
     match state.repo.get_device_settings(device.id) {
         Ok(settings) => Json(settings).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// POST /api/settings/fail —— worker 启动失败上报：revision 匹配当前版
+/// 则自动回滚到 last_good（无则清空托管）并递增 revision，向节点重推
+/// settings_changed；过期/重复上报被忽略（幂等）。
+async fn report_settings_fail(State(state): State<SharedState>, req: Request<Body>) -> Response {
+    let Some(device) = state.auth_device(&req) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let body = axum::body::to_bytes(req.into_body(), 8 * 1024)
+        .await
+        .unwrap_or_default();
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return err(StatusCode::BAD_REQUEST, "invalid body");
+    };
+    let (Some(revision), Some(error)) = (payload["revision"].as_i64(), payload["error"].as_str())
+    else {
+        return err(StatusCode::BAD_REQUEST, "revision/error 缺失");
+    };
+    match state.repo.report_settings_fail(device.id, revision, error) {
+        Ok(Some(rolled)) => {
+            (state.log)(&format!(
+                "SETTINGS_FAIL device={}({}) failed_rev={revision} rolled_back_to_rev={} error={error}",
+                device.name, device.id, rolled.revision
+            ));
+            state.hub.send_to_device(
+                device.id,
+                WsEvent {
+                    event_type: ws_events::SETTINGS_CHANGED.to_string(),
+                    network_id: None,
+                    device_id: Some(device.id),
+                    message: Some(rolled.revision.to_string()),
+                },
+            );
+            (StatusCode::OK, Json(json!({ "rolledBackTo": rolled.revision }))).into_response()
+        }
+        Ok(None) => (StatusCode::OK, Json(json!({ "rolledBackTo": null }))).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -883,6 +930,17 @@ async fn admin_put_device_settings(
     payload.revision = 0; // 服务端权威，忽略请求中的值
     if let Err(msg) = payload.validate() {
         return err(StatusCode::BAD_REQUEST, msg);
+    }
+    // TUN 预检：TUN 限单网络，设备当前多网络成员时直接拒绝（节点侧
+    // 启动兜底会失败回滚，这里提前给出明确错误）。
+    if payload.mode.as_deref() == Some("tun") {
+        let nets = state.repo.memberships_of_device(device_id).unwrap_or_default().len();
+        if nets > 1 {
+            return err(
+                StatusCode::CONFLICT,
+                format!("TUN 模式仅支持单网络，该设备当前有 {nets} 个网络成员"),
+            );
+        }
     }
     // 对端覆盖的 deviceId 必须是已注册设备（防手滑写错 id；字符串形式，
     // 解析失败同样拒绝）。
@@ -1356,13 +1414,10 @@ async fn admin_list_devices(State(state): State<SharedState>, req: Request<Body>
             let paths = record.as_ref().map(|r| r.paths.clone()).filter(|p| !p.is_empty());
             let applied_revision = record.as_ref().and_then(|r| r.applied_settings_revision);
             let restart_pending = record.as_ref().map(|r| r.restart_pending);
-            // 期望 revision：从未保存过托管配置的设备不显示（None）。
-            let settings_revision = state
-                .repo
-                .get_device_settings(d.id)
-                .ok()
-                .filter(|s| s.revision > 0)
-                .map(|s| s.revision);
+            // 期望 revision 与下发失败状态：从未保存过托管配置的设备不显示。
+            let (settings, settings_error, settings_error_revision) =
+                state.repo.get_device_settings_full(d.id).unwrap_or_default();
+            let settings_revision = (settings.revision > 0).then_some(settings.revision);
             AdminDevice {
                 id: d.id.to_string(),
                 name: d.name,
@@ -1374,6 +1429,8 @@ async fn admin_list_devices(State(state): State<SharedState>, req: Request<Body>
                 settings_revision,
                 applied_revision,
                 restart_pending,
+                settings_error,
+                settings_error_revision,
             }
         })
         .collect();

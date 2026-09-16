@@ -41,7 +41,7 @@ tests/it              Harness（进程内 server+节点）+ mesh.rs 六场景
 
 ## 硬性约束与已知坑（违反会引入难查的 bug）
 
-0. **多网络不变式**：`peers` 按 `(network, device)` 双键组织（每网络独立 codec——密钥以 networkId 为派生盐）；**`PacketCodec::try_open` 必须解密成功后才推进重放窗口**（多 codec 试解零副作用的前提，wire.rs 有注释与单测锁定）；**starskiff.json 是瘦配置**（server/mode/mtu/dataDir/listen 端口/identity——启动名单唯一来源是 GET /api/memberships、行为配置唯一来源是 GET /api/settings，文件不再有 networks/socks/forwards/force 字段；遗留文件的非默认值在首次启动经 PUT /api/settings adopt 收编，之后文件被重写、遗留键消失）；TUN 模式限单网络（服务端强制 join 预检 + 节点启动兜底）；WS 每网络一条连接，事件按 networkId 路由；**join/leave 双通道**：CLI join 走 /api/join，管理端强制 join/leave 走 /admin/devices/{id}/networks 并推 networks_changed（节点对账 roster：离开即时修剪、加入置 restartPending；推送丢失由 WS 重连自拉兜底）。
+0. **多网络不变式**（listen 为 URL 数组 `["udp://0.0.0.0:24933",…]`：每协议可多条、可绑指定网卡/IPv6；通配绑定失败容错回退、指定 IP 失败致命走回滚；UdpMesh 多 socket 中 primary 承担中继注册、PONG 沿到达 socket 回复、直连数据经学习端点的 socket、探测全 socket 喷射）：`peers` 按 `(network, device)` 双键组织（每网络独立 codec——密钥以 networkId 为派生盐）；**`PacketCodec::try_open` 必须解密成功后才推进重放窗口**（多 codec 试解零副作用的前提，wire.rs 有注释与单测锁定）；**starskiff.json 是瘦配置**（server/mode/mtu/dataDir/listen 端口/identity——启动名单唯一来源是 GET /api/memberships、行为配置唯一来源是 GET /api/settings，文件不再有 networks/socks/forwards/force 字段；遗留文件的非默认值在首次启动经 PUT /api/settings adopt 收编，之后文件被重写、遗留键消失）；TUN 模式限单网络（服务端强制 join 预检 + 节点启动兜底）；WS 每网络一条连接，事件按 networkId 路由；**join/leave 双通道**：CLI join 走 /api/join，管理端强制 join/leave 走 /admin/devices/{id}/networks 并推 networks_changed（节点对账 roster：离开即时修剪、加入置 restartPending；推送丢失由 WS 重连自拉兜底）。
 1. **首字节 magic 是协议级判别**：wire `0x0A`（version=2，帧头 11B 明文头进 AEAD AAD——头部可见但不可篡改，勿改回无 AAD）、中继 `0x0B`（version=1，未知版本静默丢弃）。两个 magic 必须落在 **0x04–0x13** 区间（避 QUIC/STUN/DTLS/IKE/ASCII，见 docs/protocol.md 判别表）。改任一值 = 破坏兼容；新增隧道协议复用现有端口按首字节分流。
 2. **所有 JSON 走 serde camelCase + null 省略**（DTO 在 skiff-core/src/models.rs，全部双向 derive）；错误响应统一 `{"error":"..."}`；API DTO 放 core（两端共享）；**设备 id 在管理面 JSON 中以字符串传输**（AdminDevice.id / PeerPathReport.deviceId / PeerPolicy.deviceId——随机 u64 常超 JS Number 的 2^53 精度，按数字解析会失真导致"设备不存在"；节点内部仍按 u64 用，边界 parse）。
 3. **存储是 rusqlite 手写 ADO**（单连接 Mutex + WAL，无 ORM）；行映射列名必须与 SQL 一致；enroll 是唯一事务（IP 分配优先级 requestedIp > token.requestedIp > 顺序）。
@@ -59,8 +59,12 @@ tests/it              Harness（进程内 server+节点）+ mesh.rs 六场景
 15. **探测 PING 可能误入同机其它 UDP 端口**（邻近端口预测副作用，sealed 帧被 forwarder 转发是预期噪声）——测试断言注意。
 16. Git Bash 下 docker 的容器内路径加 `export MSYS_NO_PATHCONV=1`。
 17. **默认端口 24930-24933**（API/RelayUdp/RelayTcp/节点监听）；防火墙规则名 `Starskiff {name} UDP/TCP`，remove 按名删除——改名要两处同步。
-18. **设备托管配置（DeviceSettings）走 revision 收敛**：服务端权威递增 revision，节点只在 `settings_changed` 推送与每次 WS `connected` 时自拉并按 `revision` 幂等应用（多网络节点多连接重复投递必须安全）；PUT 是全量替换，字段缺省=未托管走默认值（socks 默认开启 127.0.0.1:1080）；节点侧 `PUT /api/settings`（adopt）仅填未托管字段（遗留值收编，幂等无新值不递增 revision）；Secret/身份/listen 端口/mode 永不进该通道；**重启类字段（mtu/socks/forwards）不落文件**——以 EngineShared.runtime_* 为生效基准做 restart_pending 比对，重启按拉取值重建。**路径策略（PathPolicy：auto/relayUdp/relayTcp/directAny/directUdp/directTcp，全局+按对端覆盖）热生效且只控本端出口**：中继回退与超时降级仅 auto；探测/升级以"资源是否就绪"判断而非 path（pin 下 apply 已把 path 置为 pin 值，以 path 判断会死锁）；**relayTcp 送达要求接收方持有 TCP 中继连接**（单向 pin 黑洞，管理页提供成对设置）；RelayTcpClient 收到 REGISTER ACK 必须继续读（曾 `_ => return` 僵尸——发送正常接收全失）。
+18. **设备托管配置（DeviceSettings）走 revision 收敛 + 应答回滚闭环**：服务端权威递增 revision，节点只在 `settings_changed` 推送与每次 WS `connected` 时自拉并按 `revision` 幂等应用（多网络节点多连接重复投递必须安全）；PUT 是全量替换，字段缺省=未托管走默认值（socks 默认开启 127.0.0.1:1080）；节点侧 `PUT /api/settings`（adopt）仅填未托管字段（遗留值收编，幂等无新值不递增 revision）；Secret/身份永不进该通道（**mode/listen 已纳入托管**，重启类）；**重启类字段（mode/listen/mtu/socks/forwards）不落文件**——以 EngineShared.runtime_* 为生效基准做比对，**变更即自动 request_stop(Restart)**，应答由新 worker 启动成功给出（apply_settings 在重启类变更时**不得**写 applied_revision/心跳——旧 worker 代答会让服务端把未验证配置固化为 last_good，失败回滚将回到坏配置自身形成循环；TUN 无权限/端口占用等启动失败经 worker 的 fail 上报触发服务端回滚到 last_good）。**路径策略（PathPolicy：auto/relayUdp/relayTcp/directAny/directUdp/directTcp，全局+按对端覆盖）热生效且只控本端出口**：中继回退与超时降级仅 auto；探测/升级以"资源是否就绪"判断而非 path（pin 下 apply 已把 path 置为 pin 值，以 path 判断会死锁）；**relayTcp 送达要求接收方持有 TCP 中继连接**（单向 pin 黑洞，管理页提供成对设置）；RelayTcpClient 收到 REGISTER ACK 必须继续读（曾 `_ => return` 僵尸——发送正常接收全失）。
 19. **WS 握手请求必须经 `into_client_request()` 从 URL 生成**（control.rs run_ws_once）：手工 `Request::builder().uri()` 构造的请求缺 sec-websocket-key 等握手头，握手必被拒——曾因此引擎事件订阅整体静默失效，全靠 5s probe 轮询兜底。
+20. **判别/分流逻辑的判据是不可见不变量，重构必须有分支级测试锁定**：UDP 到达分类的依据是**来源地址**（from == relay_addr）而非包格式——中继转发的是剥壳后的内层 wire 帧（0x0A），节点侧 parse 中继协议必然失败；多 socket 重构把 handle 拆成自由函数时丢失了 self 上的 relay_addr，改按"包能否 parse 成中继协议"判别后，中继流量全部误判为直连（PONG 裸发中继地址被丢、RTT 永测不到、违反 #8）。数据面帧（DATA/FLOW）不读 arrival 分类——**"数据通了"证明不了分类正确**，只有沿原路回程的协议（PING/PONG）才暴露误判；测试须直接断言 last_pong/rtt/PATH_UP 这类路径健康信号（见 mesh.rs 中继往返场景），联调验证清单加"观察 RTT/PATH_UP 指标"。ACK 只信任中继来源（否则任意 0x0B ACK 可伪造 ObservedEndpoint 污染探测目标）。
+21. **字符串枚举 match 必须穷举合法值，`_`/else 只留缺省**：`Some("tun") => Tun, _ => 文件值` 曾吞掉同样合法的 `Some("proxy")`，且另一处同一解析写成 `else => Proxy`——两路径语义相反（启动按文件、运行时按托管，白转一圈重启圈）。合法值逐个显式列举；同一 wire 字符串在多处解析必须收敛为同一语义（最好单一函数）；双向变更都要测（proxy→tun 测了、tun→proxy 漏测过）。
+22. **"读-判-写"存储操作默认写成单条条件 UPDATE / 事务内守卫**：先 SELECT 再无条件 UPDATE 必开并发窗口（心跳 appliedRevision 判定与管理员 PUT 交错，未验证配置被固化进 last_good，回滚回到坏配置自身）。凡带 revision/版本判定的写入，WHERE 里带守卫条件，把正确性交给数据库原子性而非调用方时序；测试直接锁定守护语义（过期 revision 不生效），不追求复现竞态。
+23. **修完时序/竞态 bug 按不变式穷举写入路径，而非止于症状消失**：T3 堵住 worker 代答入口后回滚循环消失，但服务端心跳 TOCTOU 同样能把未验证配置固化进 last_good（同 #22）。修完后自问"还有谁能把坏值写进这个字段/状态"，逐个入口闭合。
 
 ## 结构化日志（稳定性/性能分析）
 
@@ -87,6 +91,7 @@ tests/it              Harness（进程内 server+节点）+ mesh.rs 六场景
 5. 涉及管理面的改动：Web 页（`crates/skiff-server/web/`，Vue 3 + Vite + Naive UI + vue-i18n；`npm run build` 产物 dist 不入库，`web/dist/index.html` 占位页入库保证无 Node 也能 cargo build——提交前还原占位页，详见 `web/README.md`）与 admin CLI 保持功能对齐；改文案必须走 i18n 语言包（zh-CN/en-US 双份），改后需重新 `npm run build`。
 6. 需保证`cargo build --release --workspace`编译成功且无警告，若出现警告，无论是不是本次修改导致的都需要修复。
 7. 结束后关闭所有`starskiff`和`starskiff-server`测试进程。
+8. 若用户要求你阅读代码审查、code review报告，对于其中你不接受的点应当详细说明原因；对于报告中提到的bug，若你验证后发现确实存在且该部分代码是你所写，除了制定修复计划外，还应当反思为什么之前的开发和测试过程没有发现这些问题，并将经验教训记录在本文档中。
 
 ## 功能边界（当前版本刻意不做的）
 

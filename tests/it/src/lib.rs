@@ -121,8 +121,7 @@ impl TestHarness {
             mode: skiff_core::models::ClientMode::Proxy,
             mtu: resp["mtu"].as_u64().unwrap_or(1300) as u32,
             data_dir: data_dir.to_string_lossy().into_owned(),
-            listen_udp_port: 0,
-            listen_tcp_port: 0,
+            listen: vec!["udp://0.0.0.0:0".to_string()],
             log_file: None,
             identity: Identity {
                 device_id: resp["deviceId"].as_u64().unwrap(),
@@ -238,8 +237,7 @@ impl TestHarness {
             mode: skiff_core::models::ClientMode::Proxy,
             mtu: resp["mtu"].as_u64().unwrap_or(1300) as u32,
             data_dir: data_dir.to_string_lossy().into_owned(),
-            listen_udp_port: 0,
-            listen_tcp_port: 0,
+            listen: vec!["udp://0.0.0.0:0".to_string()],
             log_file: None,
             identity: Identity {
                 device_id: resp["deviceId"].as_u64().unwrap(),

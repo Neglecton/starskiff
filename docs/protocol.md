@@ -125,7 +125,8 @@ ERROR(4):    [msgLen u8][msg utf-8]（截断 200B）
 | `GET /api/peers` | 对端列表；`udpEndpoints[0]` **必须是中继观测端点**（客户端邻近端口探测依赖此顺序） |
 | `GET /api/memberships` | 本设备的网络成员名单（**服务端权威**，节点启动名单的唯一来源；节点文件 networks[] 仅作缓存） |
 | `GET /api/settings` | 本设备的服务端托管配置（DeviceSettings；revision 驱动幂等应用，字段缺省=未托管） |
-| `POST /api/heartbeat` | 上报本地地址与监听端口（服务器清洗：仅 IPv4、去重、≤8 个；端口 1–65535；paths ≤64）；可附 `settingsRevision`/`restartPending` 上报配置收敛状态；返回中继观测地址 |
+| `POST /api/heartbeat` | 上报本地地址与监听端口（服务器清洗：仅 IPv4、去重、≤8 个；端口 1–65535；paths ≤64）；附 `settingsRevision`/`restartPending` 上报配置收敛状态（appliedRevision 追平当前 revision 时服务端固化 last_good 并清错误）；返回中继观测地址 |
+| `POST /api/settings/fail` | worker 以新配置启动失败上报 `{revision, error}`：匹配当前 revision 则自动回滚到 last_good 并重推；过期/重复忽略 |
 | `POST /api/join` | 已注册设备用注册令牌加入**另一个**网络（幂等：已在网络则返回现 IP） |
 | `POST /api/leave` | 设备移除自己在某网络的成员关系（禁止移除最后一个网络） |
 | `WS /api/events` | 推送 peers_changed / device_online / device_offline / config_changed / settings_changed / networks_changed / restart_requested / reconnect_requested（同一设备可每网络一条连接并存） |
@@ -138,7 +139,13 @@ ERROR(4):    [msgLen u8][msg utf-8]（截断 200B）
 
 ### 设备托管配置（DeviceSettings）
 
-服务端权威下发：`{revision, pathPolicy?, peerPolicies?[{deviceId, policy}], mtu?, socksListen?(空串=禁用), forwards?, exposes?[{networkId, rules}]}`，`Some` = 托管并覆盖默认值，缺省 = 未托管走默认（路径策略默认 `auto`、socks 默认 `127.0.0.1:1080`）。路径策略与 exposes 热生效；mtu/socks/forwards 由节点在启动时拉取生效、运行中变更置 `restartPending`（心跳上报），**不落节点文件**——starskiff.json 只保留连接信息与本机部署参数。推送为 at-most-once：节点在收到 `settings_changed` 与每次 WS `connected` 时自拉，`revision` 单调递增做幂等去重（多网络节点多连接重复投递安全）。`PUT /api/settings`（设备令牌鉴权）为**收编**端点：仅用请求值填充当前未托管的字段（字段级合并、已托管字段不可被节点覆盖、无可收编项不递增 revision），用于旧版文件遗留行为值的零感迁移。
+服务端权威下发：`{revision, pathPolicy?, peerPolicies?[{deviceId, policy}], mode?("tun"/"proxy"), listen?["udp://ip:port",…], mtu?, socksListen?(空串=禁用), forwards?, exposes?[{networkId, rules}]}`，`Some` = 托管并覆盖默认值，缺省 = 未托管走默认（路径策略默认 `auto`、mode 默认文件值、socks 默认 `127.0.0.1:1080`）。**不落节点文件**——starskiff.json 只保留连接信息与本机部署参数。
+
+**下发应答闭环**：路径策略与 exposes 热生效（应答即时）；重启类字段（mode/listen/mtu/socks/forwards）变更触发节点**自动重启**应用，应答由新 worker 启动成功给出（旧 worker 不代答——未真正生效的配置不得被固化为回滚锚点）。worker 以新配置启动失败时经 `POST /api/settings/fail {revision, error}` 上报，服务端自动回滚到 last_good（心跳 appliedRevision 追平当前 revision 时固化的内容；从未成功过则清空托管）并递增 revision 重推；过期/重复上报按 revision 比对忽略（幂等）。错误与失败 revision 随 `/admin/devices` 下发（settingsError/settingsErrorRevision），下一版成功应答后清除。
+
+**监听地址（listen）**：URL 数组，每协议可多条、可绑定指定网卡与 IPv6（`udp://0.0.0.0:24933` / `tcp://[::]:24933` / `udp://192.168.1.5:24934`；端口 0=随机）。通配地址绑定失败沿用容错（UDP 回退随机端口/TCP 跳过——多节点同机依赖）；**指定 IP 绑定失败为致命错误**，走失败上报→回滚。UdpMesh 多 socket：primary（首项）承担中继注册/默认发送；PONG 沿到达 socket 回复、直连数据经学习端点时的同一 socket 发送（NAT 映射一致）；探测从全部 UDP socket 喷射。**mode=tun 需管理员/root**（无权限时启动失败自动回滚并显示原因；服务端预检拒绝多网络成员设备的 tun 下发）。
+
+推送为 at-most-once：节点在收到 `settings_changed` 与每次 WS `connected` 时自拉，`revision` 单调递增做幂等去重（多网络节点多连接重复投递安全）。`PUT /api/settings`（设备令牌鉴权）为**收编**端点：仅用请求值填充当前未托管的字段（字段级合并、已托管字段不可被节点覆盖、无可收编项不递增 revision），用于旧版文件遗留行为值的零感迁移。
 
 #### 路径策略（PathPolicy）
 
@@ -173,7 +180,7 @@ DirectUdp 30s 无 PONG（10s × 3 次）→ 回退 RelayUdp
 | 心跳间隔 | 15s（每第 2 次附带中继 REGISTER + TCP KEEPALIVE） |
 | 路径探测 | 5s；ping 10s×3 次未中降级；直连探测 2s；TCP 探测 3s 超时 + 60s 冷却 |
 | 防重放窗口 | 128 计数器；bootNonce 保留最近 32 代（REGISTER nonce 记忆 10 分钟） |
-| worker 退出码 | 0=干净停止 / 1=异常 / 3=远程重启请求；master 退避 1/2/5/10/30s（稳定 60s 清零），`__worker` 为内部子进程 |
+| worker 退出码 | 0=干净停止 / 1=异常（配置启动失败经 /api/settings/fail 上报后回滚自愈）/ 3=重启请求（远程指令或重启类配置变更自动触发）；master 退避 1/2/5/10/30s（稳定 60s 清零），`__worker` 为内部子进程 |
 | TCP 帧上限 | 512 KiB；UDP 收包缓冲 65535 |
 | wintun ring | 4 MiB |
 | 本地身份文件 | node.json，Windows DPAPI LocalMachine 密封（`SKF1` 头，entropy `starskiff.NodeState.v1`），非 Windows 明文 |

@@ -119,12 +119,23 @@ pub fn install(
                 format!("protocol={proto}"),
                 program.clone(),
             ];
-            if cfg.listen_udp_port > 0 && proto == "UDP" {
-                args.push(format!("localport={}", cfg.listen_udp_port));
+            // 从监听列表按协议收集非 0 端口（托管值运行时可变，防火墙规则
+            // 只按安装时的文件默认打——托管端口变化需管理员同步调整）。
+            let want = if proto == "UDP" { "udp" } else { "tcp" };
+            let ports: Vec<u16> = cfg
+                .listen
+                .iter()
+                .filter_map(|u| skiff_core::models::parse_listen_url(u).ok())
+                .filter(|(pr, a)| {
+                    let w = if proto == "UDP" { skiff_core::models::ListenProto::Udp } else { skiff_core::models::ListenProto::Tcp };
+                    *pr == w && a.port() != 0
+                })
+                .map(|(_, a)| a.port())
+                .collect();
+            if !ports.is_empty() {
+                args.push(format!("localport={}", ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")));
             }
-            if cfg.listen_tcp_port > 0 && proto == "TCP" {
-                args.push(format!("localport={}", cfg.listen_tcp_port));
-            }
+            let _ = want;
             let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
             let _ = run_tool("netsh", &refs, Duration::from_secs(15));
         }
@@ -146,11 +157,15 @@ pub fn install(
         run_tool("systemctl", &["daemon-reload"], timeout)?;
         run_tool("systemctl", &["enable", &name], timeout)?;
         let mut ports: Vec<(u16, &str)> = Vec::new();
-        if cfg.listen_udp_port > 0 {
-            ports.push((cfg.listen_udp_port, "udp"));
-        }
-        if cfg.listen_tcp_port > 0 {
-            ports.push((cfg.listen_tcp_port, "tcp"));
+        for u in &cfg.listen {
+            let Ok((pr, a)) = skiff_core::models::parse_listen_url(u) else { continue };
+            if a.port() == 0 {
+                continue;
+            }
+            match pr {
+                skiff_core::models::ListenProto::Udp => ports.push((a.port(), "udp")),
+                skiff_core::models::ListenProto::Tcp => ports.push((a.port(), "tcp")),
+            }
         }
         if let Err(e) = linux_firewall_add(&name, &ports) {
             println!("警告：防火墙配置失败（{e}）；容器/无 CAP_NET_ADMIN 环境可忽略");
@@ -215,11 +230,15 @@ pub fn remove(name: Option<&str>, config: Option<&PathBuf>) -> anyhow::Result<()
                     })
             });
         if let Some(cfg) = &cfg {
-            if cfg.listen_udp_port > 0 {
-                ports.push((cfg.listen_udp_port, "udp"));
-            }
-            if cfg.listen_tcp_port > 0 {
-                ports.push((cfg.listen_tcp_port, "tcp"));
+            for u in &cfg.listen {
+                let Ok((pr, a)) = skiff_core::models::parse_listen_url(u) else { continue };
+                if a.port() == 0 {
+                    continue;
+                }
+                match pr {
+                    skiff_core::models::ListenProto::Udp => ports.push((a.port(), "udp")),
+                    skiff_core::models::ListenProto::Tcp => ports.push((a.port(), "tcp")),
+                }
             }
         }
         std::fs::remove_file(&unit_path).ok();

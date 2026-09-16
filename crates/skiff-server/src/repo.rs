@@ -179,24 +179,107 @@ impl Repo {
     // device_settings ---------------------------------------------------------
 
     /// 读设备的托管配置；无记录时返回 revision=0 的空配置（全部未托管）。
-    pub fn get_device_settings(&self, device_id: u64) -> Result<DeviceSettings, RepoError> {
+    /// 附带下发状态（last_good/last_error，供管理页展示）。
+    pub fn get_device_settings_full(
+        &self,
+        device_id: u64,
+    ) -> Result<(DeviceSettings, Option<String>, Option<i64>), RepoError> {
         let row = self.db.with(|c| {
             c.query_row(
-                "SELECT revision, json FROM device_settings WHERE device_id = ?1",
+                "SELECT revision, json, last_error, failed_revision FROM device_settings WHERE device_id = ?1",
                 params![device_id as i64],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                    ))
+                },
             )
             .optional()
         })?;
         match row {
-            Some((revision, json)) => {
+            Some((revision, json, err, failed_rev)) => {
                 let mut settings: DeviceSettings =
                     serde_json::from_str(&json).map_err(|e| RepoError::Conflict(format!("device_settings JSON 无效: {e}")))?;
                 settings.revision = revision; // 列是 revision 的权威来源
-                Ok(settings)
+                Ok((settings, err, failed_rev))
             }
-            None => Ok(DeviceSettings::default()),
+            None => Ok((DeviceSettings::default(), None, None)),
         }
+    }
+
+    pub fn get_device_settings(&self, device_id: u64) -> Result<DeviceSettings, RepoError> {
+        Ok(self.get_device_settings_full(device_id)?.0)
+    }
+
+    /// 节点应答成功（心跳 appliedRevision 追平当前 revision）：把**节点
+    /// 已验证的那一版**内容固化为 last_good（回滚锚点），清除错误记录。
+    /// 单条条件 UPDATE（revision <= applied）：若调用方读判与写入之间
+    /// 管理员又下发了新版本，守卫 0 行命中、新内容不会被固化——把
+    /// 正确性交给数据库原子性而非调用方时序（AGENTS.md #22）。
+    pub fn mark_settings_applied(&self, device_id: u64, applied: i64) -> Result<(), RepoError> {
+        self.db.with(|c| {
+            c.execute(
+                "UPDATE device_settings SET last_good_json = json, last_error = NULL, failed_revision = NULL
+                 WHERE device_id = ?1 AND revision > 0 AND revision <= ?2",
+                params![device_id as i64, applied],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// worker 启动失败上报：仅当上报的 revision 仍是当前 revision 时生效
+    ///（过期/重复上报天然幂等）。回滚 = 恢复 last_good（无则清空托管），
+    /// revision 递增，记录错误。返回回滚后的配置（供日志/推送）。
+    /// 读-判-写同事务且 UPDATE 带 revision 守卫：过期上报不会覆盖期间
+    /// 管理员新下发的配置（AGENTS.md #22/#23）。
+    pub fn report_settings_fail(
+        &self,
+        device_id: u64,
+        failed_revision: i64,
+        error: &str,
+    ) -> Result<Option<DeviceSettings>, RepoError> {
+        let err: String = error.chars().take(500).collect();
+        let rolled: Option<(String, i64)> = self.db.with_tx(|tx| -> Result<Option<(String, i64)>, RepoError> {
+            let row = tx
+                .query_row(
+                    "SELECT revision, last_good_json FROM device_settings WHERE device_id = ?1",
+                    params![device_id as i64],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)),
+                )
+                .optional()?;
+            let Some((current, last_good)) = row else {
+                return Ok(None); // 无托管记录：无需回滚
+            };
+            if failed_revision != current {
+                return Ok(None); // 过期上报（已回滚过 / 又有新下发）
+            }
+            let rollback_json = match last_good {
+                Some(g) => g,
+                None => serde_json::to_string(&DeviceSettings::default())
+                    .map_err(|e| RepoError::Conflict(format!("序列化失败: {e}")))?,
+            };
+            let next = current + 1;
+            let hit = tx.execute(
+                "UPDATE device_settings SET json = ?2, revision = ?3, last_error = ?4, failed_revision = ?5, updated_at = ?6
+                 WHERE device_id = ?1 AND revision = ?7",
+                params![device_id as i64, rollback_json, next, err, failed_revision, unix_ms(), current],
+            )?;
+            if hit == 0 {
+                return Ok(None); // 守卫未命中（并发已变更）：按过期上报处理
+            }
+            Ok(Some((rollback_json, next)))
+        })?;
+        let Some((rollback_json, next)) = rolled else {
+            return Ok(None);
+        };
+        let mut rolled = serde_json::from_str::<DeviceSettings>(&rollback_json)
+            .map_err(|e| RepoError::Conflict(format!("回滚内容无效: {e}")))?;
+        rolled.revision = next;
+        Ok(Some(rolled))
     }
 
     /// 收编（adopt）：仅用候选值填充**当前未托管**的字段（字段级合并），
@@ -963,5 +1046,92 @@ mod tests {
         );
         assert!(repo.list_tokens().unwrap().is_empty());
         assert!(!repo.delete_network(net.id).unwrap());
+    }
+
+    fn settings_with_socks(port: u16) -> DeviceSettings {
+        let mut s = DeviceSettings::default();
+        s.socks_listen = Some(format!("127.0.0.1:{port}"));
+        s
+    }
+
+    fn last_good_json(repo: &Repo, device_id: u64) -> Option<String> {
+        repo.db
+            .with(|c| {
+                c.query_row(
+                    "SELECT last_good_json FROM device_settings WHERE device_id = ?1",
+                    params![device_id as i64],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .unwrap()
+            .flatten()
+    }
+
+    /// mark_settings_applied 的 revision 守卫：节点 applied=1 期间管理员
+    /// 已下发未验证的 rev2，固化不得把 rev2 内容写进 last_good（否则回滚
+    /// 回到坏配置自身——AGENTS.md #22 的 TOCTOU 守护语义，确定性测试
+    /// 无需复现竞态）。
+    #[test]
+    fn mark_applied_never_fixates_newer_unverified_revision() {
+        let repo = temp_repo();
+        let net = repo.create_network("n", "10.9.0.0/24").unwrap();
+        let token = repo.create_token(net.id, 5, 86_400_000, None).unwrap();
+        let dev = repo
+            .enroll(&token.token, "a", &"aa".repeat(32), &"bb".repeat(32), None)
+            .unwrap();
+
+        let s1 = repo.set_device_settings(dev.device_id, &settings_with_socks(1111)).unwrap();
+        assert_eq!(s1.revision, 1);
+        repo.mark_settings_applied(dev.device_id, 1).unwrap();
+        let good = last_good_json(&repo, dev.device_id).expect("applied 版本应固化为 last_good");
+        assert!(good.contains("1111"));
+
+        // 节点心跳（applied=1）与新版下发（rev2）交错：守卫 0 行命中。
+        let s2 = repo.set_device_settings(dev.device_id, &settings_with_socks(2222)).unwrap();
+        assert_eq!(s2.revision, 2);
+        repo.mark_settings_applied(dev.device_id, 1).unwrap();
+        let good2 = last_good_json(&repo, dev.device_id).unwrap();
+        assert_eq!(good2, good, "未验证的 rev2 不得覆盖 last_good");
+
+        // 节点真实验证 rev2 后（applied=2）才允许固化。
+        repo.mark_settings_applied(dev.device_id, 2).unwrap();
+        let good3 = last_good_json(&repo, dev.device_id).unwrap();
+        assert!(good3.contains("2222"), "验证后的 rev2 才可固化");
+    }
+
+    /// report_settings_fail 的过期守卫：上报 revision 落后于当前版本时
+    /// 不回滚、不覆盖新下发内容（防止过期失败上报吞掉管理员刚保存的
+    /// 配置）；匹配当前版本时正常回滚到 last_good。
+    #[test]
+    fn report_fail_stale_revision_is_ignored() {
+        let repo = temp_repo();
+        let net = repo.create_network("n", "10.9.1.0/24").unwrap();
+        let token = repo.create_token(net.id, 5, 86_400_000, None).unwrap();
+        let dev = repo
+            .enroll(&token.token, "a", &"aa".repeat(32), &"bb".repeat(32), None)
+            .unwrap();
+
+        let s1 = repo.set_device_settings(dev.device_id, &settings_with_socks(1111)).unwrap();
+        repo.mark_settings_applied(dev.device_id, s1.revision).unwrap();
+        let s2 = repo.set_device_settings(dev.device_id, &settings_with_socks(2222)).unwrap();
+        let s3 = repo.set_device_settings(dev.device_id, &settings_with_socks(3333)).unwrap();
+        assert_eq!((s2.revision, s3.revision), (2, 3));
+
+        // 过期上报（rev2）：当前已是 rev3，忽略。
+        assert!(repo.report_settings_fail(dev.device_id, 2, "stale").unwrap().is_none());
+        assert_eq!(
+            repo.get_device_settings(dev.device_id).unwrap().socks_listen,
+            Some("127.0.0.1:3333".into()),
+            "过期上报不得覆盖新下发内容"
+        );
+
+        // 匹配当前版本（rev3）：回滚到 last_good（rev1 内容）、revision 递增。
+        let rolled = repo.report_settings_fail(dev.device_id, 3, "boom").unwrap().expect("当前版本应回滚");
+        assert_eq!(rolled.revision, 4);
+        assert_eq!(rolled.socks_listen, Some("127.0.0.1:1111".into()));
+        let cur = repo.get_device_settings(dev.device_id).unwrap();
+        assert_eq!(cur.revision, 4);
+        assert_eq!(cur.socks_listen, Some("127.0.0.1:1111".into()));
     }
 }

@@ -16,6 +16,12 @@ pub mod win_service;
 
 pub use net_if::local_ipv4_addrs;
 
+/// 监听地址默认值（enroll/init-config 样例与 harness 用）。
+pub fn default_listen() -> Vec<String> {
+    let p = skiff_core::consts::DEFAULT_LISTEN_PORT;
+    vec![format!("udp://0.0.0.0:{p}"), format!("tcp://0.0.0.0:{p}")]
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -183,10 +189,20 @@ pub async fn start_engine(config_path: PathBuf, cfg: NodeConfig, log: LogFn) -> 
     let data_dir = if cfg.data_dir.is_empty() { default_data_dir() } else { PathBuf::from(&cfg.data_dir) };
     let status_dir = data_dir.clone();
 
-    let (data_sink, outbound_rx): (DataSink, Option<tokio::sync::mpsc::Receiver<Vec<u8>>>) = if cfg.mode == ClientMode::Tun {
-        // TUN 设备必须在引擎之前创建，而名单以服务端为准——临时控制
-        // 连接预拉首个网络与生效 MTU（引擎启动时会再拉全量名单，双拉幂等）。
-        let (ip, cidr, mtu) = tun_first_network(&cfg, &log).await?;
+    // 托管配置预拉（一次，双拉幂等）：运行模式可能被托管覆盖，TUN 分支
+    // 判定以生效模式为准；TUN 预拉还取首个网络与生效 MTU。
+    let control = control::ControlClient::new(
+        &cfg.server,
+        cfg.identity.device_token.expose(),
+        cfg.identity.server_cert_pin.as_deref(),
+    );
+    let settings = engine::bootstrap_settings_pub(&control, &config_path, &log).await;
+    let effective_mode = engine::effective_mode_of(&settings, &cfg);
+    let file_mtu = cfg.mtu;
+
+    let (data_sink, outbound_rx): (DataSink, Option<tokio::sync::mpsc::Receiver<Vec<u8>>>) = if effective_mode == ClientMode::Tun {
+        let (ip, cidr, _) = tun_first_network(&control, &log).await?;
+        let mtu = settings.mtu.unwrap_or(file_mtu);
         let (device, rx) = tun::TunDevice::start(ip, cidr, mtu, log.clone())?;
         let device = Arc::new(device);
         let sink: DataSink = Box::new(move |packet: &[u8]| device.write_packet(packet));
@@ -195,7 +211,7 @@ pub async fn start_engine(config_path: PathBuf, cfg: NodeConfig, log: LogFn) -> 
         (Box::new(|_: &[u8]| {}), None)
     };
 
-    let engine = NodeEngine::start(config_path, cfg, data_sink, log).await?;
+    let engine = NodeEngine::start_with_settings(config_path, cfg, data_sink, settings, log).await?;
 
     // TUN outbound packets flow into the engine as events.
     if let Some(mut rx) = outbound_rx {
@@ -213,12 +229,10 @@ pub async fn start_engine(config_path: PathBuf, cfg: NodeConfig, log: LogFn) -> 
 /// TUN 模式预取首个网络的 ip/cidr 与生效 MTU（服务端权威名单 + 托管
 /// 配置；无限重试直到成功——与引擎 FetchConfigOrFail 同语义，服务器
 /// 不可达时 worker 不启动）。
-async fn tun_first_network(cfg: &NodeConfig, log: &LogFn) -> anyhow::Result<(std::net::Ipv4Addr, Cidr, u32)> {
-    let control = control::ControlClient::new(
-        &cfg.server,
-        cfg.identity.device_token.expose(),
-        cfg.identity.server_cert_pin.as_deref(),
-    );
+async fn tun_first_network(
+    control: &control::ControlClient,
+    log: &LogFn,
+) -> anyhow::Result<(std::net::Ipv4Addr, Cidr, u32)> {
     let mut attempt: u32 = 0;
     loop {
         if let Some(first) = control
@@ -226,13 +240,9 @@ async fn tun_first_network(cfg: &NodeConfig, log: &LogFn) -> anyhow::Result<(std
             .await
             .and_then(|list| list.first().cloned())
         {
-            let mtu = control
-                .get_settings()
-                .await
-                .and_then(|s| s.mtu)
-                .unwrap_or(cfg.mtu);
+            // MTU 的托管覆盖在调用方（start_engine 已预拉 settings）处理。
             match (first.ip.parse::<std::net::Ipv4Addr>(), Cidr::parse(&first.cidr)) {
-                (Ok(ip), Ok(cidr)) => return Ok((ip, cidr, mtu)),
+                (Ok(ip), Ok(cidr)) => return Ok((ip, cidr, 0)),
                 _ => anyhow::bail!(
                     "网络 {} 的 IP/网段无效: {}/{}",
                     first.network_name,

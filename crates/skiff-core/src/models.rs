@@ -276,6 +276,12 @@ pub struct AdminDevice {
     /// 节点上报的重启待生效标志。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restart_pending: Option<bool>,
+    /// 最近一次下发失败的原因（已自动回滚；presence 上报）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings_error: Option<String>,
+    /// 失败对应的 revision。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings_error_revision: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,6 +418,13 @@ pub struct DeviceSettings {
     /// 按对端覆盖列表（None=未托管；空列表=明确无覆盖）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_policies: Option<Vec<PeerPolicy>>,
+    /// 运行模式（"tun"/"proxy"，重启生效；tun 需管理员/root，节点启动
+    /// 失败会自动回滚并上报错误）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// 监听地址列表（URL 形式，重启生效；全量替换文件默认值）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -425,6 +438,27 @@ pub struct DeviceSettings {
 impl DeviceSettings {
     /// 托管子集的格式校验（节点在持久化前还会做整体 validate 兜底）。
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(mode) = &self.mode
+            && mode != "tun"
+            && mode != "proxy"
+        {
+            return Err(format!("mode 必须是 tun 或 proxy（{mode}）"));
+        }
+        if let Some(list) = &self.listen {
+            if list.len() > 8 {
+                return Err("listen 最多 8 条".into());
+            }
+            for (i, item) in list.iter().enumerate() {
+                parse_listen_url(item).map_err(|e| format!("listen[{i}]: {e}"))?;
+            }
+            for i in 0..list.len() {
+                for j in (i + 1)..list.len() {
+                    if list[i] == list[j] {
+                        return Err(format!("listen 中存在重复地址 {i}/{j}"));
+                    }
+                }
+            }
+        }
         if let Some(mtu) = self.mtu
             && !(576..=65500).contains(&mtu)
         {
@@ -502,6 +536,8 @@ impl DeviceSettings {
     pub fn is_empty(&self) -> bool {
         self.path_policy.is_none()
             && self.peer_policies.is_none()
+            && self.mode.is_none()
+            && self.listen.is_none()
             && self.mtu.is_none()
             && self.socks_listen.is_none()
             && self.forwards.is_none()
@@ -558,10 +594,14 @@ pub struct NodeConfig {
     pub mtu: u32,
     #[serde(default)]
     pub data_dir: String,
-    #[serde(default = "default_listen_port")]
-    pub listen_udp_port: u16,
-    #[serde(default = "default_listen_port")]
-    pub listen_tcp_port: u16,
+    /// 监听地址列表（URL 形式，可绑定指定网卡/IPv6，每协议可多条）：
+    /// `"udp://0.0.0.0:24933"` / `"tcp://[::]:24933"` / `"udp://192.168.1.5:24934"`。
+    /// 端口 0 = 随机。通配地址绑定失败沿用容错（UDP 回退随机/TCP 跳过），
+    /// 指定 IP 绑定失败为致命错误。服务端托管值（DeviceSettings.listen）
+    /// 可覆盖本列表（重启生效）。旧的 listenUdpPort/listenTcpPort 数字
+    /// 字段已废弃，加载时忽略。
+    #[serde(default = "default_listen")]
+    pub listen: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_file: Option<String>,
     pub identity: Identity,
@@ -592,8 +632,31 @@ fn default_mtu() -> u32 {
     DEFAULT_MTU
 }
 
-fn default_listen_port() -> u16 {
-    crate::consts::DEFAULT_LISTEN_PORT
+fn default_listen() -> Vec<String> {
+    let p = crate::consts::DEFAULT_LISTEN_PORT;
+    vec![format!("udp://0.0.0.0:{p}"), format!("tcp://0.0.0.0:{p}")]
+}
+
+/// 解析监听 URL：`scheme://ip:port`，scheme ∈ {tcp, udp}；支持 IPv6 字面量
+/// （须方括号，如 `udp://[::]:24933`）；端口 0 = 随机。
+pub fn parse_listen_url(s: &str) -> Result<(ListenProto, std::net::SocketAddr), String> {
+    let (scheme, rest) = s.split_once("://").ok_or("监听地址缺少 scheme（应为 tcp://… 或 udp://…）")?;
+    let proto = match scheme {
+        "tcp" => ListenProto::Tcp,
+        "udp" => ListenProto::Udp,
+        other => return Err(format!("监听地址 scheme 无效：{other}（应为 tcp 或 udp）")),
+    };
+    // IPv6 字面量带方括号：[::]:port —— 用 rsplit 解析避免冒号歧义。
+    let addr = rest
+        .parse::<std::net::SocketAddr>()
+        .map_err(|e| format!("监听地址无效（{s}）：{e}"))?;
+    Ok((proto, addr))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenProto {
+    Tcp,
+    Udp,
 }
 
 fn default_mode() -> ClientMode {
@@ -799,6 +862,53 @@ mod tests {
         )
         .unwrap();
         assert!(bad.validate().is_err());
+        // mode/listen 校验。
+        let bad: DeviceSettings = serde_json::from_str(r#"{"mode":"carrierPigeon"}"#).unwrap();
+        assert!(bad.validate().is_err());
+        let bad: DeviceSettings = serde_json::from_str(r#"{"listen":["udp://1.2.3.4:99999"]}"#).unwrap();
+        assert!(bad.validate().is_err());
+        let bad: DeviceSettings =
+            serde_json::from_str(r#"{"listen":["tcp://1.2.3.4:1","tcp://1.2.3.4:1"]}"#).unwrap();
+        assert!(bad.validate().is_err());
+        let ok: DeviceSettings = serde_json::from_str(
+            r#"{"mode":"tun","listen":["udp://[::]:0","tcp://192.168.1.5:24933"]}"#,
+        )
+        .unwrap();
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn listen_url_parse() {
+        use std::net::SocketAddr;
+        assert_eq!(
+            parse_listen_url("udp://0.0.0.0:24933").unwrap(),
+            (ListenProto::Udp, "0.0.0.0:24933".parse::<SocketAddr>().unwrap())
+        );
+        assert_eq!(
+            parse_listen_url("tcp://[::]:24933").unwrap(),
+            (ListenProto::Tcp, "[::]:24933".parse::<SocketAddr>().unwrap())
+        );
+        assert_eq!(
+            parse_listen_url("udp://192.168.1.5:0").unwrap(),
+            (ListenProto::Udp, "192.168.1.5:0".parse::<SocketAddr>().unwrap())
+        );
+        // 非法：缺 scheme / 错 scheme / 坏地址。
+        assert!(parse_listen_url("0.0.0.0:24933").is_err());
+        assert!(parse_listen_url("sctp://0.0.0.0:24933").is_err());
+        assert!(parse_listen_url("udp://[::]:notaport").is_err());
+        // NodeConfig 默认 listen 数组 + 旧数字字段忽略。
+        let cfg: NodeConfig = serde_json::from_str(
+            r#"{"server":"http://x","listenUdpPort":12345,"identity":{"deviceId":1,"name":"n","deviceToken":"t","signPublicKey":"a","signPrivateKey":"b","dhPublicKey":"c","dhPrivateKey":"d"}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.listen.len(), 2);
+        assert!(cfg.listen[0].starts_with("udp://0.0.0.0:"));
+        assert!(cfg.listen[1].starts_with("tcp://0.0.0.0:"));
+        let cfg: NodeConfig = serde_json::from_str(
+            r#"{"server":"http://x","listen":["udp://127.0.0.1:1"],"identity":{"deviceId":1,"name":"n","deviceToken":"t","signPublicKey":"a","signPrivateKey":"b","dhPublicKey":"c","dhPrivateKey":"d"}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.listen, vec!["udp://127.0.0.1:1".to_string()]);
     }
 
     #[test]
@@ -808,7 +918,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.mode, ClientMode::Proxy);
-        assert_eq!(cfg.listen_udp_port, 24933);
+        assert_eq!(cfg.listen.len(), 2);
         assert_eq!(cfg.mtu, 1300);
         assert!(cfg.validate().is_ok());
 

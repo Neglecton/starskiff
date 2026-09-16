@@ -492,14 +492,17 @@ async fn managed_settings_hot_apply_and_pending() {
         .unwrap();
     assert_eq!(&got[..n], b"v2:ping", "热更改后的 expose 立即生效");
 
-    // 3) 重启类字段：socksListen 与启动时生效值不同 → restart_pending
-    //    （行为配置不落文件，重启时按服务端值重建）。整体 PUT 替换后
-    //    exposes 回到未托管——未托管即回默认（无规则），不再有本地回落。
+    // 3) 重启类字段：socksListen 与启动时生效值不同 → 自动重启应用
+    //    （worker 退出码 3；行为配置不落文件，重启时按服务端值重建）。
+    //    in-process 测试断言停止原因为 Restart；整体 PUT 替换后 exposes
+    //    回到未托管（默认无规则）。
     let saved = admin_put(&h, b_id, serde_json::json!({ "socksListen": "127.0.0.1:19999" })).await;
     assert_eq!(saved["revision"], 3);
     h.until(|| eb.shared.restart_pending.load(std::sync::atomic::Ordering::Relaxed)).await;
-    h.until(|| eb.shared.applied_settings_revision.load(std::sync::atomic::Ordering::Relaxed) >= 3)
-        .await;
+    tokio::time::timeout(Duration::from_secs(10), eb.stopped())
+        .await
+        .expect("重启类变更自动触发引擎重启");
+    assert_eq!(eb.exit_code(), 3, "重启类变更 → worker 退出码 3（master 拉起）");
 }
 
 /// 远程重启指令：WS restart_requested → 引擎优雅停止且停止原因为
@@ -595,12 +598,12 @@ async fn path_policy_switches_routes() {
     .await;
     let ea = h
         .start_engine(&sa, |c| {
-            c.listen_tcp_port = a_tcp;
+            c.listen.push(format!("tcp://127.0.0.1:{a_tcp}"));
         })
         .await;
     let eb = h
         .start_engine(&sb, |c| {
-            c.listen_tcp_port = b_tcp;
+            c.listen.push(format!("tcp://127.0.0.1:{b_tcp}"));
         })
         .await;
     let _ec = h.start_engine(&sc, |_| {}).await;
@@ -702,4 +705,56 @@ async fn path_policy_switches_routes() {
             && ea.shared.peer_policies.is_empty()
     })
     .await;
+}
+
+/// 中继路径 PING/PONG 完整往返（回归锁定：中继转发的内层 wire 帧曾被
+/// 误判为直连——PONG 裸发中继地址被服务端丢弃、last_pong 永不更新，
+/// 数据面不受影响所以 flow 类测试测不到，见 AGENTS.md #20）。双节点在
+/// 首个探测 tick（5s）之前均 pin relayUdp（无直连喷射），断言双方
+/// last_pong 经中继往返被记录、direct_endpoint 不被污染（PONG 沿中继
+/// 回程而非被当直连升级信号）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_udp_ping_pong_roundtrip_without_path_poisoning() {
+    let h = TestHarness::create().await;
+    let pa = h.enroll_node("rpong-a", None).await;
+    let pb = h.enroll_node("rpong-b", None).await;
+    let ea = h.start_engine(&pa, |_| {}).await;
+    let eb = h.start_engine(&pb, |_| {}).await;
+
+    // 立即双侧 pin relayUdp：必须赶在首个探测 tick（启动后 5s）之前——
+    // Auto 阶段的直连喷射会学习 direct_endpoint，污染"无毒化"断言。
+    h.set_settings(&pa, serde_json::json!({ "pathPolicy": "relayUdp" })).await;
+    h.set_settings(&pb, serde_json::json!({ "pathPolicy": "relayUdp" })).await;
+    h.until(|| {
+        *ea.shared.path_policy.lock().unwrap() == skiff_core::models::PathPolicy::RelayUdp
+            && *eb.shared.path_policy.lock().unwrap() == skiff_core::models::PathPolicy::RelayUdp
+    })
+    .await;
+
+    // 中继 PING/PONG 往返：probe 经 route_sealed 走中继（RELAY 壳），服务
+    // 端剥壳转发内层 PING；对端按 RelayUdp 到达分类、沿中继回 PONG；
+    // 发起方记录 last_pong/RTT。对称侧同理。probe 周期 5s，留足余量。
+    h.until_with_timeout(
+        || {
+            ea.peers().iter().any(|(_, p)| {
+                p.name() == "rpong-b" && p.last_pong_ms.load(std::sync::atomic::Ordering::Relaxed) > 0
+            }) && eb.peers().iter().any(|(_, p)| {
+                p.name() == "rpong-a" && p.last_pong_ms.load(std::sync::atomic::Ordering::Relaxed) > 0
+            })
+        },
+        Duration::from_secs(30),
+    )
+    .await;
+
+    // 无路径毒化：pin 期间从未直连探测，PONG 全部经中继回程——若
+    // direct_endpoint 被写入，说明中继帧又被误判为直连到达。
+    for (side, e) in [("a", &ea), ("b", &eb)] {
+        for (_, p) in e.peers() {
+            assert!(
+                p.direct_endpoint.lock().unwrap().is_none(),
+                "side={side} peer={} direct_endpoint 被污染（中继帧误判直连）",
+                p.name()
+            );
+        }
+    }
 }

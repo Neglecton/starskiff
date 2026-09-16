@@ -771,6 +771,131 @@ async fn settings_adopt_fills_only_unmanaged_fields() {
 }
 
 #[tokio::test]
+async fn settings_fail_report_rolls_back_to_last_good() {
+    let srv = spawn_server().await;
+    create_network(&srv, "net", "10.57.0.0/24").await;
+    let token = create_token(&srv, "net").await;
+    let a = enroll(&srv, &token, "a", None).await.unwrap();
+    let put = |body: serde_json::Value| {
+        srv.client
+            .put(format!("{}/admin/devices/{}/settings", srv.base_url, a.device_id))
+            .header("X-Admin-Token", &srv.admin_token)
+            .json(&body)
+            .send()
+    };
+
+    // 第 1 版（pathPolicy）被节点确认（心跳 appliedRevision 追平 → mark_applied
+    // 固化为 last_good）。
+    let v: serde_json::Value = put(serde_json::json!({ "pathPolicy": "relayUdp" }))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rev1 = v["revision"].as_i64().unwrap();
+    let resp = srv
+        .client
+        .post(format!("{}/api/heartbeat", srv.base_url))
+        .bearer_auth(&a.device_token)
+        .json(&serde_json::json!({ "settingsRevision": rev1 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // 第 2 版（坏 listen）→ worker 启动失败上报 → 自动回滚到第 1 版内容。
+    let v: serde_json::Value = put(serde_json::json!({ "listen": ["udp://203.0.113.1:1"] }))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rev2 = v["revision"].as_i64().unwrap();
+    let resp = srv
+        .client
+        .post(format!("{}/api/settings/fail", srv.base_url))
+        .bearer_auth(&a.device_token)
+        .json(&serde_json::json!({ "revision": rev2, "error": "UDP 监听绑定失败 203.0.113.1:1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    let rev3 = v["rolledBackTo"].as_i64().unwrap();
+    assert!(rev3 > rev2, "回滚递增 revision");
+
+    // 回读：pathPolicy 恢复（last_good 内容），listen 消失；错误状态在设备列表。
+    let v: serde_json::Value = srv
+        .client
+        .get(format!("{}/api/settings", srv.base_url))
+        .bearer_auth(&a.device_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["revision"], rev3);
+    assert_eq!(v["pathPolicy"], "relayUdp");
+    assert!(v.get("listen").is_none());
+    let devs: serde_json::Value = srv
+        .client
+        .get(format!("{}/admin/devices", srv.base_url))
+        .header("X-Admin-Token", &srv.admin_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let me = devs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"].as_str() == Some(&a.device_id.to_string()))
+        .unwrap();
+    assert!(me["settingsError"].as_str().unwrap_or("").contains("绑定失败"));
+    assert_eq!(me["settingsErrorRevision"], rev2);
+
+    // 过期/重复上报被忽略（revision 已前进）。
+    let resp = srv
+        .client
+        .post(format!("{}/api/settings/fail", srv.base_url))
+        .bearer_auth(&a.device_token)
+        .json(&serde_json::json!({ "revision": rev2, "error": "stale" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert!(v["rolledBackTo"].is_null());
+
+    // TUN 预检：多网络成员 + mode=tun → 409。
+    create_network(&srv, "net2", "10.58.0.0/24").await;
+    let resp = srv
+        .client
+        .post(format!("{}/admin/devices/{}/networks", srv.base_url, a.device_id))
+        .header("X-Admin-Token", &srv.admin_token)
+        .json(&serde_json::json!({ "network": "net2" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = put(serde_json::json!({ "mode": "tun" })).await.unwrap();
+    assert_eq!(resp.status(), 409, "TUN 多网络预检拒绝");
+
+    // 无设备令牌 → 401。
+    let resp = srv
+        .client
+        .post(format!("{}/api/settings/fail", srv.base_url))
+        .json(&serde_json::json!({ "revision": 1, "error": "x" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
 async fn admin_console_assets_served_with_cache_headers() {
     let srv = spawn_server().await;
     // Shell document: 200 + html + no-cache (placeholder or built bundle).

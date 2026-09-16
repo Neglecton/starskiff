@@ -55,7 +55,9 @@ pub struct PeerSession {
     pub codec: Mutex<PacketCodec>,
     pub tcp_conn: Mutex<Option<Arc<crate::transport::peer_tcp::PeerTcpConnection>>>,
     pub current_path: Mutex<PathKind>,
-    pub direct_endpoint: Mutex<Option<SocketAddr>>,
+    /// (对端地址, 学习到它时的本地绑定地址)——直连数据经同一 socket
+    /// 发送保持 NAT 映射一致（多地址监听）。
+    pub direct_endpoint: Mutex<Option<(SocketAddr, SocketAddr)>>,
     pub last_pong_ms: AtomicI64,
     pub tcp_cooldown_until_ms: AtomicI64,
     pub rtt_ms: AtomicI64,

@@ -14,6 +14,24 @@ pub enum DbError {
     Io(#[from] std::io::Error),
 }
 
+fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has = |col: &str| -> Result<bool, rusqlite::Error> {
+        let mut stmt = conn.prepare("PRAGMA table_info(device_settings)")?;
+        let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        Ok(cols.filter_map(Result::ok).any(|c| c == col))
+    };
+    for (col, ddl) in [
+        ("last_good_json", "ALTER TABLE device_settings ADD COLUMN last_good_json TEXT"),
+        ("last_error", "ALTER TABLE device_settings ADD COLUMN last_error TEXT"),
+        ("failed_revision", "ALTER TABLE device_settings ADD COLUMN failed_revision INTEGER"),
+    ] {
+        if !has(col)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Db {
     conn: std::sync::Arc<Mutex<Connection>>,
@@ -54,7 +72,10 @@ CREATE TABLE IF NOT EXISTS device_settings(
     device_id INTEGER PRIMARY KEY,
     revision INTEGER NOT NULL DEFAULT 0,
     json TEXT NOT NULL,
-    updated_at INTEGER NOT NULL);
+    updated_at INTEGER NOT NULL,
+    last_good_json TEXT,
+    last_error TEXT,
+    failed_revision INTEGER);
 CREATE INDEX IF NOT EXISTS idx_devices_token ON devices(token_hash);
 CREATE INDEX IF NOT EXISTS idx_memberships_device ON memberships(device_id);
 ";
@@ -66,6 +87,9 @@ impl Db {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        // 旧库迁移：device_settings 缺列则补（CREATE IF NOT EXISTS 不加列）。
+        migrate(&conn)?;
+
         conn.pragma_update(None, "journal_mode", "WAL")?;
         Ok(Db {
             conn: std::sync::Arc::new(Mutex::new(conn)),
