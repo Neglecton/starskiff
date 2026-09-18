@@ -262,3 +262,23 @@ fn windows_rss_kib() -> u64 {
         }
     }
 }
+
+/// 数据面 UDP socket 内核缓冲（字节）。32KiB 级密封帧的突发在默认
+/// ~64KB 接收缓冲下会被内核静默丢弃且无任何计数——曾表现为 bulk 传输
+/// 无痕停摆（发送方 send_to 成功、接收方永远等不到）。
+pub const UDP_DATA_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+/// 创建带大数据面内核缓冲的非阻塞 UDP socket（绑定 `bind`）。缓冲设置
+/// 失败时沿用系统默认（尽力而为）。返回 std socket，由调用方转 tokio
+///（core 无 tokio 依赖）。
+pub fn udp_socket_buffered(bind: std::net::SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if bind.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    // 先扩缓冲再绑定：绑定后瞬间到达的突发也受保护。
+    let _ = sock.set_recv_buffer_size(UDP_DATA_BUFFER_BYTES);
+    let _ = sock.set_send_buffer_size(UDP_DATA_BUFFER_BYTES);
+    sock.set_nonblocking(true)?;
+    sock.bind(&bind.into())?;
+    Ok(sock.into())
+}

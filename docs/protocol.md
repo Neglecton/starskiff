@@ -111,7 +111,7 @@ ERROR(4):    [msgLen u8][msg utf-8]（截断 200B）
 | DATAGRAM(6) | `[addrLen u8]["ip:port"][数据报]` | UDP 数据报，addr 为目标虚拟 IP:端口；回程地址填本端虚拟 IP:服务端口 |
 
 - 接收方按 `dst.Port` 查找 `exposes` 规则投递到本地服务，回程沿同一 flowId
-- TCP 流承载于 TCP 传输（直连或中继），UDP 数据报承载于 UDP 传输
+- **FLOW 帧的传输路径与 flow 类型无关**：两类 flow 的帧都按发送方当前路径策略/CurrentPath 选路（直连 UDP / 直连 TCP / UDP 中继 / TCP 中继）。UDP 路径上**无应用层确认、重传与重组**——丢包即静默损坏流、分块（≤32KiB，`FLOW_CHUNK`）依赖 IP 分片；对完整性敏感的 bulk 场景应 pin `directTcp`/`relayTcp`（TCP 路径帧序由单写者队列保证）。数据面 UDP socket 已扩内核缓冲（4MB）缓解突发下的内核静默丢弃
 - UDP flow 的空闲超时（5 分钟）由端口转发层负责 GC
 
 ## 控制面 API 摘要

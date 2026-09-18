@@ -58,7 +58,7 @@ tests/it              Harness（进程内 server+节点）+ mesh.rs 六场景
 14. **rustls 全链路 ring provider**（main/start 里 install_default）——别引入 aws-lc（musl/cmake 构建坑）。
 15. **探测 PING 可能误入同机其它 UDP 端口**（邻近端口预测副作用，sealed 帧被 forwarder 转发是预期噪声）——测试断言注意。
 16. Git Bash 下 docker 的容器内路径加 `export MSYS_NO_PATHCONV=1`。
-17. **默认端口 24930-24933**（API/RelayUdp/RelayTcp/节点监听）；防火墙规则名 `Starskiff {name} UDP/TCP`，remove 按名删除——改名要两处同步。
+17. **默认端口 24930-24933**（API/RelayUdp/RelayTcp/节点监听）；防火墙规则名 `Starskiff {name} UDP/TCP`（service install/remove），remove 按名删除——改名要两处同步。另有**运行时规则** `Starskiff Node UDP/TCP`（仅 Windows）：worker 每次启动按当期实际生效端口 delete-then-add 重建（listen 托管变更重启后自动跟进），挂钩在 main.rs `__worker` 而非 NodeEngine::start（防测试 harness 在管理员 shell 下误改开发机防火墙），service remove 一并清理；非管理员跳过仅记日志。
 18. **设备托管配置（DeviceSettings）走 revision 收敛 + 应答回滚闭环**：服务端权威递增 revision，节点只在 `settings_changed` 推送与每次 WS `connected` 时自拉并按 `revision` 幂等应用（多网络节点多连接重复投递必须安全）；PUT 是全量替换，字段缺省=未托管走默认值（socks 默认开启 127.0.0.1:1080）；节点侧 `PUT /api/settings`（adopt）仅填未托管字段（遗留值收编，幂等无新值不递增 revision）；Secret/身份永不进该通道（**mode/listen 已纳入托管**，重启类）；**重启类字段（mode/listen/mtu/socks/forwards）不落文件**——以 EngineShared.runtime_* 为生效基准做比对，**变更即自动 request_stop(Restart)**，应答由新 worker 启动成功给出（apply_settings 在重启类变更时**不得**写 applied_revision/心跳——旧 worker 代答会让服务端把未验证配置固化为 last_good，失败回滚将回到坏配置自身形成循环；TUN 无权限/端口占用等启动失败经 worker 的 fail 上报触发服务端回滚到 last_good）。**路径策略（PathPolicy：auto/relayUdp/relayTcp/directAny/directUdp/directTcp，全局+按对端覆盖）热生效且只控本端出口**：中继回退与超时降级仅 auto；探测/升级以"资源是否就绪"判断而非 path（pin 下 apply 已把 path 置为 pin 值，以 path 判断会死锁）；**relayTcp 送达要求接收方持有 TCP 中继连接**（单向 pin 黑洞，管理页提供成对设置）；RelayTcpClient 收到 REGISTER ACK 必须继续读（曾 `_ => return` 僵尸——发送正常接收全失）。
 19. **WS 握手请求必须经 `into_client_request()` 从 URL 生成**（control.rs run_ws_once）：手工 `Request::builder().uri()` 构造的请求缺 sec-websocket-key 等握手头，握手必被拒——曾因此引擎事件订阅整体静默失效，全靠 5s probe 轮询兜底。
 20. **判别/分流逻辑的判据是不可见不变量，重构必须有分支级测试锁定**：UDP 到达分类的依据是**来源地址**（from == relay_addr）而非包格式——中继转发的是剥壳后的内层 wire 帧（0x0A），节点侧 parse 中继协议必然失败；多 socket 重构把 handle 拆成自由函数时丢失了 self 上的 relay_addr，改按"包能否 parse 成中继协议"判别后，中继流量全部误判为直连（PONG 裸发中继地址被丢、RTT 永测不到、违反 #8）。数据面帧（DATA/FLOW）不读 arrival 分类——**"数据通了"证明不了分类正确**，只有沿原路回程的协议（PING/PONG）才暴露误判；测试须直接断言 last_pong/rtt/PATH_UP 这类路径健康信号（见 mesh.rs 中继往返场景），联调验证清单加"观察 RTT/PATH_UP 指标"。ACK 只信任中继来源（否则任意 0x0B ACK 可伪造 ObservedEndpoint 污染探测目标）。
@@ -99,3 +99,5 @@ tests/it              Harness（进程内 server+节点）+ mesh.rs 六场景
 - 前向保密：静态-静态 X25519（HKDF-SHA256），已知限制；Noise IK/密钥轮换是单独大改动。
 - TUN 仅 IPv4（非 IPv4 包直接丢弃是故意的）。
 - 客户端单网络。
+- **FLOW 无应用层确认/重传/重组**：TCP flow 走 UDP 路径（中继或直连 UDP）时丢包即静默损坏流；分块 ≤32KiB（FLOW_CHUNK）依赖 IP 分片，数据面 UDP socket 已扩 4MB 内核缓冲缓解突发丢弃。完整性敏感的 bulk 场景应 pin directTcp/relayTcp。协议级重传/拥塞控制是单独大改动。
+- **无协议版本协商/能力位**：wire/中继版本不匹配静默丢弃（未上线、双端同仓同步升级，无降级需求）。上线对外发版前需重新评估（enroll/heartbeat 加 protoVersion + 诊断）。

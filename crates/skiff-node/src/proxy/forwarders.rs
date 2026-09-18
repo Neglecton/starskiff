@@ -14,7 +14,7 @@ use tokio::net::{TcpListener, UdpSocket};
 
 use crate::engine::EngineShared;
 
-const PUMP_BUF: usize = 32 * 1024;
+const PUMP_BUF: usize = skiff_core::consts::FLOW_CHUNK;
 const UDP_IDLE_MS: i64 = 5 * 60 * 1000;
 const UDP_SWEEP: Duration = Duration::from_secs(30);
 
@@ -26,9 +26,9 @@ pub async fn spawn_all(
     for rule in rules {
         let listen: SocketAddr = rule.listen.parse()?;
         let dest: SocketAddr = rule.dest.parse()?;
-        let port = match rule.proto.as_str() {
-            "udp" => spawn_udp(rule, listen, dest, Arc::clone(&shared)).await?,
-            _ => spawn_tcp(listen, dest, Arc::clone(&shared)).await?,
+        let port = match rule.proto {
+            skiff_core::models::ProtoKind::Udp => spawn_udp(rule, listen, dest, Arc::clone(&shared)).await?,
+            skiff_core::models::ProtoKind::Tcp => spawn_tcp(listen, dest, Arc::clone(&shared)).await?,
         };
         ports.push(port);
     }

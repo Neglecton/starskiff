@@ -65,6 +65,15 @@ pub enum EngineEvent {
     TunPacket(Vec<u8>),
 }
 
+/// RelayTcp 出站队列项（见 EngineShared.relay_tcp_tx 注释）。
+pub struct RelayTcpOut {
+    pub peer: Arc<PeerSession>,
+    pub frame: Vec<u8>,
+    /// Auto（残留态）失败回落 UDP 中继；pin 档失败即丢帧计数。
+    pub fallback: bool,
+    pub policy: PathPolicy,
+}
+
 /// Sink for decrypted inbound DATA frames (TUN mode); no-op in proxy mode.
 pub type DataSink = Box<dyn Fn(&[u8]) + Send + Sync>;
 
@@ -101,6 +110,11 @@ pub struct EngineShared {
     pub control: Arc<ControlClient>,
     pub udp: Arc<UdpMesh>,
     pub relay_tcp: Arc<RelayTcpClient>,
+    /// RelayTcp 出站 FIFO（单消费者任务顺序发送——每帧 tokio::spawn 在
+    /// multi_thread 下不保序，会引入 TCP 本身不会有的帧乱序，FLOW
+    /// DATA/CLOSE 乱序将静默截断流；且 ensure_connected 内联 10s 连接
+    /// 超时，不能在中央事件循环直接 await）。
+    pub relay_tcp_tx: mpsc::UnboundedSender<RelayTcpOut>,
     /// (network, device) -> session. Session keys are per-network.
     pub peers: DashMap<(NetId, u64), Arc<PeerSession>>,
     pub flows: Arc<FlowManager>,
@@ -134,6 +148,8 @@ pub struct EngineShared {
     pub runtime_listen: Mutex<Vec<String>>,
     /// primary TCP 监听端口（心跳上报实际值；0=无监听）。
     pub tcp_listen_port: AtomicU16,
+    /// 全部成功绑定的 TCP 监听端口（运行时防火墙规则同步用）。
+    pub tcp_listen_ports: Mutex<Vec<u16>>,
     /// 停止原因（首次触发时锁定）；worker 宿主据此映射退出码。
     pub stop_reason: Mutex<Option<StopReason>>,
     /// 服务端权威的网络名单（启动与 networks_changed 时刷新；prune 与
@@ -206,7 +222,9 @@ impl EngineShared {
                     } else if peer.direct_endpoint.lock().unwrap().is_some() {
                         PathKind::DirectUdp
                     } else {
-                        return; // No direct resource: drop rather than leak via relay.
+                        // No direct resource: drop rather than leak via relay.
+                        self.note_policy_drop(peer, "directAny-no-resource");
+                        return;
                     }
                 }
             },
@@ -227,7 +245,7 @@ impl EngineShared {
                     match ep {
                         Some(ep) => self.udp.send_direct(ep, frame),
                         None if relay_fallback => self.udp.send_relay(self_id, peer.id, frame),
-                        None => {}
+                        None => self.note_policy_drop(peer, "directUdp-no-endpoint"),
                     }
                     peer.add_tx(frame.len());
                 }
@@ -236,28 +254,29 @@ impl EngineShared {
                 let conn = peer.tcp_conn.lock().unwrap().clone();
                 match conn {
                     Some(conn) if !conn.is_closed() => {
-                        conn.send(frame);
-                        peer.add_tx(frame.len());
+                        if conn.send(frame) {
+                            peer.add_tx(frame.len());
+                        } else {
+                            // 发送失败计入丢帧（曾静默——连接写端已死等探测重建）。
+                            self.note_policy_drop(peer, "directTcp-send-failed");
+                        }
                     }
                     _ if relay_fallback => {
                         self.udp.send_relay(self_id, peer.id, frame);
                         peer.add_tx(frame.len());
                     }
-                    _ => {} // pin：无连接丢帧，TCP 探测会重建
+                    _ => self.note_policy_drop(peer, "directTcp-no-conn"),
                 }
             }
             PathKind::RelayTcp => {
-                let relay = Arc::clone(&self.relay_tcp);
-                let udp = Arc::clone(&self.udp);
-                let events = self.events.clone();
-                let dst = peer.id;
-                let payload = frame.to_vec();
+                // 经单消费者 FIFO 发送（保序；ensure_connected 的 10s 连接
+                // 超时在队列任务里消化，不阻塞事件循环）。
                 peer.add_tx(frame.len());
-                tokio::spawn(async move {
-                    // Auto（残留态）失败回落 UDP 中继；pin 档失败即丢帧。
-                    if !relay.send(dst, &payload, &events).await && relay_fallback {
-                        udp.send_relay(self_id, dst, &payload);
-                    }
+                let _ = self.relay_tcp_tx.send(RelayTcpOut {
+                    peer: Arc::clone(peer),
+                    frame: frame.to_vec(),
+                    fallback: relay_fallback,
+                    policy,
                 });
             }
             PathKind::RelayUdp => {
@@ -266,6 +285,26 @@ impl EngineShared {
             }
         }
         let _ = net_id;
+    }
+
+    /// 每 peer 60s 一条的节流诊断日志（TX_DROP / 探测跳过共用锚点）——
+    /// 策略档资源缺失是"静默丢帧"型故障，不落日志则无从诊断。
+    fn throttled_diag(&self, peer: &Arc<PeerSession>, msg: &str) {
+        let now = unix_ms();
+        let last = peer.last_diag_log_ms.load(Ordering::Relaxed);
+        if now - last > 60_000
+            && peer
+                .last_diag_log_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            (self.log)(&format!("peer={} {msg}", peer.name()));
+        }
+    }
+
+    /// 策略档丢帧（pin 无中继回退）：计数 + 节流日志。
+    fn note_policy_drop(&self, peer: &Arc<PeerSession>, reason: &str) {
+        note_drop_detached(&self.log.clone(), peer, self.policy_for(peer.id), reason);
     }
 
     /// Reply on the arrival path — the PONG invariant that makes direct
@@ -397,12 +436,9 @@ impl EngineShared {
             }
             FRAME_DATA => (self.data_sink)(&payload),
             FRAME_FLOW => {
-                let flows = Arc::clone(&self.flows);
-                let peer_id = peer.id;
-                let payload = payload.clone();
-                tokio::spawn(async move {
-                    flows.on_frame(net_id, peer_id, &payload).await;
-                });
+                // 经 FlowManager 串行队列保序处理（曾每帧 spawn，处理顺序
+                // 不保——DATA/CLOSE 乱序会静默截断流）。
+                self.flows.enqueue(net_id, peer.id, &payload);
             }
             _ => {}
         }
@@ -446,24 +482,10 @@ pub fn effective_listen_addrs(settings: &DeviceSettings, cfg: &NodeConfig) -> an
     Ok(EffectiveListen { udp, tcp, raw })
 }
 
-/// 托管 mode 字符串 → ClientMode（合法值穷举；未知值 None——服务端
-/// validate 已拒绝非法取值，此处防御）。启动与运行时 diff 两路径共用，
-/// 禁止各自内联解析（曾因两处语义相反引入"托管 proxy 不生效"缺陷）。
-fn managed_mode(v: &str) -> Option<ClientMode> {
-    match v {
-        "tun" => Some(ClientMode::Tun),
-        "proxy" => Some(ClientMode::Proxy),
-        _ => None,
-    }
-}
-
-/// 生效运行模式：托管 mode 覆盖文件默认（"tun"/"proxy" 均为显式托管值）。
+/// 生效运行模式：托管 mode 覆盖文件默认（枚举化后由 serde+编译器保证
+/// 合法值穷举，无需手动解析——字符串时期曾两路径语义相反，AGENTS #21）。
 pub fn effective_mode_of(settings: &DeviceSettings, cfg: &NodeConfig) -> ClientMode {
-    settings
-        .mode
-        .as_deref()
-        .and_then(managed_mode)
-        .unwrap_or(cfg.mode)
+    settings.mode.unwrap_or(cfg.mode)
 }
 
 impl NodeEngine {
@@ -512,7 +534,7 @@ impl NodeEngine {
             (log)("警告：控制面使用明文 http://（服务器 --no-tls 模式？）");
         }
         let effective_listen = effective_listen_addrs(&settings, &cfg)?;
-        let udp = UdpMesh::bind(&effective_listen.udp, events_tx.clone()).await?;
+        let udp = UdpMesh::bind(&effective_listen.udp, events_tx.clone(), Arc::clone(&log)).await?;
         if udp
             .used_fallback_port
             .load(Ordering::Relaxed)
@@ -526,6 +548,7 @@ impl NodeEngine {
         let (flow_out_tx, mut flow_out_rx) = mpsc::unbounded_channel::<(NetId, u64, Vec<u8>)>();
         let networks: NetworksMap = Arc::new(DashMap::new());
         let flows = FlowManager::new(flow_out_tx, Arc::clone(&networks), log.clone());
+        let (relay_tcp_tx, mut relay_tcp_rx) = mpsc::unbounded_channel::<RelayTcpOut>();
 
         let shared = Arc::new(EngineShared {
             cfg: Mutex::new(cfg.clone()),
@@ -538,6 +561,7 @@ impl NodeEngine {
             control: Arc::clone(&control),
             udp: Arc::clone(&udp),
             relay_tcp: Arc::clone(&relay_tcp),
+            relay_tcp_tx,
             peers: DashMap::new(),
             flows: Arc::clone(&flows),
             data_sink,
@@ -560,6 +584,7 @@ impl NodeEngine {
             runtime_mode: Mutex::new(effective_mode),
             runtime_listen: Mutex::new(effective_listen.raw.clone()),
             tcp_listen_port: AtomicU16::new(0),
+            tcp_listen_ports: Mutex::new(Vec::new()),
             stop_reason: Mutex::new(None),
             roster: Mutex::new(std::collections::HashSet::new()),
             stopped_tx: stopped_tx.clone(),
@@ -592,12 +617,15 @@ impl NodeEngine {
         // 直连 TCP 监听（多地址）：通配绑定失败跳过（容错）；指定 IP
         // 绑定失败为致命错误（显式意图，走配置回滚）。
         let mut tcp_listeners = Vec::new();
+        let mut tcp_ports = Vec::new();
         for addr in &effective_listen.tcp {
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(l) => {
+                    let port = l.local_addr()?.port();
                     if tcp_listeners.is_empty() {
-                        shared.tcp_listen_port.store(l.local_addr()?.port(), Ordering::Relaxed);
+                        shared.tcp_listen_port.store(port, Ordering::Relaxed);
                     }
+                    tcp_ports.push(port);
                     tcp_listeners.push(l);
                 }
                 Err(e) if addr.ip().is_unspecified() => {
@@ -608,6 +636,7 @@ impl NodeEngine {
                 }
             }
         }
+        *shared.tcp_listen_ports.lock().unwrap() = tcp_ports;
 
         refresh_peers(&shared).await;
 
@@ -658,6 +687,34 @@ impl NodeEngine {
                             // Attachment happens when a frame identifies (network, peer).
                         }
                         Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                    }
+                }
+            }));
+        }
+
+        // RelayTcp 出站 FIFO 消费者：严格按入队顺序发送（保序），失败按
+        // 策略回落/计数——连接建立（最长 10s）只阻塞本队列，不阻塞事件
+        // 循环（期间帧在队列中缓冲而非丢失）。
+        {
+            let shared2 = Arc::clone(&shared);
+            tasks.push(tokio::spawn(async move {
+                while let Some(out) = relay_tcp_rx.recv().await {
+                    let ok = shared2
+                        .relay_tcp
+                        .send(out.peer.id, &out.frame, &shared2.events)
+                        .await;
+                    if !ok {
+                        if out.fallback {
+                            let self_id = shared2.device_id.load(Ordering::Relaxed);
+                            shared2.udp.send_relay(self_id, out.peer.id, &out.frame);
+                        } else {
+                            note_drop_detached(
+                                &shared2.log.clone(),
+                                &out.peer,
+                                out.policy,
+                                "relayTcp-send-failed",
+                            );
+                        }
                     }
                 }
             }));
@@ -1109,6 +1166,15 @@ async fn bootstrap_settings(
         && let Some(merged) = control.adopt_settings(&candidate).await
     {
         (log)("遗留本地配置已收编为服务端托管");
+        // 收编成功即重写瘦配置：NodeConfig 序列化不含遗留键，遗留值
+        // 已上移服务端托管——不重写则遗留键永留文件、每次启动重复
+        // 收编（幂等但违背瘦配置契约，legacy_seed 注释承诺的"文件被
+        // 重写后遗留键消失"此前从未实现）。
+        if let Ok(cfg) = crate::node_config::load(config_path)
+            && let Err(e) = crate::node_config::save(config_path, &cfg)
+        {
+            (log)(&format!("配置瘦化重写失败（不影响运行，下次启动重试）：{e}"));
+        }
         return merged;
     }
     // 收编失败（罕见）：继续走拉取，下次启动再收编。
@@ -1250,7 +1316,7 @@ fn apply_runtime_settings(shared: &Arc<EngineShared>, settings: &DeviceSettings,
         }
         // mode / listen：与生效基准不同即需重启应用（TUN 权限、端口占用等
         // 失败由 worker 启动失败上报 → 服务端回滚闭环处理）。
-        if let Some(desired) = settings.mode.as_deref().and_then(managed_mode)
+        if let Some(desired) = settings.mode
             && *shared.runtime_mode.lock().unwrap() != desired
         {
             pending = true;
@@ -1442,7 +1508,7 @@ async fn heartbeat_tick(shared: &Arc<EngineShared>) {
             })
         })
         .collect();
-    let mode_str = shared.runtime_mode.lock().unwrap().as_str().to_string();
+    let mode_val = *shared.runtime_mode.lock().unwrap();
     let tcp_port = shared.tcp_listen_port.load(Ordering::Relaxed);
     let req = HeartbeatRequest {
         local_addrs: crate::local_ipv4_addrs(),
@@ -1451,7 +1517,7 @@ async fn heartbeat_tick(shared: &Arc<EngineShared>) {
         paths: Some(paths),
         settings_revision: Some(shared.applied_settings_revision.load(Ordering::Relaxed) as i64),
         restart_pending: Some(shared.restart_pending.load(Ordering::Relaxed)),
-        mode: Some(mode_str),
+        mode: Some(mode_val),
     };
     match shared.control.heartbeat(&req).await {
         Some(resp) => {
@@ -1559,18 +1625,53 @@ async fn probe_peer(shared: &Arc<EngineShared>, net_id: NetId, peer: Arc<PeerSes
     }
 }
 
+/// 策略档丢帧计数 + 每 peer 60s 节流日志（脱离 &EngineShared 的任务上下
+/// 文用：只持 Arc 字段克隆，如 RelayTcp 发送任务）。
+fn note_drop_detached(log: &LogFn, peer: &Arc<PeerSession>, policy: PathPolicy, reason: &str) {
+    let total = peer.tx_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = unix_ms();
+    let last = peer.last_diag_log_ms.load(Ordering::Relaxed);
+    if now - last > 60_000
+        && peer
+            .last_diag_log_ms
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        log(&format!(
+            "peer={} TX_DROP policy={policy:?} reason={reason} total={total}（pin 档无中继回退，等待探测重建直连资源）",
+            peer.name()
+        ));
+    }
+}
+
 async fn try_direct_tcp_probe(shared: &Arc<EngineShared>, peer: &Arc<PeerSession>, endpoints: &[SocketAddr]) {
-    let Some(tcp_port) = *peer.tcp_listen_port.lock().unwrap() else { return };
+    // 对端心跳公布的 TCP 监听端口；未公布 = 对端无 TCP 监听（端口被占
+    // 禁用 / 托管 listen 无 tcp:// 条目），directTcp 无法建立——必须留痕。
+    let Some(tcp_port) = *peer.tcp_listen_port.lock().unwrap() else {
+        shared.throttled_diag(peer, "TCP_PROBE_SKIP reason=peer-no-tcp-port（对端未公布 TCP 监听）");
+        return;
+    };
     if peer.tcp_conn.lock().unwrap().is_some() {
         return;
     }
-    let Some(first) = endpoints.first() else { return };
+    // 多端点逐个尝试（对端公布的 UDP 端点 IP + 其 TCP 监听端口）：观测
+    // 端点[0] 在 NAT 后是公网映射，同局域网/服务器异网时几乎必败；LAN
+    // 地址排在 [1..]。此前只连 endpoints[0]，直连 TCP 在这些场景永远
+    // 建不起来且无任何日志——正是"pin directTcp 后 ping 全超时"的根因。
+    let targets: Vec<SocketAddr> = endpoints
+        .iter()
+        .take(4)
+        .map(|e| SocketAddr::new(e.ip(), tcp_port))
+        .collect();
+    if targets.is_empty() {
+        shared.throttled_diag(peer, "TCP_PROBE_SKIP reason=no-endpoints");
+        return;
+    }
     let now = unix_ms();
     if now < peer.tcp_cooldown_until_ms.load(Ordering::Relaxed) {
         return;
     }
     peer.tcp_cooldown_until_ms.store(now + 60_000, Ordering::Relaxed);
-    let target = SocketAddr::new(first.ip(), tcp_port);
     let shared = Arc::clone(shared);
     let peer = Arc::clone(peer);
     // The connection's frames feed the central loop; the network binding
@@ -1587,19 +1688,22 @@ async fn try_direct_tcp_probe(shared: &Arc<EngineShared>, peer: &Arc<PeerSession
         });
     }
     tokio::spawn(async move {
-        // Silent on connect failure: the cooldown throttles retries.
-        if let Ok(conn) = PeerTcpConnection::connect(target, Duration::from_secs(3), tx).await {
-            let nets: Vec<NetId> = shared.peers.iter().filter(|e| e.key().1 == peer.id).map(|e| e.key().0).collect();
-            if let Some(net_id) = nets.first() {
-                shared.attach_peer_tcp(net_id, &peer, Arc::clone(&conn));
+        for target in targets {
+            // Silent on connect failure: the cooldown throttles retries.
+            if let Ok(conn) = PeerTcpConnection::connect(target, Duration::from_secs(3), tx.clone()).await {
+                let nets: Vec<NetId> = shared.peers.iter().filter(|e| e.key().1 == peer.id).map(|e| e.key().0).collect();
+                if let Some(net_id) = nets.first() {
+                    shared.attach_peer_tcp(net_id, &peer, Arc::clone(&conn));
+                }
+                let self_id = shared.device_id.load(Ordering::Relaxed);
+                let ping = {
+                    let mut codec = peer.codec.lock().unwrap();
+                    codec.seal(self_id, FRAME_PING, &unix_ms().to_le_bytes())
+                };
+                conn.send(&ping);
+                peer.add_tx(ping.len());
+                return;
             }
-            let self_id = shared.device_id.load(Ordering::Relaxed);
-            let ping = {
-                let mut codec = peer.codec.lock().unwrap();
-                codec.seal(self_id, FRAME_PING, &unix_ms().to_le_bytes())
-            };
-            conn.send(&ping);
-            peer.add_tx(ping.len());
         }
     });
 }
@@ -1676,7 +1780,7 @@ fn write_status(shared: &Arc<EngineShared>, path: &std::path::Path) {
         .lock()
         .unwrap()
         .iter()
-        .map(|f| format!("{} {}->{}", f.proto, f.listen, f.dest))
+        .map(|f| format!("{} {}->{}", f.proto.as_str(), f.listen, f.dest))
         .collect::<Vec<_>>();
     let socks_port = shared.socks_port.load(Ordering::Relaxed);
     let report = StatusReport {
@@ -1754,9 +1858,9 @@ mod tests {
         }
     }
 
-    fn settings_with_mode(mode: Option<&str>) -> DeviceSettings {
+    fn settings_with_mode(mode: Option<ClientMode>) -> DeviceSettings {
         DeviceSettings {
-            mode: mode.map(str::to_string),
+            mode,
             ..DeviceSettings::default()
         }
     }
@@ -1766,7 +1870,7 @@ mod tests {
     #[test]
     fn managed_proxy_overrides_file_tun() {
         assert_eq!(
-            effective_mode_of(&settings_with_mode(Some("proxy")), &test_cfg(ClientMode::Tun)),
+            effective_mode_of(&settings_with_mode(Some(ClientMode::Proxy)), &test_cfg(ClientMode::Tun)),
             ClientMode::Proxy
         );
     }
@@ -1774,7 +1878,7 @@ mod tests {
     #[test]
     fn managed_tun_overrides_file_proxy() {
         assert_eq!(
-            effective_mode_of(&settings_with_mode(Some("tun")), &test_cfg(ClientMode::Proxy)),
+            effective_mode_of(&settings_with_mode(Some(ClientMode::Tun)), &test_cfg(ClientMode::Proxy)),
             ClientMode::Tun
         );
     }

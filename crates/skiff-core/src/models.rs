@@ -143,10 +143,11 @@ pub struct HeartbeatRequest {
     /// 有重启类托管配置（socks/forwards/mtu）已写入文件但尚未重启生效。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_pending: Option<bool>,
-    /// 节点运行模式（"tun"/"proxy"）——服务端据此预防性拒绝会让 TUN
-    /// 节点超过单网络限制的强制 join。
+    /// 节点运行模式——服务端据此预防性拒绝会让 TUN 节点超过单网络限制
+    /// 的强制 join。枚举（serde "tun"/"proxy"，线格式与旧字符串同形）：
+    /// 非法值在反序列化即拒绝，杜绝字符串 match 吞合法值（AGENTS #21）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<String>,
+    pub mode: Option<ClientMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,10 +419,11 @@ pub struct DeviceSettings {
     /// 按对端覆盖列表（None=未托管；空列表=明确无覆盖）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_policies: Option<Vec<PeerPolicy>>,
-    /// 运行模式（"tun"/"proxy"，重启生效；tun 需管理员/root，节点启动
-    /// 失败会自动回滚并上报错误）。
+    /// 运行模式（重启生效；tun 需管理员/root，节点启动失败会自动回滚并
+    /// 上报错误）。枚举化：启动/运行时 diff/服务端预检共用同一类型，
+    /// 编译器接管穷举（AGENTS #21）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<String>,
+    pub mode: Option<ClientMode>,
     /// 监听地址列表（URL 形式，重启生效；全量替换文件默认值）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen: Option<Vec<String>>,
@@ -438,12 +440,6 @@ pub struct DeviceSettings {
 impl DeviceSettings {
     /// 托管子集的格式校验（节点在持久化前还会做整体 validate 兜底）。
     pub fn validate(&self) -> Result<(), String> {
-        if let Some(mode) = &self.mode
-            && mode != "tun"
-            && mode != "proxy"
-        {
-            return Err(format!("mode 必须是 tun 或 proxy（{mode}）"));
-        }
         if let Some(list) = &self.listen {
             if list.len() > 8 {
                 return Err("listen 最多 8 条".into());
@@ -475,9 +471,6 @@ impl DeviceSettings {
                 return Err("forwards 最多 64 条".into());
             }
             for (i, f) in forwards.iter().enumerate() {
-                if f.proto != "tcp" && f.proto != "udp" {
-                    return Err(format!("forwards[{i}].proto 必须是 tcp 或 udp"));
-                }
                 if f.listen.parse::<std::net::SocketAddr>().is_err() {
                     return Err(format!("forwards[{i}].listen 不是合法的 ip:port（{}）", f.listen));
                 }
@@ -495,9 +488,6 @@ impl DeviceSettings {
                     return Err(format!("exposes[{i}] 规则过多（最多 64 条）"));
                 }
                 for (j, r) in ne.rules.iter().enumerate() {
-                    if r.proto != "tcp" && r.proto != "udp" {
-                        return Err(format!("exposes[{i}].rules[{j}].proto 必须是 tcp 或 udp"));
-                    }
                     if r.port == 0 {
                         return Err(format!("exposes[{i}].rules[{j}].port 无效"));
                     }
@@ -680,27 +670,45 @@ impl ClientMode {
     }
 }
 
+/// 转发/暴露规则的传输协议。`#[serde(other)]` 兜底未知值→Tcp：遗留
+/// 配置文件里的非法 proto 曾被下游 `_ => spawn_tcp` 静默退化，枚举化后
+/// 该行为显式化（新 PUT 的非法值由 validate 拒绝，此处仅容错旧文件）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ProtoKind {
+    #[serde(rename = "udp")]
+    Udp,
+    /// 未知值兜底（serde(other) 要求在最后变体）：遗留文件容错。
+    #[default]
+    #[serde(rename = "tcp", other)]
+    Tcp,
+}
+
+impl ProtoKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProtoKind::Tcp => "tcp",
+            ProtoKind::Udp => "udp",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ForwardRule {
     /// Local "ip:port" to listen on.
     pub listen: String,
-    #[serde(default = "default_proto")]
-    pub proto: String,
+    #[serde(default)]
+    pub proto: ProtoKind,
     /// Remote "virtual-ip:port".
     pub dest: String,
-}
-
-fn default_proto() -> String {
-    "tcp".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExposeRule {
     pub port: u16,
-    #[serde(default = "default_proto")]
-    pub proto: String,
+    #[serde(default)]
+    pub proto: ProtoKind,
     /// Local "ip:port" of the real service.
     pub dest: String,
 }
@@ -851,20 +859,22 @@ mod tests {
             serde_json::from_str(r#"{"forwards":[{"listen":"1.2.3.4:x","proto":"tcp","dest":"10.0.0.2:80"}]}"#)
                 .unwrap();
         assert!(bad.validate().is_err());
-        let bad: DeviceSettings = serde_json::from_str(
+        // proto 非法值：枚举 serde(other) 显式容错为 Tcp（遗留文件兼容，
+        // 旧字符串时期由下游 `_ => spawn_tcp` 隐式退化）——不再是校验错误。
+        let tolerated: DeviceSettings = serde_json::from_str(
             r#"{"exposes":[{"networkId":"0102030405060708090a0b0c0d0e0f10","rules":[{"port":80,"proto":"sctp","dest":"127.0.0.1:80"}]}]}"#,
         )
         .unwrap();
-        assert!(bad.validate().is_err());
+        assert_eq!(tolerated.exposes.as_ref().unwrap()[0].rules[0].proto, ProtoKind::Tcp);
+        assert!(tolerated.validate().is_ok());
         // peerPolicies 重复对端拒绝。
         let bad: DeviceSettings = serde_json::from_str(
             r#"{"peerPolicies":[{"deviceId":7,"policy":"auto"},{"deviceId":7,"policy":"relayUdp"}]}"#,
         )
         .unwrap();
         assert!(bad.validate().is_err());
-        // mode/listen 校验。
-        let bad: DeviceSettings = serde_json::from_str(r#"{"mode":"carrierPigeon"}"#).unwrap();
-        assert!(bad.validate().is_err());
+        // mode 非法值：枚举在反序列化即拒绝（不再进入 validate）。
+        assert!(serde_json::from_str::<DeviceSettings>(r#"{"mode":"carrierPigeon"}"#).is_err());
         let bad: DeviceSettings = serde_json::from_str(r#"{"listen":["udp://1.2.3.4:99999"]}"#).unwrap();
         assert!(bad.validate().is_err());
         let bad: DeviceSettings =

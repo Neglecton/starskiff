@@ -159,6 +159,23 @@ fn main() -> anyhow::Result<()> {
             let code = runtime.block_on(async move {
                 match skiff_node::start_engine(config, cfg, log).await {
                     Ok(engine) => {
+                        // 防火墙规则运行时同步（仅 Windows）：按当期实际生效
+                        // 端口重建 Starskiff Node UDP/TCP——listen 托管变更
+                        // 重启后规则自动跟进。netsh 子进程较慢，放阻塞线程；
+                        // 非管理员跳过（service_install 内判定，仅记日志）。
+                        {
+                            let shared = Arc::clone(&engine.shared);
+                            tokio::task::spawn_blocking(move || {
+                                let udp: Vec<u16> =
+                                    shared.udp.local_binds().iter().map(|a| a.port()).collect();
+                                let tcp = shared.tcp_listen_ports.lock().unwrap().clone();
+                                for line in skiff_node::service_install::ensure_runtime_firewall(
+                                    &udp, &tcp,
+                                ) {
+                                    (shared.log)(&line);
+                                }
+                            });
+                        }
                         // 控制台 Ctrl+C 会同时送达 worker 子进程（Windows
                         // console / 终端进程组）：默认处理直接终止进程，跳过
                         // 优雅收尾。注册处理器改为按正常停止处理，与 master

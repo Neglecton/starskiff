@@ -29,17 +29,37 @@ impl EventsHub {
     }
 
     /// Register the socket for (device, network); replaces any previous
-    /// socket for the same pair only.
+    /// socket for the same pair only. 返回 (rx, tx 克隆)：WS 任务退出时用
+    /// tx 调 unregister_if_current——**不能按 key 无条件注销**（快重连场景
+    /// 新连接已顶掉同 key 旧条目，旧任务收尾会误杀新连接，形成"任何同
+    /// key 双注册都自杀"的闪断链）。
     pub fn register(
         &self,
         device_id: u64,
         network_id: NetId,
-    ) -> mpsc::UnboundedReceiver<HubMessage> {
+    ) -> (mpsc::UnboundedReceiver<HubMessage>, mpsc::UnboundedSender<HubMessage>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        self.map.insert((device_id, network_id), Entry { tx });
-        rx
+        self.map.insert((device_id, network_id), Entry { tx: tx.clone() });
+        (rx, tx)
     }
 
+    /// 仅当 `tx` 仍是当前注册条目时注销（同 key 新注册已顶掉旧条目的
+    /// 情况下为 no-op）——WS 任务退出路径专用。
+    pub fn unregister_if_current(
+        &self,
+        device_id: u64,
+        network_id: NetId,
+        tx: &mpsc::UnboundedSender<HubMessage>,
+    ) {
+        if let Some(entry) = self.map.get(&(device_id, network_id))
+            && entry.tx.same_channel(tx)
+        {
+            drop(entry);
+            self.map.remove(&(device_id, network_id));
+        }
+    }
+
+    /// 按 key 无条件注销并关闭当前连接（管理端强制踢线用）。
     pub fn unregister(&self, device_id: u64, network_id: NetId) {
         if let Some((_, entry)) = self.map.remove(&(device_id, network_id)) {
             let _ = entry.tx.send(HubMessage::Close);
@@ -72,5 +92,26 @@ impl EventsHub {
                 let _ = entry.value().tx.send(HubMessage::Ws(evt.clone()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 代际注销守护：快重连的新注册顶掉旧条目后，旧任务收尾只允许清理
+    /// 自己的注册——按 key 无条件注销会误杀新连接（曾形成同 key 双注册
+    /// 必闪断的自杀链）。
+    #[test]
+    fn teardown_only_removes_own_registration() {
+        let hub = EventsHub::new();
+        let net = NetId::random();
+        let (_rx1, tx1) = hub.register(7, net);
+        let (mut rx2, _tx2) = hub.register(7, net); // 新连接顶掉旧条目
+        // 旧任务收尾：不得误杀新条目。
+        hub.unregister_if_current(7, net, &tx1);
+        // 新条目仍在：按 key 注销能找到并送达 Close。
+        hub.unregister(7, net);
+        assert!(matches!(rx2.try_recv(), Ok(HubMessage::Close)));
     }
 }

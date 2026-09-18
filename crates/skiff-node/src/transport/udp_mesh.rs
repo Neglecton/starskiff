@@ -18,22 +18,29 @@
 //! 分支语义由单测锁定。
 
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use skiff_core::consts::UDP_BUFFER_SIZE;
+use skiff_core::logging::LogFn;
 use skiff_core::protocol::relay_udp;
+use skiff_core::logging::unix_ms;
 use tokio::net::UdpSocket;
 
 use crate::engine::EngineEvent;
 
 pub struct UdpMesh {
-    /// 全部 UDP socket；primary = 首项（中继注册/默认发送用）。
-    sockets: Vec<Arc<UdpSocket>>,
-    /// 与 sockets 一一对应的本地绑定地址（发送选路用）。
+    /// 与 writer 一一对应的本地绑定地址（发送选路用；socket 本体由
+    /// 各 writer/reader 任务持有）。
     binds: Vec<SocketAddr>,
+    /// 与 sockets 一一对应的 writer 通道（FIFO 保序——每包 tokio::spawn
+    /// 在 multi_thread runtime 下不保序，FLOW DATA/CLOSE 乱序会静默截断
+    /// 流；参照 peer_tcp.rs 的单 writer 模式）。
+    writers: Vec<tokio::sync::mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>,
     pub local_port: u16,
     pub used_fallback_port: AtomicBool,
+    /// send_to 失败计数（曾 `let _ =` 静默——超限帧/网络错误的唯一痕迹）。
+    pub send_errors: Arc<AtomicU64>,
     /// 读循环与发送侧共享的中继地址（读循环闭包在 bind 时创建、
     /// configure_relay 写入，故必须经 Arc 共享同一 cell）。
     relay_addr: Arc<Mutex<Option<SocketAddr>>>,
@@ -47,45 +54,80 @@ impl UdpMesh {
     pub async fn bind(
         addrs: &[SocketAddr],
         events: tokio::sync::mpsc::UnboundedSender<EngineEvent>,
+        log: LogFn,
     ) -> anyhow::Result<Arc<UdpMesh>> {
         if addrs.is_empty() {
             anyhow::bail!("UDP 监听地址列表为空");
         }
         let relay_cell = Arc::new(Mutex::new(None::<SocketAddr>));
+        let send_errors = Arc::new(AtomicU64::new(0));
         let mut sockets: Vec<Arc<UdpSocket>> = Vec::new();
         let mut binds: Vec<SocketAddr> = Vec::new();
+        let mut writers: Vec<tokio::sync::mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>> = Vec::new();
         let mut used_fallback = false;
+        let spawn_socket = |s: Arc<UdpSocket>,
+                            events: tokio::sync::mpsc::UnboundedSender<EngineEvent>,
+                            relay_cell: Arc<Mutex<Option<SocketAddr>>>,
+                            log: LogFn,
+                            send_errors: Arc<AtomicU64>|
+         -> tokio::sync::mpsc::UnboundedSender<(SocketAddr, Vec<u8>)> {
+            spawn_reader(Arc::clone(&s), events, relay_cell);
+            spawn_writer(s, log, send_errors)
+        };
+        let bind_one = |want: SocketAddr| -> anyhow::Result<UdpSocket> {
+            // 经 socket2 扩内核缓冲（32KiB 级密封帧突发防内核静默丢弃，
+            // 见 platform::udp_socket_buffered）。绑定错误语义与
+            // UdpSocket::bind 一致（调用方据此走容错/致命分支）。
+            let std_sock = skiff_core::platform::udp_socket_buffered(want)
+                .map_err(|e| anyhow::anyhow!("UDP 监听绑定失败 {want}: {e}"))?;
+            UdpSocket::from_std(std_sock).map_err(|e| anyhow::anyhow!("UDP 监听绑定失败 {want}: {e}"))
+        };
         for want in addrs {
             // 同一地址只绑一次（调用方可能给出重复项）。
             if binds.contains(want) {
                 continue;
             }
             let primary_empty = sockets.is_empty();
-            match UdpSocket::bind(want).await {
+            match bind_one(*want) {
                 Ok(s) => {
                     let local = s.local_addr()?;
                     let s = Arc::new(s);
-                    spawn_reader(Arc::clone(&s), events.clone(), Arc::clone(&relay_cell));
+                    let tx = spawn_socket(
+                        Arc::clone(&s),
+                        events.clone(),
+                        Arc::clone(&relay_cell),
+                        log.clone(),
+                        Arc::clone(&send_errors),
+                    );
                     sockets.push(s);
                     binds.push(local);
+                    writers.push(tx);
                 }
                 Err(e) => {
                     let wildcard = want.ip().is_unspecified();
                     if wildcard && want.port() != 0 {
                         // 通配 + 固定端口：回退随机端口（同机多节点容错）。
-                        let s = UdpSocket::bind(SocketAddr::new(want.ip(), 0)).await?;
+                        let s = bind_one(SocketAddr::new(want.ip(), 0))?;
                         let local = s.local_addr()?;
                         let s = Arc::new(s);
-                        spawn_reader(Arc::clone(&s), events.clone(), Arc::clone(&relay_cell));
+                        let tx = spawn_socket(
+                            Arc::clone(&s),
+                            events.clone(),
+                            Arc::clone(&relay_cell),
+                            log.clone(),
+                            Arc::clone(&send_errors),
+                        );
                         sockets.push(s);
                         binds.push(local);
+                        writers.push(tx);
                         used_fallback = true;
                     } else if wildcard && want.port() == 0 && !primary_empty {
                         // 端口 0 通配失败且已有 socket：跳过（无需回退目标）。
                         continue;
                     } else {
-                        // 指定 IP 失败 / 首个通配端口 0 失败：致命。
-                        anyhow::bail!("UDP 监听绑定失败 {want}: {e}");
+                        // 指定 IP 失败 / 首个通配端口 0 失败：致命（bind_one
+                        // 的错误信息已含地址与原因）。
+                        anyhow::bail!("{e}");
                     }
                 }
             }
@@ -95,26 +137,27 @@ impl UdpMesh {
         }
         let local_port = sockets[0].local_addr()?.port();
         Ok(Arc::new(UdpMesh {
-            sockets,
             binds,
+            writers,
             local_port,
             used_fallback_port: AtomicBool::new(used_fallback),
+            send_errors,
             relay_addr: relay_cell,
             register_creds: Mutex::new(None),
         }))
     }
 
-    fn primary(&self) -> &Arc<UdpSocket> {
-        &self.sockets[0]
+    fn primary_tx(&self) -> &tokio::sync::mpsc::UnboundedSender<(SocketAddr, Vec<u8>)> {
+        &self.writers[0]
     }
 
-    /// 与本地绑定地址匹配的 socket（找不到回退 primary）。
-    fn socket_for(&self, local: SocketAddr) -> &Arc<UdpSocket> {
+    /// 与本地绑定地址匹配的 writer（找不到回退 primary）。
+    fn writer_for(&self, local: SocketAddr) -> &tokio::sync::mpsc::UnboundedSender<(SocketAddr, Vec<u8>)> {
         self.binds
             .iter()
             .position(|b| *b == local)
-            .map(|i| &self.sockets[i])
-            .unwrap_or(&self.sockets[0])
+            .map(|i| &self.writers[i])
+            .unwrap_or(&self.writers[0])
     }
 
     /// 全部本地绑定地址（探测从所有 socket 喷射）。
@@ -137,10 +180,7 @@ impl UdpMesh {
             return;
         };
         let pkt = relay_udp::build_register(device_id, &key).to_vec();
-        let socket = Arc::clone(self.primary());
-        tokio::spawn(async move {
-            let _ = socket.send_to(&pkt, relay).await;
-        });
+        let _ = self.primary_tx().send((relay, pkt));
     }
 
     pub fn send_relay(&self, src_id: u64, dst_id: u64, frame: &[u8]) {
@@ -148,41 +188,53 @@ impl UdpMesh {
             return;
         };
         let pkt = relay_udp::build_relay(src_id, dst_id, frame);
-        let socket = Arc::clone(self.primary());
-        tokio::spawn(async move {
-            let _ = socket.send_to(&pkt, relay).await;
-        });
+        let _ = self.primary_tx().send((relay, pkt));
     }
 
     /// 默认直发（primary socket）。
     pub fn send_direct(&self, endpoint: SocketAddr, frame: &[u8]) {
-        let socket = Arc::clone(self.primary());
-        let frame = frame.to_vec();
-        tokio::spawn(async move {
-            let _ = socket.send_to(&frame, endpoint).await;
-        });
+        let _ = self.primary_tx().send((endpoint, frame.to_vec()));
     }
 
     /// 经指定本地绑定的 socket 直发（PONG 沿到达路径 / 直连数据保持
     /// NAT 映射一致；未知绑定回退 primary）。
     pub fn send_direct_from(&self, local: SocketAddr, endpoint: SocketAddr, frame: &[u8]) {
-        let socket = Arc::clone(self.socket_for(local));
-        let frame = frame.to_vec();
-        tokio::spawn(async move {
-            let _ = socket.send_to(&frame, endpoint).await;
-        });
+        let _ = self.writer_for(local).send((endpoint, frame.to_vec()));
     }
 
     /// 从每个 socket 各直发一次（探测 PING 喷射：对端可沿任一路径回 PONG）。
     pub fn send_direct_all(&self, endpoint: SocketAddr, frame: &[u8]) {
-        for socket in &self.sockets {
-            let socket = Arc::clone(socket);
-            let frame = frame.to_vec();
-            tokio::spawn(async move {
-                let _ = socket.send_to(&frame, endpoint).await;
-            });
+        for tx in &self.writers {
+            let _ = tx.send((endpoint, frame.to_vec()));
         }
     }
+}
+
+/// 单 socket 常驻 writer：严格按入队顺序 send_to（保序），失败计数 +
+/// 60s 节流日志（消灭曾经的 `let _ =` 静默——超限帧/网络错误唯一痕迹）。
+fn spawn_writer(
+    socket: Arc<UdpSocket>,
+    log: LogFn,
+    errors: Arc<AtomicU64>,
+) -> tokio::sync::mpsc::UnboundedSender<(SocketAddr, Vec<u8>)> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(SocketAddr, Vec<u8>)>();
+    tokio::spawn(async move {
+        let mut last_log_ms: i64 = 0;
+        while let Some((dst, pkt)) = rx.recv().await {
+            if let Err(e) = socket.send_to(&pkt, dst).await {
+                let total = errors.fetch_add(1, Ordering::Relaxed) + 1;
+                let now = unix_ms();
+                if now - last_log_ms > 60_000 {
+                    last_log_ms = now;
+                    log(&format!(
+                        "UDP_SEND_ERR dst={dst} len={} err={e} total={total}（帧超 UDP 数据报上限或本机网络错误）",
+                        pkt.len()
+                    ));
+                }
+            }
+        }
+    });
+    tx
 }
 
 /// 单 socket 读循环：收包按 classify 分流后上抛事件。

@@ -61,6 +61,11 @@ pub struct PeerSession {
     pub last_pong_ms: AtomicI64,
     pub tcp_cooldown_until_ms: AtomicI64,
     pub rtt_ms: AtomicI64,
+    /// 策略档资源缺失被丢弃的出站帧数（pin 无中继回退，丢帧靠探测自愈
+    /// ——但必须可观测，否则"全超时却无任何日志"无法诊断）。
+    pub tx_dropped: AtomicU64,
+    /// 诊断日志节流锚点（TX_DROP / 探测跳过共用，每 peer 60s 一条）。
+    pub last_diag_log_ms: AtomicI64,
     pub tx_bytes: AtomicU64,
     pub rx_bytes: AtomicU64,
     pub tx_packets: AtomicU64,
@@ -92,6 +97,8 @@ impl PeerSession {
             last_pong_ms: AtomicI64::new(0),
             tcp_cooldown_until_ms: AtomicI64::new(0),
             rtt_ms: AtomicI64::new(-1),
+            tx_dropped: AtomicU64::new(0),
+            last_diag_log_ms: AtomicI64::new(0),
             tx_bytes: AtomicU64::new(0),
             rx_bytes: AtomicU64::new(0),
             tx_packets: AtomicU64::new(0),

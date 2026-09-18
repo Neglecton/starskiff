@@ -249,7 +249,6 @@ impl ControlClient {
     }
 
     async fn run_ws_once(&self, network: &str, tx: &mpsc::UnboundedSender<WsEvent>) -> anyhow::Result<()> {
-        use futures_util::StreamExt;
         let ws_url = self.url(&format!(
             "/api/events?network={}&token={}",
             urlencode(network),
@@ -274,16 +273,45 @@ impl ControlClient {
             Some(cfg) => tokio_tungstenite::Connector::Rustls(cfg.clone()),
             None => tokio_tungstenite::Connector::Plain,
         };
-        let (ws, _resp) =
-            tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector))
-                .await?;
-        let _ = tx.send(WsEvent {
-            event_type: skiff_core::models::ws_events::CONNECTED.to_string(),
-            network_id: None,
-            device_id: None,
-            message: None,
-        });
-        let mut ws = ws;
+        match tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector)).await {
+            Ok((ws, _resp)) => {
+                let _ = tx.send(WsEvent {
+                    event_type: skiff_core::models::ws_events::CONNECTED.to_string(),
+                    network_id: None,
+                    device_id: None,
+                    message: None,
+                });
+                Self::pump_ws(ws, tx.clone()).await
+            }
+            Err(e) => {
+                // 服务端明确拒绝（如设备已不属任何网络 → 404）：推送必然
+                // 收不到，发合成 NETWORKS_CHANGED 触发对账——否则零成员
+                // 设备永远连不上 WS，roster 永不收敛、死网络无限期残留
+                //（曾为删网后节点僵尸的根因）。仅限 HTTP 应答型拒绝，
+                // 网络不可达不触发（避免故障期高频拉取）。
+                if matches!(
+                    e,
+                    tokio_tungstenite::tungstenite::Error::Http(_)
+                ) {
+                    let _ = tx.send(WsEvent {
+                        event_type: skiff_core::models::ws_events::NETWORKS_CHANGED.to_string(),
+                        network_id: None,
+                        device_id: None,
+                        message: None,
+                    });
+                }
+                Err(anyhow::anyhow!("ws connect: {e}"))
+            }
+        }
+    }
+
+    async fn pump_ws(
+        mut ws: tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tx: mpsc::UnboundedSender<WsEvent>,
+    ) -> anyhow::Result<()> {
+        use futures_util::StreamExt;
         while let Some(msg) = ws.next().await {
             match msg {
                 Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {

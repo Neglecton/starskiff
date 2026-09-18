@@ -189,17 +189,16 @@ pub fn remove(name: Option<&str>, config: Option<&PathBuf>) -> anyhow::Result<()
     {
         let _ = run_tool("sc", &["stop", &name], timeout);
         let _ = config;
-        for suffix in ["UDP", "TCP"] {
-            let rule = format!("Starskiff {name} {suffix}");
+        // 服务级规则 + worker 运行时规则一并清理（对称）。
+        for rule in [
+            format!("Starskiff {name} UDP"),
+            format!("Starskiff {name} TCP"),
+            "Starskiff Node UDP".to_string(),
+            "Starskiff Node TCP".to_string(),
+        ] {
             let _ = run_tool(
                 "netsh",
-                &[
-                    "advfirewall",
-                    "firewall",
-                    "delete",
-                    "rule",
-                    &format!("name={rule}"),
-                ],
+                &["advfirewall", "firewall", "delete", "rule", &format!("name={rule}")],
                 Duration::from_secs(15),
             );
         }
@@ -251,8 +250,89 @@ pub fn remove(name: Option<&str>, config: Option<&PathBuf>) -> anyhow::Result<()
     }
 }
 
-pub fn start(name: Option<&str>) -> anyhow::Result<()> {
-    let name = service_name(name);
+/// 运行时防火墙同步（仅 Windows）：按**当期实际生效**的监听端口重建
+/// 固定名规则 `Starskiff Node UDP` / `Starskiff Node TCP`（先删后建，
+/// 幂等；listen 托管变更 → worker 重启 → 规则自动跟进）。仅在该协议
+/// 存在非 0 端口时建规则（program-only 放行过宽）。返回需写入引擎日志
+/// 的结果行；非管理员跳过而非失败（前台非提权运行是合法形态）。
+///
+/// 挂钩点在 main.rs 的 `__worker` 处理器而非 NodeEngine::start——后者
+/// 被测试 harness 进程内直调，管理员 shell 下跑 cargo test 不能误改
+/// 开发机防火墙。
+pub fn ensure_runtime_firewall(udp_ports: &[u16], tcp_ports: &[u16]) -> Vec<String> {
+    // 非 Windows 分支只消费入参不写 logs（cfg 差异），抑制 unused_mut。
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut logs = Vec::new();
+    #[cfg(windows)]
+    {
+        if !is_root() {
+            logs.push(
+                "防火墙：非管理员运行，跳过运行时规则同步（入站直连可能被系统防火墙拦截）"
+                    .into(),
+            );
+            return logs;
+        }
+        let Ok(exe) = std::env::current_exe() else {
+            logs.push("防火墙：无法确定可执行文件路径，跳过规则同步".into());
+            return logs;
+        };
+        let program = format!("program={}", exe.to_string_lossy());
+        for (suffix, proto, ports) in [
+            ("UDP", "UDP", udp_ports),
+            ("TCP", "TCP", tcp_ports),
+        ] {
+            let rule = format!("Starskiff Node {suffix}");
+            let ports: Vec<u16> = ports.iter().copied().filter(|p| *p != 0).collect();
+            // 无监听不建规则；删除旧规则让端口收窄/清空可回收。
+            let _ = run_tool(
+                "netsh",
+                &[
+                    "advfirewall",
+                    "firewall",
+                    "delete",
+                    "rule",
+                    &format!("name={rule}"),
+                ],
+                Duration::from_secs(15),
+            );
+            if ports.is_empty() {
+                continue;
+            }
+            let port_text = ports
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let args = vec![
+                "advfirewall".to_string(),
+                "firewall".into(),
+                "add".into(),
+                "rule".into(),
+                format!("name={rule}"),
+                "dir=in".into(),
+                "action=allow".into(),
+                format!("protocol={proto}"),
+                program.clone(),
+                format!("localport={port_text}"),
+            ];
+            let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            match run_tool("netsh", &refs, Duration::from_secs(15)) {
+                Ok(_) => logs.push(format!("防火墙：规则 {rule} 已按当期端口更新（{port_text}）")),
+                Err(e) => logs.push(format!("防火墙：规则 {rule} 更新失败（{e}）")),
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // Linux 不做运行时同步：iptables 运行时规则不持久 + 注释键删除
+        // 不对称（重装/卸载无法可靠回收）。变更端口后重跑 service install
+        // 或手动放行（README 已记录）。
+        let _ = (udp_ports, tcp_ports);
+    }
+    logs
+}
+
+pub fn start(name: Option<&str>) -> anyhow::Result<()> {    let name = service_name(name);
     let timeout = Duration::from_secs(20);
     #[cfg(windows)]
     {

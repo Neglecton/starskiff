@@ -16,7 +16,7 @@ use axum::{Json, Router};
 use serde_json::json;
 use sha2::Digest as _;
 use skiff_core::crypto::tokens::{sha256_hex, split_token, with_fingerprint};
-use skiff_core::ipam::{Cidr, IpPool};
+use skiff_core::ipam::Cidr;
 use skiff_core::logging::{LogFn, unix_ms};
 use skiff_core::models::*;
 use skiff_core::platform::rss_kib;
@@ -26,7 +26,7 @@ use crate::events_hub::{Hub, HubMessage};
 use crate::presence::{Presence, PresenceStore};
 use crate::relay::tcp_relay::TcpRelay;
 use crate::relay::udp_relay::UdpRelay;
-use crate::repo::{DeviceRow, EnrollResult, MembershipRow, NetworkRow, Repo, RepoError};
+use crate::repo::{DeviceRow, EnrollResult, NetworkRow, Repo, RepoError};
 
 pub struct ServerOptions {
     pub db_path: PathBuf,
@@ -123,8 +123,15 @@ pub async fn start(opts: ServerOptions) -> anyhow::Result<RunningServer> {
     let udp_relay = UdpRelay::new(presence.clone(), lookup_key.clone(), register_guard.clone());
     let tcp_relay = TcpRelay::new(presence.clone(), lookup_key, register_guard);
 
-    // Bind sockets first so port-0 resolution is real.
-    let udp_socket = tokio::net::UdpSocket::bind(("0.0.0.0", opts.relay_udp_port)).await?;
+    // Bind sockets first so port-0 resolution is real. UDP 经 socket2 扩
+    // 内核缓冲（32KiB 级中继帧突发防内核静默丢弃——曾表现为 bulk 传输
+    // 无痕停摆且零计数）。
+    let udp_socket = tokio::net::UdpSocket::from_std(
+        skiff_core::platform::udp_socket_buffered(std::net::SocketAddr::from((
+            [0, 0, 0, 0],
+            opts.relay_udp_port,
+        )))?,
+    )?;
     let relay_udp_port = udp_socket.local_addr()?.port();
     let tcp_listener = tokio::net::TcpListener::bind(("0.0.0.0", opts.relay_tcp_port)).await?;
     let relay_tcp_port = tcp_listener.local_addr()?.port();
@@ -784,14 +791,22 @@ async fn admin_device_join_network(
     let Some(net_id) = resolve_network_id(&state, &payload.network) else {
         return err(StatusCode::NOT_FOUND, "网络不存在");
     };
-    // TUN 预检：TUN 节点仅支持单网络（节点侧 validate 兜底，这里提前拒绝
-    // 避免制造重启死循环）。
-    let mode = state.presence.record(device_id).and_then(|r| r.mode);
-    let member_count = state.repo.memberships_of_device(device_id).unwrap_or_default().len();
-    if mode.as_deref() == Some("tun") && member_count >= 1 {
-        return err(StatusCode::CONFLICT, "TUN 模式节点仅支持单网络（先切换 proxy 模式或移出现有网络）");
-    }
-    match state.repo.admin_join_network(device_id, net_id, payload.requested_ip.as_deref()) {
+    // TUN 单网络守卫：权威判定在 admin_join_network 的事务内（预检读在
+    // 事务外，两个并发 join 都读到 1 个成员时会让 TUN 设备进 2 个网络）。
+    // 这里仅取 mode 标志传入；presence 缺失时回退读托管 settings 的 mode。
+    let mode = state
+        .presence
+        .record(device_id)
+        .and_then(|r| r.mode)
+        .or_else(|| {
+            state
+                .repo
+                .get_device_settings(device_id)
+                .ok()
+                .and_then(|s| s.mode)
+        });
+    let tun_required = mode == Some(skiff_core::models::ClientMode::Tun);
+    match state.repo.admin_join_network(device_id, net_id, payload.requested_ip.as_deref(), tun_required) {
         Ok(join) => {
             (state.log)(&format!(
                 "ADMIN_JOIN device={device_id} network={}({}) ip={} already={}",
@@ -933,7 +948,7 @@ async fn admin_put_device_settings(
     }
     // TUN 预检：TUN 限单网络，设备当前多网络成员时直接拒绝（节点侧
     // 启动兜底会失败回滚，这里提前给出明确错误）。
-    if payload.mode.as_deref() == Some("tun") {
+    if payload.mode == Some(skiff_core::models::ClientMode::Tun) {
         let nets = state.repo.memberships_of_device(device_id).unwrap_or_default().len();
         if nets > 1 {
             return err(
@@ -1132,7 +1147,7 @@ async fn ws_events(
         ));
         state.presence.ws_connected(device.id);
         let mut incoming = socket;
-        let mut events = state.hub.register(device.id, net.id);
+        let (mut events, events_tx) = state.hub.register(device.id, net.id);
         loop {
             tokio::select! {
                 msg = incoming.recv() => {
@@ -1157,7 +1172,9 @@ async fn ws_events(
                 }
             }
         }
-        state.hub.unregister(device.id, net.id);
+        // 仅当仍是当前注册时注销：快重连的新连接已顶掉同 key 旧条目，
+        // 旧任务收尾按 key 无条件注销会误杀新连接（闪断链）。
+        state.hub.unregister_if_current(device.id, net.id, &events_tx);
         state.presence.ws_disconnected(device.id);
         (state.log)(&format!(
             "WS_DISCONNECT device={}({})",
@@ -1273,8 +1290,47 @@ async fn admin_delete_network(
     let Some(net_id) = NetId::from_hex(&id) else {
         return err(StatusCode::BAD_REQUEST, "无效的网络 ID");
     };
+    // 删除前收集成员（删除后 memberships 级联消失）：删网必须给存量
+    // 成员节点收敛信号——节点对账（reconcile_roster）只由 NETWORKS_CHANGED
+    // 推送或 WS 重连触发，5s 轮询遇 404 直接早退不清理，零信号意味着
+    // 死网络的 peers/探测/中继转发无限期续命（安全边界落空）。
+    let members: Vec<u64> = state
+        .repo
+        .memberships_of_network(net_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| m.device_id)
+        .collect();
     match state.repo.delete_network(net_id) {
-        Ok(true) => (StatusCode::OK, "OK").into_response(),
+        Ok(true) => {
+            (state.log)(&format!("ADMIN_NET_DELETE network={net_id} members={}", members.len()));
+            for event_type in [ws_events::PEERS_CHANGED, ws_events::DEVICE_OFFLINE] {
+                state.hub.broadcast_network(
+                    &net_id,
+                    WsEvent {
+                        event_type: event_type.to_string(),
+                        network_id: Some(net_id),
+                        device_id: None,
+                        message: None,
+                    },
+                );
+            }
+            // 逐成员推 NETWORKS_CHANGED（多网络节点任一 WS 收到即对账）
+            // 并注销其在死网络上的 hub 条目（关闭该 WS）。
+            for device_id in members {
+                state.hub.send_to_device(
+                    device_id,
+                    WsEvent {
+                        event_type: ws_events::NETWORKS_CHANGED.to_string(),
+                        network_id: Some(net_id),
+                        device_id: Some(device_id),
+                        message: None,
+                    },
+                );
+                state.hub.unregister(device_id, net_id);
+            }
+            (StatusCode::OK, "OK").into_response()
+        }
         Ok(false) => err(StatusCode::NOT_FOUND, "网络不存在"),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -1504,30 +1560,19 @@ async fn admin_set_ip(
     let Some(net) = state.repo.get_network(net_id).ok().flatten() else {
         return err(StatusCode::NOT_FOUND, "网络不存在");
     };
-    let Some(current) = state.repo.membership_of(net_id, device_id).ok().flatten() else {
+    let Some(_) = state.repo.membership_of(net_id, device_id).ok().flatten() else {
         return err(StatusCode::NOT_FOUND, "设备不属于该网络");
     };
     let cidr = match Cidr::parse(&net.cidr) {
         Ok(c) => c,
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
-    let used: std::collections::HashSet<u32> = state
-        .repo
-        .memberships_of_network(net_id)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|m: &MembershipRow| m.ip.parse::<std::net::Ipv4Addr>().ok().map(u32::from))
-        .collect();
-    let current_ip = current.ip.parse::<std::net::Ipv4Addr>().ok().map(u32::from);
-    match IpPool::validate_manual(&payload.ip, &cidr, &used, current_ip) {
-        Ok(_) => {}
-        Err(msg) => return err(StatusCode::BAD_REQUEST, msg),
-    }
-    if let Err(e) = state
-        .repo
-        .update_membership_ip(net_id, device_id, &payload.ip)
-    {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    // 校验+写入单事务（并发抢注由 UNIQUE 约束兜底并映射为 409）。
+    if let Err(e) = state.repo.set_membership_ip_atomic(net_id, device_id, &payload.ip, &cidr) {
+        return match e {
+            RepoError::Conflict(msg) => err(StatusCode::CONFLICT, msg),
+            other => err(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        };
     }
     state.hub.send_to_device(
         device_id,

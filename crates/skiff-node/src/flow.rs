@@ -29,7 +29,7 @@ enum FlowKind {
     /// Initiated TCP flow, waiting for OPENED_OK, then delivering DATA.
     OutTcp {
         open_reply: Option<oneshot::Sender<Result<(), String>>>,
-        data_tx: mpsc::Sender<Vec<u8>>,
+        data_tx: mpsc::UnboundedSender<Vec<u8>>,
     },
     /// Accepted TCP flow pumping a local socket.
     InTcp {
@@ -60,6 +60,9 @@ pub struct FlowManager {
     /// Responder-side local UDP sockets keyed by (network, flow, exposed port).
     udp_locals: DashMap<(NetId, u32, u16), Arc<UdpSocket>>,
     flow_out: FlowOut,
+    /// 收端串行队列：帧按到达顺序单任务处理（曾每帧 spawn——multi_thread
+    /// 下处理顺序不保，DATA/CLOSE 乱序会静默截断流）。
+    inbox: mpsc::UnboundedSender<(NetId, u64, Vec<u8>)>,
     /// Per-network exposes (network -> rules), shared view of engine state.
     exposes: DashMap<NetId, Vec<ExposeRule>>,
     networks: NetworksMap,
@@ -103,7 +106,7 @@ pub struct FlowStream {
     pub flow_id: u32,
     pub net_id: NetId,
     pub peer: u64,
-    rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+    rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
     mgr: std::sync::Weak<FlowManager>,
 }
 
@@ -129,15 +132,30 @@ impl FlowStream {
 
 impl FlowManager {
     pub fn new(flow_out: FlowOut, networks: NetworksMap, log: LogFn) -> Arc<FlowManager> {
-        Arc::new(FlowManager {
+        let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel::<(NetId, u64, Vec<u8>)>();
+        let mgr = Arc::new(FlowManager {
             flows: DashMap::new(),
             connecting: DashMap::new(),
             udp_locals: DashMap::new(),
             flow_out,
+            inbox: inbox_tx,
             exposes: DashMap::new(),
             networks,
             log,
-        })
+        });
+        // 串行消费者：按入队顺序逐帧处理（保序）。
+        let consumer = Arc::clone(&mgr);
+        tokio::spawn(async move {
+            while let Some((net_id, peer, payload)) = inbox_rx.recv().await {
+                consumer.on_frame(net_id, peer, &payload).await;
+            }
+        });
+        mgr
+    }
+
+    /// 引擎侧入队（收端保序入口）。
+    pub fn enqueue(&self, net_id: NetId, peer: u64, payload: &[u8]) {
+        let _ = self.inbox.send((net_id, peer, payload.to_vec()));
     }
 
     /// Replace the per-network expose rules (engine refreshes from config).
@@ -160,6 +178,15 @@ impl FlowManager {
     }
 
     fn send_frame(&self, net_id: NetId, peer: u64, flow_id: u32, flags: u8, payload: &[u8]) {
+        // 统一出站守卫：载荷超 UDP 数据报安全上限的帧密封后必然 send
+        // 失败（数据报不可拆分），在此丢弃并留痕——曾静默黑洞。
+        if payload.len() > skiff_core::consts::FLOW_MAX_DATAGRAM {
+            (self.log)(&format!(
+                "FLOW_DROP frame flow={flow_id} flags={flags} payload={} 超 UDP 数据报上限，已丢弃",
+                payload.len()
+            ));
+            return;
+        }
         let _ = self.flow_out.send((net_id, peer, flow::encode(flow_id, flags, payload)));
     }
 
@@ -177,7 +204,9 @@ impl FlowManager {
     /// Open a TCP flow to a peer's exposed service; waits up to `timeout`.
     pub async fn open_tcp(self: &Arc<Self>, net_id: NetId, peer: u64, dest: &str, timeout: Duration) -> Option<FlowStream> {
         let flow_id = self.new_flow_id()?;
-        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
+        // 无界：应用侧消费慢时先缓冲（try_send 的 Full 曾被当作流失败
+        // 立即拆除——任何突发回波都会瞬间杀死流，CONNECT 后即 EOF）。
+        let (data_tx, data_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (open_tx, open_rx) = oneshot::channel::<Result<(), String>>();
         self.flows.insert(
             flow_id,
@@ -251,15 +280,23 @@ impl FlowManager {
             flow::FLAG_CLOSE => self.close_flow(msg.flow_id, false),
             flow::FLAG_DATA => {
                 // OutTcp: deliver to the stream; InTcp: to the local writer.
-                let failed = match self.flows.get(&msg.flow_id) {
+                // 两路通道均无界：背压时缓冲而非拆流。kill 判定与 close_flow
+                // 之间必须先 drop DashMap 引用（同 key 重叠会死锁，AGENTS #5）。
+                let kill = match self.flows.get(&msg.flow_id) {
                     Some(entry) => match &entry.value().kind {
-                        FlowKind::OutTcp { data_tx, .. } => data_tx.try_send(msg.payload.to_vec()).is_err(),
-                        FlowKind::InTcp { writer, .. } => writer.send(msg.payload.to_vec()).is_err(),
+                        FlowKind::OutTcp { data_tx, .. } => {
+                            let _ = data_tx.send(msg.payload.to_vec());
+                            false
+                        }
+                        FlowKind::InTcp { writer, .. } => {
+                            let _ = writer.send(msg.payload.to_vec());
+                            false
+                        }
                         FlowKind::Udp { .. } => true,
                     },
                     None => false,
                 };
-                if failed {
+                if kill {
                     self.close_flow(msg.flow_id, true);
                 }
             }
@@ -288,7 +325,7 @@ impl FlowManager {
                     return;
                 }
                 let exposes = self.exposes.get(&net_id).map(|e| e.value().clone()).unwrap_or_default();
-                let Some(expose) = exposes.iter().find(|e| e.proto == "tcp" && e.port == port) else {
+                let Some(expose) = exposes.iter().find(|e| e.proto == skiff_core::models::ProtoKind::Tcp && e.port == port) else {
                     let reason = format!("no tcp service on port {port}");
                     self.send_frame(net_id, peer, flow_id, flow::FLAG_OPENED_FAIL, &flow::build_opened_fail(&reason));
                     return;
@@ -315,7 +352,10 @@ impl FlowManager {
                             let _ = mgr.connecting.remove(&flow_id);
                             mgr.send_frame(net_id, peer, flow_id, flow::FLAG_OPENED_OK, b"");
                             tokio::spawn(local_writer_loop(wr, writer_rx));
-                            let mut buf = vec![0u8; 64 * 1024];
+                            // 分块上限 FLOW_CHUNK：读到多少发多少，保证
+                            // 密封后不超 UDP 数据报上限（曾为 64KiB——
+                            // 密封后 65592 > 65507，UDP 路径必失败且静默）。
+                            let mut buf = vec![0u8; skiff_core::consts::FLOW_CHUNK];
                             loop {
                                 match rd.read(&mut buf).await {
                                     Ok(0) | Err(_) => break,
@@ -366,7 +406,7 @@ impl FlowManager {
         // Responder side: route to the exposed UDP service in this network.
         let Some(dst_port) = info.addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) else { return };
         let exposes = self.exposes.get(&net_id).map(|e| e.value().clone()).unwrap_or_default();
-        let Some(expose) = exposes.iter().find(|e| e.proto == "udp" && e.port == dst_port) else { return };
+        let Some(expose) = exposes.iter().find(|e| e.proto == skiff_core::models::ProtoKind::Udp && e.port == dst_port) else { return };
         let Some(self_ip) = self.self_ip_of(&net_id) else { return };
         let dest: SocketAddr = expose.dest.parse().unwrap_or_else(|_| {
             format!("127.0.0.1:{}", expose.port).parse().expect("fallback udp dest parses")
@@ -384,15 +424,14 @@ impl FlowManager {
                 // go back as DATAGRAM frames carrying the local virtual
                 // address of THIS network.
                 let mgr = Arc::clone(self);
-                let flow_out = self.flow_out.clone();
                 let sock_clone = Arc::clone(&sock);
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 65535];
                     while let Ok(Ok((n, _))) =
                         tokio::time::timeout(Duration::from_secs(300), sock_clone.recv_from(&mut buf)).await
                     {
-                        let dg = flow::build_datagram(&reply_addr, &buf[..n]);
-                        let _ = flow_out.send((net_id, peer, flow::encode(flow_id, flow::FLAG_DATAGRAM, &dg)));
+                        // 走 send_frame 统一超限守卫（超大数据报丢弃留痕）。
+                        mgr.send_frame(net_id, peer, flow_id, flow::FLAG_DATAGRAM, &flow::build_datagram(&reply_addr, &buf[..n]));
                     }
                     // 5 min idle or socket error ends this port's reply loop.
                     mgr.udp_locals.remove(&(net_id, flow_id, dst_port));
@@ -470,8 +509,9 @@ mod tests {
     }
 
     /// close_peer 只关指定网络的 flow：同一 peer 在另一网络的流不受影响。
-    #[test]
-    fn close_peer_is_scoped_to_network() {
+    /// （FlowManager::new 会 spawn 收端串行消费者，需在 tokio 上下文构造。）
+    #[tokio::test]
+    async fn close_peer_is_scoped_to_network() {
         let (mgr, _rx) = mk_mgr();
         let net_a = NetId([1; 16]);
         let net_b = NetId([2; 16]);
@@ -493,7 +533,7 @@ mod tests {
         let net = NetId([3; 16]);
         mgr.set_exposes(
             net,
-            vec![ExposeRule { port, proto: "tcp".into(), dest: format!("127.0.0.1:{port}") }],
+            vec![ExposeRule { port, proto: skiff_core::models::ProtoKind::Tcp, dest: format!("127.0.0.1:{port}") }],
         );
         let accepted = Arc::new(AtomicUsize::new(0));
         let acc = Arc::clone(&accepted);

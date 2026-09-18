@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use crate::engine::EngineShared;
 use crate::flow::UdpFlowSender;
 
-const PUMP_BUF: usize = 32 * 1024;
+const PUMP_BUF: usize = skiff_core::consts::FLOW_CHUNK;
 
 pub async fn spawn(listen: &str, shared: Arc<EngineShared>) -> anyhow::Result<u16> {
     let listener = TcpListener::bind(parse_listen(listen)?).await?;

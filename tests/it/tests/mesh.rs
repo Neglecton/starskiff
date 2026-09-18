@@ -758,3 +758,456 @@ async fn relay_udp_ping_pong_roundtrip_without_path_poisoning() {
         }
     }
 }
+
+/// directTcp pin 的连接建立与 PING/PONG 往返（回归锁定：TCP 探测此前
+/// 只连 endpoints[0]，且失败/对端无 TCP 监听全程静默——"pin directTcp
+/// 后 ping 全超时却无任何日志"的直接成因层，此前零测试覆盖）。双节点
+/// 均在本机（观测端点即 127.0.0.1），断言 A 侧建立 TCP 连接并收到沿
+/// 连接回程的 PONG。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_tcp_pin_probes_connect_and_carries_ping_pong() {
+    let h = TestHarness::create().await;
+    let pa = h.enroll_node("dtcp-a", None).await;
+    let pb = h.enroll_node("dtcp-b", None).await;
+    // 端口 0 = 随机：并行测试会争抢默认 24933，后启动的节点 TCP 监听
+    // 被容错跳过（tcp_listen_port=None），探测无从发起。
+    let ea = h
+        .start_engine(&pa, |c| c.listen = vec!["udp://0.0.0.0:0".into(), "tcp://0.0.0.0:0".into()])
+        .await;
+    let eb = h
+        .start_engine(&pb, |c| c.listen = vec!["udp://0.0.0.0:0".into(), "tcp://0.0.0.0:0".into()])
+        .await;
+
+    // 双侧 pin directTcp：不走中继、无 UDP 喷射，连通性完全取决于 TCP
+    // 探测建连。
+    h.set_settings(&pa, serde_json::json!({ "pathPolicy": "directTcp" })).await;
+    h.set_settings(&pb, serde_json::json!({ "pathPolicy": "directTcp" })).await;
+    h.until(|| {
+        *ea.shared.path_policy.lock().unwrap() == skiff_core::models::PathPolicy::DirectTcp
+            && *eb.shared.path_policy.lock().unwrap() == skiff_core::models::PathPolicy::DirectTcp
+    })
+    .await;
+
+    // A 侧：TCP 连接建立（探测 attach）+ PING 沿连接发出、PONG 沿连接
+    // 回程被记录。探测周期 5s + 60s 失败冷却，留足余量。
+    h.until_with_timeout(
+        || {
+            ea.peers().iter().any(|(_, p)| {
+                p.name() == "dtcp-b"
+                    && p.tcp_conn.lock().unwrap().is_some()
+                    && p.last_pong_ms.load(std::sync::atomic::Ordering::Relaxed) > 0
+            })
+        },
+        Duration::from_secs(30),
+    )
+    .await;
+
+    // 建连后不再丢帧：PONG 已回程说明连接可用，此后 route_sealed 的
+    // directTcp 出口应全部命中连接（计数在下一个探测周期内保持不变；
+    // pin 生效→建连之间的窗口内探测 PING 丢一次是预期）。
+    let base = ea
+        .peers()
+        .into_iter()
+        .find(|(_, p)| p.name() == "dtcp-b")
+        .map(|(_, p)| p.tx_dropped.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    for (_, p) in ea.peers() {
+        assert_eq!(
+            p.tx_dropped.load(std::sync::atomic::Ordering::Relaxed),
+            if p.name() == "dtcp-b" { base } else { 0 },
+            "directTcp 建连后仍有丢帧（peer={}）",
+            p.name()
+        );
+    }
+}
+
+/// 中继 UDP 路径上的大流量 TCP flow 完整性（回归锁定：B 侧响应读块曾为
+/// 64KiB——密封后 65592 > IPv4 UDP 数据报上限 65507，中继/直连 UDP 路径
+/// send_to 必失败且被静默吞掉，bulk 传输=无痕黑洞；分块上限 FLOW_CHUNK
+/// 与 per-socket writer 保序修复后应完整回环）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_udp_carries_bulk_tcp_flow_intact() {
+    let h = TestHarness::create().await;
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            if let Ok((mut s, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 || s.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let sa = h.enroll_node("bulk-a", None).await;
+    let sb = h.enroll_node("bulk-b", None).await;
+    // 双侧 pin relayUdp：请求与响应全程经中继，最大化分片/分块压力。
+    h.set_settings(&sa, serde_json::json!({ "pathPolicy": "relayUdp", "socksListen": "127.0.0.1:0" })).await;
+    h.set_settings(&sb, serde_json::json!({ "pathPolicy": "relayUdp" })).await;
+    let net_id = h.network_id_by_name("testnet").await;
+    h.set_settings(
+        &sb,
+        serde_json::json!({ "exposes": [{
+            "networkId": net_id.to_hex(),
+            "rules": [{ "port": 9090, "proto": "tcp", "dest": format!("127.0.0.1:{echo_port}") }]
+        }]}),
+    )
+    .await;
+    let ea = h.start_engine(&sa, |_| {}).await;
+    let _eb = h.start_engine(&sb, |_| {}).await;
+
+    h.until(|| {
+        ea.socks_port() > 0
+            && ea
+                .peers()
+                .iter()
+                .any(|(_, p)| p.name() == "bulk-b" && p.online())
+    })
+    .await;
+    let peer_ip = ea
+        .peers()
+        .into_iter()
+        .find(|(_, p)| p.name() == "bulk-b")
+        .unwrap()
+        .1
+        .virtual_ip();
+
+    // 经 SOCKS5 走真实反压路径（客户端 TCP 流控天然限制 in-flight，
+    // 直连 flow.write 连发 16 帧大报文会打爆接收内核缓冲——UDP 静默
+    // 丢包、无重传，属协议已知边界而非本测试目标）。
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", ea.socks_port()))
+        .await
+        .unwrap();
+    s.write_all(&[5, 1, 0]).await.unwrap();
+    let mut m = [0u8; 2];
+    s.read_exact(&mut m).await.unwrap();
+    assert_eq!(&m, &[5, 0]);
+    let oct = peer_ip.octets();
+    let port = 9090u16.to_be_bytes();
+    s.write_all(&[5, 1, 0, 1, oct[0], oct[1], oct[2], oct[3], port[0], port[1]])
+        .await
+        .unwrap();
+    let mut r = [0u8; 10];
+    s.read_exact(&mut r).await.unwrap();
+    assert_eq!(r[1], 0, "CONNECT ok");
+
+    // 256KiB 确定性图案回环（B 侧 echo 回读块曾达 64KiB 触发必失败帧）。
+    let total = 256 * 1024;
+    let pattern: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+    let (mut rd, mut wr) = s.into_split();
+    let writer = tokio::spawn(async move {
+        for off in (0..total).step_by(16 * 1024) {
+            wr.write_all(&pattern[off..off + 16 * 1024]).await.unwrap();
+        }
+        // 写半提前 drop 会向 SOCKS 服务端发 FIN 被视作客户端关闭、整条
+        // 流拆除（合法的 TCP 半关闭语义本实现不支持）——保持存活直到
+        // 读侧完成后由 abort 收尾。
+        std::future::pending::<()>().await;
+        let _ = wr;
+    });
+    let mut got = vec![0u8; total];
+    let mut filled = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while filled < total && tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), rd.read(&mut got[filled..])).await {
+            Ok(Ok(0)) => {
+                eprintln!("bulk diag: client EOF at filled={filled}");
+                break;
+            }
+            Err(_) => {} // 本轮超时，继续等总 deadline
+            Ok(Ok(n)) => filled += n,
+            Ok(Err(e)) => panic!("读失败: {e}"),
+        }
+    }
+    writer.abort();
+    let expect: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+    if filled != total || got != expect {
+        let (_, p) = ea
+            .peers()
+            .into_iter()
+            .find(|(_, p)| p.name() == "bulk-b")
+            .unwrap();
+        let (_, pb) = _eb
+            .peers()
+            .into_iter()
+            .find(|(_, x)| x.name() == "bulk-a")
+            .unwrap();
+        let rs = h.server.state.udp_relay.stats();
+        panic!(
+            "bulk 回环不完整: got={filled} want={total}
+A: tx_pkts={} tx_bytes={} tx_dropped={} send_errors={}
+B: rx_pkts={} rx_bytes={} tx_pkts={}
+relay: fwd_pkts={} fwd_bytes={} dropped={}",
+            p.tx_packets.load(std::sync::atomic::Ordering::Relaxed),
+            p.tx_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            p.tx_dropped.load(std::sync::atomic::Ordering::Relaxed),
+            ea.shared.udp.send_errors.load(std::sync::atomic::Ordering::Relaxed),
+            pb.rx_packets.load(std::sync::atomic::Ordering::Relaxed),
+            pb.rx_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            pb.tx_packets.load(std::sync::atomic::Ordering::Relaxed),
+            rs.forwarded_packets, rs.forwarded_bytes, rs.dropped_packets
+        );
+    }
+}
+
+/// 删除网络的收敛信号（回归锁定：曾零信号——节点对账只由推送/重连触发，
+/// 5s 轮询遇 404 早退不清理，死网络的 peers/探测无限期续命）。删网后
+/// NETWORKS_CHANGED 推送应触发节点对账，roster 即时修剪。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_network_converges_node_roster() {
+    let h = TestHarness::create().await;
+    let sa = h.enroll_node("del-a", None).await;
+    let ea = h.start_engine(&sa, |_| {}).await;
+    let net_id = h.network_id_by_name("testnet").await;
+    // roster 就位（启动即写；WS 可能尚未连通——推送丢失时由 WS 404 拒绝
+    // 触发的合成对账事件兜底收敛）。
+    h.until(|| ea.shared.roster.lock().unwrap().contains(&net_id))
+        .await;
+
+    let resp = h
+        .admin
+        .delete(format!("{}/admin/networks/{}", h.base_url(), net_id.to_hex()))
+        .header("X-Admin-Token", &h.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    h.until_with_timeout(
+        || !ea.shared.roster.lock().unwrap().contains(&net_id),
+        Duration::from_secs(15),
+    )
+    .await;
+}
+
+/// 首块回显固定标记的 echo 服务（返回监听端口）——用于验证数据落在
+/// 哪个网络的 expose 规则上。
+async fn spawn_marker_echo(marker: &'static [u8]) -> u16 {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            if let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let mut first = true;
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        if first {
+                            let _ = s.write_all(marker).await;
+                            first = false;
+                        }
+                        if s.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        }
+    });
+    port
+}
+
+/// 同一设备跨两网络：(network, device) 双键 + 多 codec 试解链的引擎层
+/// 锁定（AGENTS #0——密钥以 networkId 为派生盐，同一 deviceId 在两网各
+/// 有独立会话，帧必须落在正确网络的会话）。B 在两网各暴露同端口不同
+/// echo（回显不同标记），A 经 SOCKS 分别连两网 VIP：标记即落点证明。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_device_across_two_networks_lands_in_right_session() {
+    let h = TestHarness::create().await;
+    h.create_network("xdup2", "10.97.0.0/24").await;
+    let tok2 = h.token_for("xdup2").await;
+    let net1 = h.network_id_by_name("testnet").await;
+    let net2 = h.network_id_by_name("xdup2").await;
+
+    let echo1 = spawn_marker_echo(b"NET1:").await;
+    let echo2 = spawn_marker_echo(b"NET2:").await;
+
+    let pa = h.enroll_node("xdup-a", None).await;
+    h.join_node(&pa, &tok2).await.expect("join net2");
+    let pb = h.enroll_node("xdup-b", None).await;
+    h.join_node(&pb, &tok2).await.expect("join net2");
+
+    h.set_settings(&pa, serde_json::json!({ "socksListen": "127.0.0.1:0" })).await;
+    // 同端口 8100、两网不同 dest：应答标记 = OPEN 落点的网络。
+    h.set_settings(
+        &pb,
+        serde_json::json!({ "exposes": [
+            { "networkId": net1.to_hex(),
+              "rules": [{ "port": 8100, "proto": "tcp", "dest": format!("127.0.0.1:{echo1}") }] },
+            { "networkId": net2.to_hex(),
+              "rules": [{ "port": 8100, "proto": "tcp", "dest": format!("127.0.0.1:{echo2}") }] }
+        ]}),
+    )
+    .await;
+
+    let ea = h.start_engine(&pa, |_| {}).await;
+    let _eb = h.start_engine(&pb, |_| {}).await;
+
+    // A 在两网各看到 B 的独立会话且均在线。
+    h.until(|| {
+        ea.peers().iter().filter(|(_, p)| p.name() == "xdup-b").filter(|(_, p)| p.online()).count() == 2
+    })
+    .await;
+    let vips: Vec<(skiff_core::models::NetId, std::net::Ipv4Addr)> = ea
+        .peers()
+        .into_iter()
+        .filter(|(_, p)| p.name() == "xdup-b")
+        .map(|(n, p)| (n, p.virtual_ip()))
+        .collect();
+    assert_eq!(vips.len(), 2, "同一 device 双网会话独立存在");
+
+    for (net, marker) in [(net1, &b"NET1:"[..]), (net2, &b"NET2:"[..])] {
+        let vip = vips.iter().find(|(n, _)| *n == net).unwrap().1;
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", ea.socks_port()))
+            .await
+            .unwrap();
+        s.write_all(&[5, 1, 0]).await.unwrap();
+        let mut m = [0u8; 2];
+        s.read_exact(&mut m).await.unwrap();
+        let oct = vip.octets();
+        let port = 8100u16.to_be_bytes();
+        s.write_all(&[5, 1, 0, 1, oct[0], oct[1], oct[2], oct[3], port[0], port[1]])
+            .await
+            .unwrap();
+        let mut r = [0u8; 10];
+        s.read_exact(&mut r).await.unwrap();
+        assert_eq!(r[1], 0, "CONNECT ok (net={net:?})");
+        s.write_all(b"ping").await.unwrap();
+        let mut got = [0u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(10), s.read(&mut got))
+            .await
+            .expect("echo 回答")
+            .unwrap();
+        assert_eq!(
+            &got[..marker.len()],
+            marker,
+            "数据落在错误网络的会话（net={net:?}）"
+        );
+        assert_eq!(&got[marker.len()..n], b"ping");
+    }
+}
+
+/// 遗留配置收编端到端（曾零覆盖）：旧格式文件的非默认值（forceRelay /
+/// socksListen / forwards）在首次启动经 adopt 收编为服务端托管，之后
+/// 文件被重写为瘦配置、遗留键消失。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_file_values_are_adopted_and_file_rewritten_thin() {
+    let h = TestHarness::create().await;
+    let pa = h.enroll_node("legacy-a", None).await;
+    let dev_id = h.device_id_of(&pa);
+
+    // 写入遗留字段（旧格式）。
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&pa).unwrap()).unwrap();
+    v["forceRelay"] = serde_json::json!(true);
+    v["socksListen"] = serde_json::json!("127.0.0.1:12377");
+    v["forwards"] = serde_json::json!([{
+        "listen": "127.0.0.1:15001", "proto": "tcp", "dest": "10.99.0.2:80"
+    }]);
+    std::fs::write(&pa, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+
+    // 直调 NodeEngine::start：harness 的 start_engine 会先按瘦配置重写
+    // 文件，把注入的遗留键在引擎读到之前抹掉——收编路径必须从原始遗留
+    // 文件启动。
+    let cfg = skiff_node::node_config::load(&pa).unwrap();
+    let log: skiff_core::logging::LogFn = std::sync::Arc::new(|_| {});
+    let sink: skiff_node::engine::DataSink = Box::new(|_| {});
+    let _ea = skiff_node::engine::NodeEngine::start(pa.clone(), cfg, sink, log)
+        .await
+        .expect("engine starts with legacy file");
+
+    // 等收编落库：服务端托管出现遗留值。
+    let base = h.base_url();
+    let admin_token = h.admin_token.clone();
+    let admin_client = h.admin.clone();
+    h.until_with_timeout(
+        move || {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let s: serde_json::Value = admin_client
+                        .get(format!("{base}/admin/devices/{dev_id}/settings"))
+                        .header("X-Admin-Token", &admin_token)
+                        .send()
+                        .await
+                        .unwrap()
+                        .json()
+                        .await
+                        .unwrap();
+                    s["pathPolicy"] == serde_json::json!("relayUdp")
+                        && s["socksListen"] == serde_json::json!("127.0.0.1:12377")
+                        && s["forwards"].as_array().is_some_and(|a| a.len() == 1)
+                        && s["socksListen"] == serde_json::json!("127.0.0.1:12377")
+                        && s["forwards"].as_array().is_some_and(|a| a.len() == 1)
+                })
+            })
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+
+    // 文件被重写为瘦配置：遗留键消失。
+    h.until(|| {
+        std::fs::read_to_string(&pa)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .is_some_and(|after| {
+                after.get("forceRelay").is_none()
+                    && after.get("socksListen").is_none()
+                    && after.get("forwards").is_none()
+            })
+    })
+    .await;
+}
+
+/// 多地址 listen 语义：通配端口被占→回退随机（标志置位）+ 指定地址共存
+/// 多绑定；TCP 指定地址独立绑定。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_address_listen_fallback_and_extra_binds() {
+    let h = TestHarness::create().await;
+    let pa = h.enroll_node("mlisten-a", None).await;
+    // 占住一个 UDP 端口（保持 socket 存活至引擎绑定之后）。
+    let guard = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let occupied = guard.local_addr().unwrap().port();
+
+    let ea = h
+        .start_engine(&pa, |c| {
+            c.listen = vec![
+                format!("udp://0.0.0.0:{occupied}"),
+                "udp://127.0.0.1:0".into(),
+                "tcp://127.0.0.1:0".into(),
+            ];
+        })
+        .await;
+    assert!(
+        ea.shared.udp.used_fallback_port.load(std::sync::atomic::Ordering::Relaxed),
+        "被占通配端口应回退随机"
+    );
+    assert!(
+        ea.shared.udp.local_binds().len() >= 2,
+        "回退绑定 + 指定地址共存"
+    );
+    assert_eq!(ea.shared.tcp_listen_ports.lock().unwrap().len(), 1);
+}
+
+/// 指定 IP（不在本机）绑定失败必须致命（显式意图，走配置回滚路径）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unassigned_ip_listen_is_fatal() {
+    let h = TestHarness::create().await;
+    let pa = h.enroll_node("mfail-a", None).await;
+    let mut cfg = skiff_node::node_config::load(&pa).unwrap();
+    cfg.listen = vec!["udp://203.0.113.1:0".into()]; // TEST-NET-3，不在本机
+    let log: skiff_core::logging::LogFn = std::sync::Arc::new(|_| {});
+    let sink: skiff_node::engine::DataSink = Box::new(|_| {});
+    let result = skiff_node::engine::NodeEngine::start(pa.clone(), cfg, sink, log).await;
+    assert!(result.is_err(), "指定 IP 绑定失败应致命而非回退");
+}

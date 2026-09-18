@@ -290,48 +290,56 @@ impl Repo {
         device_id: u64,
         candidate: &DeviceSettings,
     ) -> Result<DeviceSettings, RepoError> {
-        let current = self.get_device_settings(device_id)?;
-        let mut merged = current.clone();
-        if merged.path_policy.is_none() {
-            merged.path_policy = candidate.path_policy;
-        }
-        if merged.peer_policies.is_none() {
-            merged.peer_policies = candidate.peer_policies.clone();
-        } else if let Some(cur) = &mut merged.peer_policies
-            && let Some(cand) = &candidate.peer_policies
-        {
-            // 逐对端合并：已有覆盖的对端不动，其余采纳候选。
-            for pp in cand {
-                if !cur.iter().any(|x| x.device_id == pp.device_id) {
-                    cur.push(pp.clone());
+        // 读-合并-写单事务 + revision 守卫（AGENTS #22/#23）：跨两次加锁的
+        // 读判写窗口内，并发管理员 PUT 的新版本会被基于过期基线的合并
+        // 静默覆盖（管理员刚解除托管的字段被节点收编值改回去）。守卫 0
+        // 行命中即放弃本次收编——幂等，节点下次启动重试。
+        let outcome: Option<(DeviceSettings, i64)> = self.db.with_tx(|tx| -> Result<Option<(DeviceSettings, i64)>, RepoError> {
+            let row = tx
+                .query_row(
+                    "SELECT revision, json FROM device_settings WHERE device_id = ?1",
+                    params![device_id as i64],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let (current, base_rev) = match row {
+                Some((rev, json)) => {
+                    let mut s: DeviceSettings = serde_json::from_str(&json)
+                        .map_err(|e| RepoError::Conflict(format!("device_settings JSON 无效: {e}")))?;
+                    s.revision = rev; // 列是 revision 的权威来源
+                    (s, rev)
                 }
+                None => (DeviceSettings::default(), 0),
+            };
+            let merged = adopt_merge(&current, candidate);
+            if merged == current {
+                return Ok(None); // 无可收编项：不产生新 revision
             }
-        }
-        if merged.mtu.is_none() {
-            merged.mtu = candidate.mtu;
-        }
-        if merged.socks_listen.is_none() {
-            merged.socks_listen = candidate.socks_listen.clone();
-        }
-        if merged.forwards.is_none() {
-            merged.forwards = candidate.forwards.clone();
-        }
-        if merged.exposes.is_none() {
-            merged.exposes = candidate.exposes.clone();
-        } else if let Some(cur) = &mut merged.exposes
-            && let Some(cand) = &candidate.exposes
-        {
-            // 逐网络合并：已有托管规则的网络不动，其余采纳候选。
-            for ne in cand {
-                if !cur.iter().any(|x| x.network_id == ne.network_id) {
-                    cur.push(ne.clone());
-                }
+            let mut stored = merged.clone();
+            stored.revision = 0; // json 内不存 revision，列权威（同 set_device_settings）
+            let json = serde_json::to_string(&stored)
+                .map_err(|e| RepoError::Conflict(format!("序列化失败: {e}")))?;
+            let next = base_rev + 1;
+            let hit = tx.execute(
+                "INSERT INTO device_settings(device_id, revision, json, updated_at)
+                 VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(device_id) DO UPDATE SET
+                    revision = excluded.revision, json = excluded.json, updated_at = excluded.updated_at
+                 WHERE device_settings.revision = ?5",
+                params![device_id as i64, next, json, unix_ms(), base_rev],
+            )?;
+            if hit == 0 {
+                return Ok(None); // 并发已变更：守卫生效，放弃收编
             }
+            Ok(Some((merged, next)))
+        })?;
+        match outcome {
+            Some((mut merged, next)) => {
+                merged.revision = next;
+                Ok(merged)
+            }
+            None => self.get_device_settings(device_id),
         }
-        if merged == current {
-            return Ok(current); // 无可收编项：不产生新 revision
-        }
-        self.set_device_settings(device_id, &merged)
     }
 
     /// 保存托管配置：事务内 revision+1 后整体覆盖，返回落库后的值。
@@ -834,6 +842,9 @@ impl Repo {
         device_id: u64,
         network_id: NetId,
         requested_ip: Option<&str>,
+        // TUN 单网络守卫须在**事务内**复核成员数：handler 预检在事务外，
+        // 两个并发 join 都读到 1 个成员时会让 TUN 设备进 2 个网络。
+        single_network_required: bool,
     ) -> Result<JoinResult, RepoError> {
         self.db.with_tx(|tx| -> Result<JoinResult, RepoError> {
             let network: Option<NetworkRow> = tx
@@ -856,8 +867,67 @@ impl Repo {
             {
                 return Ok(JoinResult { network, ip: m.ip, already_member: true });
             }
+            if single_network_required {
+                let cnt: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM memberships WHERE device_id = ?1",
+                    params![device_id as i64],
+                    |r| r.get(0),
+                )?;
+                if cnt > 0 {
+                    return Err(RepoError::Conflict(
+                        "TUN 模式节点仅支持单网络（先切换 proxy 模式或移出现有网络）".into(),
+                    ));
+                }
+            }
             let ip_text = Self::insert_membership(tx, &network, device_id, requested_ip, None)?;
             Ok(JoinResult { network, ip: ip_text, already_member: false })
+        })
+    }
+
+    /// 管理端改成员 IP：读占用集合 + 校验 + UPDATE 单事务（AGENTS #22）。
+    /// 并发抢注由 UNIQUE(network_id, ip) 兜底并映射为 Conflict（409）——
+    /// 此前校验与写入分离，竞态窗口内会以 500 裸暴露约束冲突。
+    pub fn set_membership_ip_atomic(
+        &self,
+        network_id: NetId,
+        device_id: u64,
+        ip: &str,
+        cidr: &Cidr,
+    ) -> Result<(), RepoError> {
+        self.db.with_tx(|tx| -> Result<(), RepoError> {
+            let used: std::collections::HashSet<u32> = {
+                let mut stmt = tx.prepare(
+                    "SELECT ip FROM memberships WHERE network_id = ?1 AND device_id != ?2",
+                )?;
+                let rows = stmt.query_map(params![network_id.as_bytes(), device_id as i64], |r| {
+                    r.get::<_, String>(0)
+                })?;
+                let mut set = std::collections::HashSet::new();
+                for row in rows {
+                    if let Ok(text) = row
+                        && let Ok(v4) = text.parse::<std::net::Ipv4Addr>()
+                    {
+                        set.insert(u32::from(v4));
+                    }
+                }
+                set
+            };
+            // 校验通过才尝试写入（错误消息面向管理员，保持 IpPool 文案）。
+            if let Err(msg) = IpPool::validate_manual(ip, cidr, &used, None) {
+                return Err(RepoError::Conflict(msg));
+            }
+            match tx.execute(
+                "UPDATE memberships SET ip = ?1 WHERE network_id = ?2 AND device_id = ?3",
+                params![ip, network_id.as_bytes(), device_id as i64],
+            ) {
+                Ok(_) => Ok(()),
+                Err(e)
+                    if e.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) =>
+                {
+                    Err(RepoError::Conflict("IP 已被占用".into()))
+                }
+                Err(e) => Err(RepoError::Sqlite(e)),
+            }
         })
     }
 
@@ -867,20 +937,7 @@ impl Repo {
         device_id: u64,
         network_id: NetId,
     ) -> Result<NetworkRow, RepoError> {
-        let memberships = self.memberships_of_device(device_id)?;
-        if !memberships.iter().any(|m| m.network_id == network_id) {
-            return Err(RepoError::Conflict("设备不属于该网络".into()));
-        }
-        if memberships.len() == 1 {
-            return Err(RepoError::Conflict("不能移除最后一个网络（如需重置请删除设备重新 enroll）".into()));
-        }
-        self.db.with_tx(|tx| -> Result<(), RepoError> {
-            tx.execute(
-                "DELETE FROM memberships WHERE network_id = ?1 AND device_id = ?2",
-                params![network_id.as_bytes(), device_id as i64],
-            )?;
-            Ok(())
-        })?;
+        remove_membership_guarded(&self.db, device_id, network_id)?;
         self.get_network(network_id)?
             .ok_or_else(|| RepoError::Conflict("网络不存在".into()))
     }
@@ -911,16 +968,8 @@ impl Repo {
         let Some(net_id) = net_id else {
             return Err(RepoError::Conflict("未找到该网络的成员关系".into()));
         };
-        if memberships.len() == 1 {
-            return Err(RepoError::Conflict("不能移除最后一个网络（如需重置请重新 enroll）".into()));
-        }
-        self.db.with_tx(|tx| -> Result<(), RepoError> {
-            tx.execute(
-                "DELETE FROM memberships WHERE network_id = ?1 AND device_id = ?2",
-                params![net_id.as_bytes(), device_id as i64],
-            )?;
-            Ok(())
-        })?;
+        // 名字解析的读取在事务外无妨：最终裁决由守卫删除给出。
+        remove_membership_guarded(&self.db, device_id, net_id)?;
         self.get_network(net_id)?
             .ok_or_else(|| RepoError::Conflict("网络不存在".into()))
     }
@@ -938,6 +987,81 @@ impl Repo {
     pub fn admin_token(&self) -> Option<String> {
         self.get_setting("admin_token").ok().flatten()
     }
+}
+
+/// adopt 的纯合并逻辑（收编只填**未托管**字段；提取为自由函数便于单测）。
+fn adopt_merge(current: &DeviceSettings, candidate: &DeviceSettings) -> DeviceSettings {
+    let mut merged = current.clone();
+    if merged.path_policy.is_none() {
+        merged.path_policy = candidate.path_policy;
+    }
+    if merged.peer_policies.is_none() {
+        merged.peer_policies = candidate.peer_policies.clone();
+    } else if let Some(cur) = &mut merged.peer_policies
+        && let Some(cand) = &candidate.peer_policies
+    {
+        for pp in cand {
+            if !cur.iter().any(|x| x.device_id == pp.device_id) {
+                cur.push(pp.clone());
+            }
+        }
+    }
+    if merged.mtu.is_none() {
+        merged.mtu = candidate.mtu;
+    }
+    if merged.socks_listen.is_none() {
+        merged.socks_listen = candidate.socks_listen.clone();
+    }
+    if merged.forwards.is_none() {
+        merged.forwards = candidate.forwards.clone();
+    }
+    if merged.exposes.is_none() {
+        merged.exposes = candidate.exposes.clone();
+    } else if let Some(cur) = &mut merged.exposes
+        && let Some(cand) = &candidate.exposes
+    {
+        for ne in cand {
+            if !cur.iter().any(|x| x.network_id == ne.network_id) {
+                cur.push(ne.clone());
+            }
+        }
+    }
+    merged
+}
+
+/// 守卫式成员移除：单条条件 DELETE（成员数 > 1 才允许删）+ 事务内归因
+/// （不属于 / 最后一个）。并发 leave 同一设备的两个网络时，单连接 Mutex
+/// 串行化 + 守卫保证不会把成员关系删光（AGENTS #22）。
+fn remove_membership_guarded(
+    db: &crate::db::Db,
+    device_id: u64,
+    network_id: NetId,
+) -> Result<(), RepoError> {
+    db.with_tx(|tx| -> Result<(), RepoError> {
+        let hit = tx.execute(
+            "DELETE FROM memberships WHERE network_id = ?1 AND device_id = ?2
+             AND (SELECT COUNT(*) FROM memberships WHERE device_id = ?2) > 1",
+            params![network_id.as_bytes(), device_id as i64],
+        )?;
+        if hit > 0 {
+            return Ok(());
+        }
+        // 0 行命中：归因（事务内重读，非竞态判定）。
+        let member: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM memberships WHERE network_id = ?1 AND device_id = ?2",
+                params![network_id.as_bytes(), device_id as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if member.is_none() {
+            Err(RepoError::Conflict("设备不属于该网络".into()))
+        } else {
+            Err(RepoError::Conflict(
+                "不能移除最后一个网络（如需重置请删除设备重新 enroll）".into(),
+            ))
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1067,6 +1191,104 @@ mod tests {
             })
             .unwrap()
             .flatten()
+    }
+
+
+    fn net_with_device(name: &str) -> (Repo, NetId, u64, NetId) {
+        let repo = temp_repo();
+        let a = repo.create_network(&format!("{name}-a"), "10.20.0.0/24").unwrap();
+        let b = repo.create_network(&format!("{name}-b"), "10.21.0.0/24").unwrap();
+        let token = repo.create_token(a.id, 10, 86_400_000, None).unwrap();
+        let dev = repo
+            .enroll(&token.token, name, &"ab".repeat(32), &"cd".repeat(32), None)
+            .unwrap();
+        (repo, a.id, dev.device_id, b.id)
+    }
+
+    /// 成员数守卫（AGENTS #22）：并发 leave 不可把成员关系删光——最后一个
+    /// 不可移除；非成员移除被拒。
+    #[test]
+    fn membership_removal_guards_last_one() {
+        let (repo, net_a, dev, net_b) = net_with_device("guard");
+        // 加入第二个网络后移除其一：成功。
+        let token_b = repo.create_token(net_b, 10, 86_400_000, None).unwrap();
+        repo.join_network(dev, &token_b.token, None).unwrap();
+        assert!(repo.admin_remove_membership(dev, net_a).is_ok());
+        // 只剩最后一个：拒绝（含正确的归因文案）。
+        let err = repo.admin_remove_membership(dev, net_b).unwrap_err();
+        assert!(err.to_string().contains("最后"));
+        // 非成员：拒绝。
+        let err = repo.admin_remove_membership(dev, net_a).unwrap_err();
+        assert!(err.to_string().contains("不属于"));
+    }
+
+    /// join 事务内 TUN 单网络守卫：tun 要求下单网络设备加入第二网被拒。
+    #[test]
+    fn join_rejects_second_network_when_single_required() {
+        let (repo, _net_a, dev, net_b) = net_with_device("tung");
+        let token_b = repo.create_token(net_b, 10, 86_400_000, None).unwrap();
+        assert!(repo
+            .admin_join_network(dev, net_b, None, true)
+            .is_err_and(|e| e.to_string().contains("单网络")));
+        // 非单网络要求时同一 join 成功（语义不受标志影响）。
+        assert!(repo.admin_join_network(dev, net_b, None, false).is_ok());
+        let _ = token_b;
+    }
+
+    /// set_membership_ip_atomic：重复 IP → Conflict（409 语义，UNIQUE 兜底
+    /// 不再裸 500）；合法变更成功。
+    #[test]
+    fn set_ip_atomic_maps_duplicate_to_conflict() {
+        let (repo, net_a, dev, net_b) = net_with_device("setip");
+        let token_b = repo.create_token(net_b, 10, 86_400_000, None).unwrap();
+        let other = repo
+            .enroll(&token_b.token, "setip-o", &"ef".repeat(32), &"12".repeat(32), None)
+            .unwrap();
+        // other=10.21.0.1；再注册 other2=10.21.0.2，把 other2 改成
+        // other 占用的地址应映射为 Conflict（409 语义）。
+        let other2 = repo
+            .enroll(&token_b.token, "setip-p", &"34".repeat(32), &"56".repeat(32), None)
+            .unwrap();
+        let cidr = skiff_core::ipam::Cidr::parse("10.21.0.0/24").unwrap();
+        let err = repo
+            .set_membership_ip_atomic(net_b, other2.device_id, "10.21.0.1", &cidr)
+            .unwrap_err();
+        assert!(matches!(err, RepoError::Conflict(_)), "got {err:?}");
+        let _ = other;
+        // 合法地址成功。
+        repo.set_membership_ip_atomic(net_a, dev, "10.20.0.77", &skiff_core::ipam::Cidr::parse("10.20.0.0/24").unwrap())
+            .unwrap();
+    }
+
+    /// adopt：已托管字段不被收编覆盖（管理员解除托管后节点的旧值不得被
+    /// 静默改回）；收编产生新 revision；无可收编项不动 revision。
+    #[test]
+    fn adopt_respects_managed_fields_and_revision() {
+        let repo = temp_repo();
+        let net = repo.create_network("adp", "10.30.0.0/24").unwrap();
+        let token = repo.create_token(net.id, 5, 86_400_000, None).unwrap();
+        let dev = repo
+            .enroll(&token.token, "adp-d", &"ab".repeat(32), &"cd".repeat(32), None)
+            .unwrap();
+        let managed = DeviceSettings {
+            socks_listen: Some("127.0.0.1:1999".into()),
+            ..DeviceSettings::default()
+        };
+        let saved = repo.set_device_settings(dev.device_id, &managed).unwrap();
+        assert_eq!(saved.revision, 1);
+        // 节点候选携带不同 socks：已托管字段必须保持服务端值。
+        let candidate = DeviceSettings {
+            socks_listen: Some("127.0.0.1:1".into()),
+            mtu: Some(1400),
+            ..DeviceSettings::default()
+        };
+        let merged = repo.adopt_device_settings(dev.device_id, &candidate).unwrap();
+        assert_eq!(merged.socks_listen, Some("127.0.0.1:1999".into()));
+        assert_eq!(merged.mtu, Some(1400), "未托管字段被收编");
+        assert_eq!(merged.revision, 2);
+        // 再次 adopt 相同候选：无新 revision。
+        let again = repo.adopt_device_settings(dev.device_id, &candidate).unwrap();
+        assert_eq!(again.revision, 2);
     }
 
     /// mark_settings_applied 的 revision 守卫：节点 applied=1 期间管理员

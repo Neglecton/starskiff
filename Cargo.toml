@@ -19,6 +19,8 @@ skiff-node = { path = "crates/skiff-node" }
 
 # async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal", "process", "io-util", "fs"] }
+# UDP 数据面 socket 内核缓冲（socket2，tokio 传递依赖已在树中）
+socket2 = "0.6"
 
 # crypto (pure Rust, static-link friendly)
 x25519-dalek = { version = "2", features = ["static_secrets"] }

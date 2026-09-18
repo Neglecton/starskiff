@@ -24,10 +24,13 @@ use tokio::sync::mpsc;
 use crate::presence::Presence;
 
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
+/// 每连接写队列深度上限（帧）：128 帧 × ≤512KiB 为最坏内存上界，慢接
+/// 收方溢出即丢弃计数（背压防护，见 handle_connection 注释）。
+const RELAY_TCP_QUEUE_FRAMES: usize = 128;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(12 * 3600);
 
 struct ConnHandle {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::Sender<Vec<u8>>,
 }
 
 pub struct TcpRelay {
@@ -75,14 +78,17 @@ impl TcpRelay {
 
     async fn handle_connection(self: Arc<Self>, stream: TcpStream, peer: SocketAddr) {
         let (read_half, write_half) = stream.into_split();
-        let (writer_tx, writer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // 有界写队列（背压防护）：合法设备可向慢接收方灌帧，无界队列
+        // 会按入速-排空速累积直至内存耗尽。溢出丢弃并计数——加密帧丢失
+        // 由上层重传/超时处理，与 UDP 中继的丢弃语义一致。
+        let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(RELAY_TCP_QUEUE_FRAMES);
         let writer = tokio::spawn(writer_loop(write_half, writer_rx));
 
         let result = self.session(read_half, writer_tx.clone(), peer).await;
         if let Err(msg) = &result {
             // Mirror the C# error text contract.
             let inner = relay_tcp::encode_cmd(CMD_ERROR, msg.as_bytes());
-            let _ = writer_tx.send(length_prefix(&inner));
+            let _ = writer_tx.try_send(length_prefix(&inner));
         }
         // Kick self from the table only if we still own the entry.
         if let Ok(id) = &result
@@ -99,7 +105,7 @@ impl TcpRelay {
     async fn session(
         self: &Arc<Self>,
         mut read: OwnedReadHalf,
-        writer_tx: mpsc::UnboundedSender<Vec<u8>>,
+        writer_tx: mpsc::Sender<Vec<u8>>,
         peer: SocketAddr,
     ) -> Result<u64, String> {
         // First frame: REGISTER with the 56-byte body, within 15s.
@@ -131,7 +137,7 @@ impl TcpRelay {
 
         // Same device reconnecting kicks the old connection.
         if let Some((_, old)) = self.connections.remove(&device_id) {
-            let _ = old.tx.send(Vec::new()); // empty write signals close-ish; rely on drop
+            let _ = old.tx.try_send(Vec::new()); // empty write signals close-ish; rely on drop
         }
         self.connections.insert(
             device_id,
@@ -145,7 +151,7 @@ impl TcpRelay {
             CMD_ACK,
             &relay_udp::build_ack_payload(&peer.ip().to_string(), peer.port()),
         );
-        if writer_tx.send(length_prefix(&ack_inner)).is_err() {
+        if writer_tx.try_send(length_prefix(&ack_inner)).is_err() {
             return Ok(device_id);
         }
 
@@ -169,21 +175,27 @@ impl TcpRelay {
                 match relay_tcp::parse(&frame) {
                     Some(RelayTcpMsg::Keepalive) => {
                         let resp = relay_tcp::encode_cmd(CMD_TCP_KEEPALIVE_RESP, b"");
-                        if writer_tx.send(length_prefix(&resp)).is_err() {
+                        if writer_tx.try_send(length_prefix(&resp)).is_err() {
                             return Ok(device_id);
                         }
                     }
                     Some(RelayTcpMsg::Send { dst, frame }) => {
-                        if let Some(target) = self.connections.get(&dst) {
-                            let inner = relay_tcp::encode_cmd(CMD_TCP_FRAME, frame);
-                            if target.tx.send(length_prefix(&inner)).is_ok() {
-                                self.forwarded_packets.fetch_add(1, Ordering::Relaxed);
-                                self.forwarded_bytes
-                                    .fetch_add(frame.len() as u64, Ordering::Relaxed);
-                            } else {
-                                self.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                        // DashMap 引用先 drop 再计丢弃（统一收尾，避免重叠）。
+                        let sent = match self.connections.get(&dst) {
+                            Some(target) => {
+                                let inner = relay_tcp::encode_cmd(CMD_TCP_FRAME, frame);
+                                let ok = target.tx.try_send(length_prefix(&inner)).is_ok();
+                                drop(target);
+                                ok
                             }
+                            None => false,
+                        };
+                        if sent {
+                            self.forwarded_packets.fetch_add(1, Ordering::Relaxed);
+                            self.forwarded_bytes
+                                .fetch_add(frame.len() as u64, Ordering::Relaxed);
                         } else {
+                            // 目标离线或写队列满（慢接收方）：丢弃计数。
                             self.dropped_packets.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -216,7 +228,7 @@ fn length_prefix(inner: &[u8]) -> Vec<u8> {
     out
 }
 
-async fn writer_loop(mut write: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+async fn writer_loop(mut write: OwnedWriteHalf, mut rx: mpsc::Receiver<Vec<u8>>) {
     while let Some(msg) = rx.recv().await {
         // Empty payload is the kick signal from a replacing connection.
         if msg.is_empty() {

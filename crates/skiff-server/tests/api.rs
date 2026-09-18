@@ -415,7 +415,35 @@ async fn relay_register_replay_rejected() {
     }
 }
 
+/// 轮询等设备在管理面显示在线（= WS 已注册入 hub）——替代固定 sleep
+/// （CI 慢机上 300ms 不够即 flaky；presence 的 online 在无引擎心跳的
+/// API 测试里只由 WS 驱动）。
+async fn wait_ws_online(srv: &TestServer, device_id: u64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        let resp = srv
+            .client
+            .get(format!("{}/admin/devices", srv.base_url))
+            .header("X-Admin-Token", &srv.admin_token)
+            .send()
+            .await
+            .unwrap();
+        let devs: serde_json::Value = resp.json().await.unwrap();
+        let hit = devs.as_array().is_some_and(|list| {
+            list.iter().any(|d| {
+                d["id"].as_str() == Some(&device_id.to_string()) && d["online"] == serde_json::json!(true)
+            })
+        });
+        if hit {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("device {device_id} 未在 10s 内上线（WS 注册超时）");
+}
+
 #[tokio::test]
+
 async fn admin_set_ip_pushes_config_changed_over_ws() {
     let srv = spawn_server().await;
     create_network(&srv, "net", "10.52.0.0/24").await;
@@ -434,8 +462,8 @@ async fn admin_set_ip_pushes_config_changed_over_ws() {
     .unwrap();
     let (mut write, mut read) = ws.split();
 
-    // Wait for the connection to register server-side, then change b's IP.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // 等 WS 服务端注册完成（在线可见）再触发事件，替代固定 sleep。
+    wait_ws_online(&srv, a.device_id).await;
     let network_id_hex = a.network_id.to_hex();
     let resp = srv
         .client
@@ -507,7 +535,7 @@ async fn admin_settings_roundtrip_and_ws_push() {
     .await
     .unwrap();
     let (mut write, mut read) = ws.split();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_ws_online(&srv, a.device_id).await;
 
     // 保存合法配置 → revision（含对端覆盖回读）。
     let resp = put(serde_json::json!({

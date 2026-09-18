@@ -222,7 +222,9 @@ async fn socks5_udp_datagrams_route_to_destination_network() {
     })
     .await;
     assert!(got_c.expect("udpnet 的 expose 收到数据报"), "udpnet 的 expose 收到数据报");
-    let leaked = tokio::time::timeout(Duration::from_millis(300), async {
+    // 负向断言的置信窗口：真实泄漏若延迟到达会漏检（假通过方向），窗口
+// 取 1s 平衡慢 CI 与测试时长。
+let leaked = tokio::time::timeout(Duration::from_secs(1), async {
         while let Some(d) = echo_b_rx.recv().await {
             if d == b"cross-net-udp" {
                 return true;
