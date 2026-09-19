@@ -1139,3 +1139,110 @@ async fn unassigned_ip_listen_is_fatal() {
     let result = skiff_node::engine::NodeEngine::start(pa.clone(), cfg, sink, log).await;
     assert!(result.is_err(), "指定 IP 绑定失败应致命而非回退");
 }
+
+/// 自适应心跳间隔（观察者门控）：无人查看 → 常态档 15s；管理端轮询
+/// /admin/devices 后 → 快档 5s。enroll 后直接 POST /api/heartbeat 断言
+/// 响应建议值（harness 创建过程只触碰 networks/tokens，不影响判定）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeat_interval_adapts_to_admin_observer() {
+    let h = TestHarness::create().await;
+    let cfg_path = h.enroll_node("gating-a", None).await;
+    let cfg = h.node_cfg(&cfg_path);
+    let token = cfg.identity.device_token.expose().to_string();
+    async fn beat(h: &TestHarness, token: &str) -> u64 {
+        let resp: serde_json::Value = reqwest::Client::new()
+            .post(format!("{}/api/heartbeat", h.base_url()))
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "localAddrs": [] }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        resp["heartbeatSecs"].as_u64().expect("响应应含 heartbeatSecs")
+    }
+    // 无观察者：常态档。
+    assert_eq!(beat(&h, &token).await, 15);
+    // 管理端查看（轮询 /admin/devices）后：快档。
+    h.admin
+        .get(format!("{}/admin/devices", h.base_url()))
+        .header("X-Admin-Token", &h.admin_token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(beat(&h, &token).await, 5);
+}
+
+/// 心跳速率上报全链路：注入确定字节的收发后，服务端 /admin/devices 的
+/// paths[] 中该对端条目应带正的 txBps/rxBps（节点差分 → 线格式 →
+/// presence → 管理 API 的完整链路；txBps 字段名同时被 JSON 断言锁定）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn heartbeat_reports_peer_rates_after_traffic() {
+    use std::sync::atomic::Ordering;
+    let h = TestHarness::create().await;
+    let pa = h.enroll_node("rate-a", None).await;
+    let pb = h.enroll_node("rate-b", None).await;
+    let dev_b = h.device_id_of(&pb);
+    let ea = h.start_engine(&pa, |_| {}).await;
+    let _eb = h.start_engine(&pb, |_| {}).await;
+
+    // 首拍尽早建立基线时钟（此时对端可能尚无 rtt，基线可为空——不影响）。
+    skiff_node::engine::heartbeat_tick(&ea.shared).await;
+    // 等 A 对 B 的探测有应答（rtt >= 0 才进入上报名单）。
+    let mut rtt_ok = false;
+    for _ in 0..100 {
+        rtt_ok = ea
+            .shared
+            .peers
+            .iter()
+            .any(|p| p.key().1 == dev_b && p.value().rtt_ms.load(Ordering::Relaxed) >= 0);
+        if rtt_ok {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(rtt_ok, "等待 A→B 探测应答超时");
+    // 第二拍：此刻基线里记录 B 的累计值。
+    skiff_node::engine::heartbeat_tick(&ea.shared).await;
+    // 注入确定流量并保证差分窗口 >= 1s（过短窗口按缺省处理）。
+    let session = ea
+        .shared
+        .peers
+        .iter()
+        .find(|p| p.key().1 == dev_b)
+        .map(|p| std::sync::Arc::clone(p.value()))
+        .unwrap();
+    session.add_tx(1500);
+    session.add_rx(3000);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    skiff_node::engine::heartbeat_tick(&ea.shared).await;
+
+    // 服务端视角断言（注入 1500B/1.1s ≈ 1300B/s 起，探测帧额外增量可忽略）。
+    let devs: serde_json::Value = h
+        .admin
+        .get(format!("{}/admin/devices", h.base_url()))
+        .header("X-Admin-Token", &h.admin_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let dev_a_id = h.device_id_of(&pa).to_string();
+    let entry = devs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"].as_str() == Some(&dev_a_id))
+        .and_then(|d| d["paths"].as_array().cloned().unwrap_or_default().into_iter().find(
+            |p| p["deviceId"].as_str() == Some(&dev_b.to_string()),
+        ))
+        .expect("A 的 paths 中应有对 B 的条目");
+    let tx = entry["txBps"].as_u64().expect("txBps 应存在");
+    let rx = entry["rxBps"].as_u64().expect("rxBps 应存在");
+    assert!(tx >= 1000, "txBps 异常偏小：{tx}");
+    assert!(rx >= 2000, "rxBps 异常偏小：{rx}");
+}

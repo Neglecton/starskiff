@@ -125,6 +125,13 @@ pub struct PeerPathReport {
     /// peer never answered a probe (or an older node that doesn't report it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtt_ms: Option<i64>,
+    /// 本心跳窗口内的发送/接收速率（字节/秒，密文整帧口径，含探测帧与
+    /// 加密开销）。首个窗口（无基线）或间隔 <1s 时缺省。tx/rx 独立：
+    /// 单侧计数回退仅该侧缺省。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_bps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_bps: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +161,16 @@ pub struct HeartbeatRequest {
 pub struct HeartbeatResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_udp_endpoint: Option<String>,
+    /// 服务端建议的下一心跳间隔（秒）：管理页被查看（近期轮询
+    /// /admin/devices）时为快档，否则常态档。恒下发；旧服务端响应缺省
+    /// 该字段时按常态档解析（default）。声明式随每次心跳重发，收发
+    /// 双方都无需记忆状态。
+    #[serde(default = "default_heartbeat_secs")]
+    pub heartbeat_secs: u32,
+}
+
+fn default_heartbeat_secs() -> u32 {
+    crate::consts::HEARTBEAT_SLOW_SECS
 }
 
 /// WebSocket event pushed to nodes.
@@ -962,5 +979,37 @@ mod tests {
         let req: HeartbeatRequest = serde_json::from_str(r#"{"localAddrs":[]}"#).unwrap();
         assert!(req.paths.is_none());
         assert!(req.listen_udp_port.is_none());
+    }
+
+    /// 速率字段（txBps/rxBps）与旧格式双向兼容：缺省解析为 None、
+    /// None 写出省略；有值 round-trip。
+    #[test]
+    fn peer_path_report_bps_compat() {
+        let legacy: PeerPathReport =
+            serde_json::from_str(r#"{"deviceId":7,"path":"DirectUdp","rttMs":10}"#).unwrap();
+        assert!(legacy.tx_bps.is_none() && legacy.rx_bps.is_none());
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("txBps"));
+
+        let full: PeerPathReport = serde_json::from_str(
+            r#"{"deviceId":8,"path":"RelayTcp","rttMs":23,"txBps":1024,"rxBps":0}"#,
+        )
+        .unwrap();
+        assert_eq!(full.tx_bps, Some(1024));
+        assert_eq!(full.rx_bps, Some(0)); // 0 是有效值（窗口内无流量）
+        let json = serde_json::to_string(&full).unwrap();
+        assert!(json.contains("\"txBps\":1024") && json.contains("\"rxBps\":0"));
+    }
+
+    /// 心跳响应的间隔建议：缺省字段按常态档解析（旧服务端兼容），
+    /// 有值 round-trip。
+    #[test]
+    fn heartbeat_response_interval_hint() {
+        let legacy: HeartbeatResponse = serde_json::from_str(r#"{"observedUdpEndpoint":null}"#).unwrap();
+        assert_eq!(legacy.heartbeat_secs, crate::consts::HEARTBEAT_SLOW_SECS);
+        let fast: HeartbeatResponse =
+            serde_json::from_str(r#"{"heartbeatSecs":5}"#).unwrap();
+        assert_eq!(fast.heartbeat_secs, crate::consts::HEARTBEAT_FAST_SECS);
+        let json = serde_json::to_string(&fast).unwrap();
+        assert!(json.contains("\"heartbeatSecs\":5"));
     }
 }

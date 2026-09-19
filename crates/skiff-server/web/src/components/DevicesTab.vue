@@ -1,6 +1,6 @@
 <script setup>
 import { computed, h, inject, onMounted, ref } from 'vue';
-import { NButton, NInput, NTag, useDialog, useMessage } from 'naive-ui';
+import { NButton, NTag, useDialog, useMessage } from 'naive-ui';
 import { useI18n } from 'vue-i18n';
 import { api, fmtTime } from '../api';
 
@@ -11,12 +11,12 @@ const registerLoader = inject('registerLoader');
 
 const rows = ref([]);
 const loading = ref(false);
-const savingIp = ref(null); // `${devId}:${netId}` while an IP save is in flight
 
 function mono(text) {
   return h('span', { class: 'mono' }, text);
 }
 
+// 虚拟 IP 仅展示；修改统一到设备配置页（SettingsTab memberships）。
 function membershipCell(row) {
   if (!row.networks?.length) {
     return h('span', { style: 'opacity: .55' }, t('devices.noNetwork'));
@@ -25,24 +25,6 @@ function membershipCell(row) {
     h('div', { class: 'member-cell', key: m.networkId }, [
       h(NTag, { size: 'small', bordered: false, type: 'info' }, { default: () => mono(m.ip) }),
       h('span', { style: 'opacity: .55; font-size: 12px' }, m.networkName),
-      h(NInput, {
-        size: 'tiny',
-        placeholder: t('devices.changeIpPh'),
-        style: 'width: 120px',
-        defaultValue: m.ip,
-        onUpdateValue: (v) => (m._newIp = v),
-      }),
-      h(
-        NButton,
-        {
-          size: 'tiny',
-          tertiary: true,
-          type: 'primary',
-          loading: savingIp.value === `${row.id}:${m.networkId}`,
-          onClick: () => saveIp(row, m),
-        },
-        { default: () => t('devices.save') },
-      ),
     ]),
   );
 }
@@ -122,20 +104,6 @@ async function load() {
     message.error(e.message);
   } finally {
     loading.value = false;
-  }
-}
-
-async function saveIp(row, m) {
-  const ip = (m._newIp ?? m.ip).trim();
-  savingIp.value = `${row.id}:${m.networkId}`;
-  try {
-    await api('POST', `/admin/networks/${m.networkId}/devices/${row.id}/ip`, { ip });
-    message.success(t('devices.ipUpdated'));
-    await load();
-  } catch (e) {
-    message.error(e.message);
-  } finally {
-    savingIp.value = null;
   }
 }
 

@@ -98,6 +98,9 @@ pub enum StopReason {
     Restart,
 }
 
+/// 心跳速率差分基线：device_id → 上次采样时累计 (tx,rx) 字节。
+type HbRateMap = HashMap<u64, (u64, u64)>;
+
 pub struct EngineShared {
     pub cfg: Mutex<NodeConfig>,
     pub config_path: PathBuf,
@@ -133,6 +136,12 @@ pub struct EngineShared {
     pub applied_settings_revision: AtomicU64,
     /// 有重启类托管配置已写入文件但尚未重启生效（心跳上报给管理页）。
     pub restart_pending: AtomicBool,
+    /// 服务端建议的心跳间隔（自适应：管理页被查看时快档）。心跳循环
+    /// 睡前读取、响应后更新；建议随每次心跳重发，无需额外同步协议。
+    pub heartbeat_secs: AtomicU32,
+    /// 上次心跳的速率差分基线：每对端累计 (tx,rx) 快照 + 采样时刻。
+    /// 每次心跳对差分得 txBps/rxBps 后整体替换；对端消失随之清理。
+    pub hb_rate_baseline: Mutex<Option<(std::time::Instant, HbRateMap)>>,
     /// 生效路径策略：对端覆盖 ?? 全局默认 ?? Auto（服务端托管，热生效，
     /// 每帧现读）。只决定本端出口；接收方全路径接收。
     pub path_policy: Mutex<PathPolicy>,
@@ -573,6 +582,8 @@ impl NodeEngine {
             stopping: AtomicBool::new(false),
             applied_settings_revision: AtomicU64::new(0),
             restart_pending: AtomicBool::new(false),
+            heartbeat_secs: AtomicU32::new(skiff_core::consts::HEARTBEAT_SLOW_SECS),
+            hb_rate_baseline: Mutex::new(None),
             path_policy: Mutex::new(PathPolicy::Auto),
             peer_policies: DashMap::new(),
             runtime_socks: Mutex::new(None),
@@ -841,13 +852,22 @@ impl NodeEngine {
             }));
         }
 
-        // Heartbeat loop (15s; every 2nd tick re-registers with the relays).
+        // Heartbeat loop (adaptive interval; every 2nd tick re-registers with
+        // the relays). 间隔由服务端心跳响应建议（管理页被查看时快档），
+        // 睡前读取当前值——响应后更新的值下一轮生效，收敛 ≤ 一个周期。
         {
             let shared2 = Arc::clone(&shared);
             tasks.push(tokio::spawn(async move {
                 let mut tick: u64 = 0;
                 loop {
-                    tokio::time::sleep(Duration::from_secs(15)).await;
+                    let secs = shared2
+                        .heartbeat_secs
+                        .load(Ordering::Relaxed)
+                        .clamp(
+                            skiff_core::consts::HEARTBEAT_MIN_SECS,
+                            skiff_core::consts::HEARTBEAT_MAX_SECS,
+                        );
+                    tokio::time::sleep(Duration::from_secs(secs as u64)).await;
                     heartbeat_tick(&shared2).await;
                     tick += 1;
                     if tick.is_multiple_of(2) {
@@ -1429,27 +1449,79 @@ async fn refresh_one_network(shared: &Arc<EngineShared>, net_id: NetId, name: &s
     }
 }
 
-async fn heartbeat_tick(shared: &Arc<EngineShared>) {
+/// 心跳速率差分（纯函数，便于单测）：对端累计 (tx,rx) 与基线差分除以
+/// 实际间隔。无基线（首个窗口）/间隔 <1s → 两侧缺省；单侧计数回退仅
+/// 该侧缺省（防御，正常单调递增不会触发）。口径为密文整帧字节（含
+/// 探测帧与加密开销），展示为链路层吞吐。
+fn rate_bps(
+    prev: Option<(u64, u64)>,
+    cur: (u64, u64),
+    dt: Duration,
+) -> (Option<u64>, Option<u64>) {
+    fn one(prev: u64, cur: u64, dt_ms: u128) -> Option<u64> {
+        if cur < prev {
+            return None;
+        }
+        Some(((cur - prev) as u128 * 1000 / dt_ms) as u64)
+    }
+    let Some(prev) = prev else {
+        return (None, None);
+    };
+    if dt < Duration::from_secs(1) {
+        return (None, None);
+    }
+    let dt_ms = dt.as_millis().max(1);
+    (one(prev.0, cur.0, dt_ms), one(prev.1, cur.1, dt_ms))
+}
+
+/// 单次心跳（pub 供集成测试直接触发：速率差分/间隔建议的全链路断言）。
+pub async fn heartbeat_tick(shared: &Arc<EngineShared>) {
     // Only report peers we have actually interacted with (rtt recorded):
     // a never-answered peer would report its initial RelayUdp state, which
     // misleads the topology view into drawing phantom relay edges.
     //（current_path 在策略应用时已同步为真实生效路径，直接上报裸枚举串。）
-    let paths: Vec<PeerPathReport> = shared
-        .peers
-        .iter()
-        .filter_map(|p| {
-            let rtt = p.value().rtt_ms.load(Ordering::Relaxed);
-            if rtt < 0 {
-                return None;
-            }
-            let path = p.value().path().as_str().to_string();
-            Some(PeerPathReport {
-                device_id: p.key().1.to_string(),
-                path,
-                rtt_ms: Some(rtt),
+    // 速率 = 相邻两次心跳间对端累计字节的差分 ÷ 实际间隔；窗口随自适应
+    // 间隔伸缩（被查看时 5s，平时 15s）。
+    let now = std::time::Instant::now();
+    let paths: Vec<PeerPathReport> = {
+        let mut baseline = shared.hb_rate_baseline.lock().unwrap();
+        let (dt, prev_map) = match baseline.as_ref() {
+            Some((at, map)) => (Some(now - *at), map.clone()),
+            None => (None, HashMap::new()),
+        };
+        let mut next_map: HbRateMap = HashMap::new();
+        let paths: Vec<PeerPathReport> = shared
+            .peers
+            .iter()
+            .filter_map(|p| {
+                let rtt = p.value().rtt_ms.load(Ordering::Relaxed);
+                if rtt < 0 {
+                    return None;
+                }
+                let dev = p.key().1;
+                let cur = (
+                    p.value().tx_bytes.load(Ordering::Relaxed),
+                    p.value().rx_bytes.load(Ordering::Relaxed),
+                );
+                let (tx_bps, rx_bps) = match dt {
+                    Some(dt) => rate_bps(prev_map.get(&dev).copied(), cur, dt),
+                    None => (None, None),
+                };
+                next_map.insert(dev, cur);
+                let path = p.value().path().as_str().to_string();
+                Some(PeerPathReport {
+                    device_id: dev.to_string(),
+                    path,
+                    rtt_ms: Some(rtt),
+                    tx_bps,
+                    rx_bps,
+                })
             })
-        })
-        .collect();
+            .collect();
+        // 整体替换基线：对端消失（rtt<0 不上报）随之清理，回来后首窗无速率。
+        *baseline = Some((now, next_map));
+        paths
+    };
     let mode_val = *shared.runtime_mode.lock().unwrap();
     let tcp_port = shared.tcp_listen_port.load(Ordering::Relaxed);
     let req = HeartbeatRequest {
@@ -1465,6 +1537,20 @@ async fn heartbeat_tick(shared: &Arc<EngineShared>) {
         Some(resp) => {
             if let Some(ep) = resp.observed_udp_endpoint {
                 *shared.observed_endpoint.lock().unwrap() = Some(ep);
+            }
+            // 应用服务端的间隔建议（声明式，每次心跳重发）；仅档位变化
+            // 时记一条日志，避免每拍刷屏。
+            let want = resp
+                .heartbeat_secs
+                .clamp(
+                    skiff_core::consts::HEARTBEAT_MIN_SECS,
+                    skiff_core::consts::HEARTBEAT_MAX_SECS,
+                );
+            let was = shared.heartbeat_secs.swap(want, Ordering::Relaxed);
+            if was != want {
+                (shared.log)(&format!(
+                    "心跳间隔 {was}s → {want}s（服务端建议，管理页查看时快档）"
+                ));
             }
         }
         None => {
@@ -1811,6 +1897,34 @@ mod tests {
         assert_eq!(
             effective_mode_of(&settings_with_mode(None)),
             ClientMode::Proxy
+        );
+    }
+
+    /// 心跳速率差分：窗口数学与三重守护（无基线/窗口过短/计数回退）。
+    #[test]
+    fn rate_bps_math_and_guards() {
+        use std::time::Duration;
+        let dt5 = Duration::from_secs(5);
+        // 无基线（首个窗口）→ 两侧缺省。
+        assert_eq!(rate_bps(None, (100, 200), dt5), (None, None));
+        // 5s 窗口 500B/1000B → 100/200 B/s；零增量侧为 Some(0)。
+        assert_eq!(
+            rate_bps(Some((1000, 2000)), (1500, 3000), dt5),
+            (Some(100), Some(200))
+        );
+        assert_eq!(
+            rate_bps(Some((100, 100)), (100, 100), dt5),
+            (Some(0), Some(0))
+        );
+        // 窗口 <1s（相邻心跳贴得过近）→ 缺省，不除以近零时长。
+        assert_eq!(
+            rate_bps(Some((0, 0)), (10, 10), Duration::from_millis(999)),
+            (None, None)
+        );
+        // 单侧计数回退：仅该侧缺省，另一侧照常计算。
+        assert_eq!(
+            rate_bps(Some((100, 100)), (50, 200), dt5),
+            (None, Some(20))
         );
     }
 }

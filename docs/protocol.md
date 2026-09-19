@@ -125,7 +125,7 @@ ERROR(4):    [msgLen u8][msg utf-8]（截断 200B）
 | `GET /api/peers` | 对端列表；`udpEndpoints[0]` **必须是中继观测端点**（客户端邻近端口探测依赖此顺序） |
 | `GET /api/memberships` | 本设备的网络成员名单（**服务端权威**，节点启动名单的唯一来源；节点文件 networks[] 仅作缓存） |
 | `GET /api/settings` | 本设备的服务端托管配置（DeviceSettings；revision 驱动幂等应用，字段缺省=未托管） |
-| `POST /api/heartbeat` | 上报本地地址与监听端口（服务器清洗：仅 IPv4、去重、≤8 个；端口 1–65535；paths ≤64）；附 `settingsRevision`/`restartPending` 上报配置收敛状态（appliedRevision 追平当前 revision 时服务端固化 last_good 并清错误）；返回中继观测地址 |
+| `POST /api/heartbeat` | 上报本地地址与监听端口（服务器清洗：仅 IPv4、去重、≤8 个；端口 1–65535；paths ≤64）；附 `settingsRevision`/`restartPending` 上报配置收敛状态（appliedRevision 追平当前 revision 时服务端固化 last_good 并清错误）；返回中继观测地址 + `heartbeatSecs`（自适应间隔建议：近期有管理端轮询 /admin/devices 时 5s，否则 15s；节点钳制 5–60s）。paths 各项含可选 `txBps`/`rxBps`——相邻心跳窗口内对端收发速率（密文整帧字节口径，含探测帧与加密开销；首窗/窗口 <1s 缺省） |
 | `POST /api/settings/fail` | worker 以新配置启动失败上报 `{revision, error}`：匹配当前 revision 则自动回滚到 last_good 并重推；过期/重复忽略 |
 | `POST /api/join` | 已注册设备用注册令牌加入**另一个**网络（幂等：已在网络则返回现 IP） |
 | `POST /api/leave` | 设备移除自己在某网络的成员关系（禁止移除最后一个网络） |

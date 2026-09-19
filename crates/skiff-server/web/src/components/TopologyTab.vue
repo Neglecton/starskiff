@@ -328,8 +328,10 @@ function applyFocus(sink, edge, entry) {
 
 function edgeTooltip(e) {
   const nameOf = (id) => nodeById.value.get(id)?.name || id;
+  const speed = (r) =>
+    r && (r.txBps != null || r.rxBps != null) ? ` · ↑${fmtBps(r.txBps)} ↓${fmtBps(r.rxBps)}` : '';
   const fmt = (r) =>
-    r ? `${r.path}${typeof r.rttMs === 'number' ? ` · ${r.rttMs}ms` : ''}` : t('topology.noReport');
+    r ? `${r.path}${typeof r.rttMs === 'number' ? ` · ${r.rttMs}ms` : ''}${speed(r)}` : t('topology.noReport');
   return `${nameOf(e.aId)} → ${nameOf(e.bId)}: ${fmt(e.aReport)}\n${nameOf(e.bId)} → ${nameOf(e.aId)}: ${fmt(e.bReport)}`;
 }
 
@@ -346,17 +348,35 @@ const focusRows = computed(() => {
     if (e.aId !== selectedId.value && e.bId !== selectedId.value) continue;
     const otherId = e.aId === selectedId.value ? e.bId : e.aId;
     const other = nodeById.value.get(otherId);
+    // 速率取选中节点自己方向的报告（该节点视角到对端的收发）。
+    const my = e.aId === selectedId.value ? e.aReport : e.bReport;
     rows.push({
       name: other?.name || String(otherId),
       ip: other?.ip || '',
       path: e.path,
       rtt: e.rtt,
       online: other?.online,
+      txBps: my?.txBps ?? null,
+      rxBps: my?.rxBps ?? null,
     });
   }
   rows.sort((x, y) => (x.rtt ?? 1e9) - (y.rtt ?? 1e9));
   return rows;
 });
+
+// Bytes/sec → human readable（B/s → KB/s → MB/s，一位小数；null → 占位）。
+function fmtBps(v) {
+  if (v == null) return '—';
+  if (v < 1024) return `${v}B/s`;
+  if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)}KB/s`;
+  if (v < 1024 * 1024 * 1024) return `${(v / 1024 / 1024).toFixed(1)}MB/s`;
+  return `${(v / 1024 / 1024 / 1024).toFixed(1)}GB/s`;
+}
+
+function fmtSpeed(row) {
+  if (row.txBps == null && row.rxBps == null) return '—';
+  return `↑ ${fmtBps(row.txBps)} · ↓ ${fmtBps(row.rxBps)}`;
+}
 
 // ---------------------------------------------------------------------------
 // Lifecycle
@@ -473,7 +493,10 @@ onBeforeUnmount(() => {
           <n-tag size="small" :bordered="false" :type="row.path.startsWith('Direct') ? 'success' : 'warning'">
             {{ row.path }}
           </n-tag>
-          <span class="mono muted" style="margin-left: auto">{{ row.rtt !== null ? row.rtt + 'ms' : '—' }}</span>
+          <span class="row-metrics">
+            <span class="mono muted">{{ fmtSpeed(row) }}</span>
+            <span class="mono muted">{{ row.rtt !== null ? row.rtt + 'ms' : '—' }}</span>
+          </span>
         </div>
         <div v-if="!focusRows.length" class="muted" style="padding: 8px 2px">{{ t('topology.noPaths') }}</div>
       </div>
@@ -598,7 +621,7 @@ onBeforeUnmount(() => {
   position: absolute;
   top: 12px;
   right: 12px;
-  width: min(320px, calc(100% - 24px));
+  width: min(340px, calc(100% - 24px));
   max-height: calc(100% - 24px);
   overflow: auto;
   box-sizing: border-box;
@@ -622,6 +645,17 @@ onBeforeUnmount(() => {
   padding: 6px 0;
   border-bottom: 1px dashed var(--sk-border);
   font-size: 12px;
+  /* 面板窄（≤340px）：名称/IP/标签 + 指标组放不下时整组换行。 */
+  flex-wrap: wrap;
+}
+
+/* 速率 + RTT 作为一组靠右；行宽不足时整组换到下一行右对齐。 */
+.row-metrics {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  white-space: nowrap;
 }
 
 .topo-panel-row:last-child { border-bottom: none; }

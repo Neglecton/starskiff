@@ -26,6 +26,9 @@ const deviceId = ref(null);
 const loading = ref(false);
 const saving = ref(false);
 const acting = ref(false);
+// memberships 的 IP 行内编辑草稿（networkId → 值）。独立于 devices 数据：
+// pollStatus/load 重拉设备列表时未提交的输入不丢失。
+const ipDrafts = ref({});
 const allNetworks = ref([]);
 const joinNet = ref(null);
 const joinIp = ref('');
@@ -186,6 +189,30 @@ function leaveNetwork(net) {
       }
     },
   });
+}
+
+/// 修改已加入网络的节点 IP（IP 配置统一在本页；设备页仅展示）。
+/// 409 冲突（IP 已被占用）等服务端中文错误经 e.message 直出。
+function draftIpOf(net) {
+  return (ipDrafts.value[net.networkId] ?? '').trim();
+}
+
+async function saveIp(net) {
+  if (!deviceId.value || acting.value) return;
+  const ip = draftIpOf(net);
+  if (!ip || ip === net.ip) return;
+  acting.value = true;
+  try {
+    await api('POST', `/admin/networks/${net.networkId}/devices/${deviceId.value}/ip`, { ip });
+    message.success(t('settings.ipUpdated'));
+    delete ipDrafts.value[net.networkId];
+    await load();
+    pollStatus(2);
+  } catch (e) {
+    message.error(e.message);
+  } finally {
+    acting.value = false;
+  }
 }
 
 async function loadSettings() {
@@ -477,8 +504,24 @@ onMounted(load);
           <div v-for="net in networkList" :key="net.networkId" class="sheet-row">
             <span>{{ net.networkName }}</span>
             <span class="mono">{{ cidrOf(net.networkId) }}</span>
-            <span class="mono">{{ net.ip }}</span>
+            <n-input
+              size="small"
+              :value="ipDrafts[net.networkId] ?? net.ip"
+              :placeholder="t('settings.changeIpPh')"
+              @update:value="(v) => (ipDrafts[net.networkId] = v)"
+              @keyup.enter="saveIp(net)"
+            />
             <span class="sheet-actions">
+              <n-button
+                size="tiny"
+                tertiary
+                type="primary"
+                :disabled="!draftIpOf(net) || draftIpOf(net) === net.ip"
+                :loading="acting"
+                @click="saveIp(net)"
+              >
+                {{ t('settings.saveIp') }}
+              </n-button>
               <n-button size="tiny" secondary :loading="acting" @click="leaveNetwork(net)">
                 <template #icon><NIcon><TrashOutline /></NIcon></template>
                 {{ t('settings.leave') }}
@@ -869,7 +912,7 @@ onMounted(load);
 .sheet-head,
 .sheet-row {
   display: grid;
-  grid-template-columns: 1.2fr 1fr 1fr 120px;
+  grid-template-columns: 1.2fr 1fr 1fr 150px;
   gap: 12px;
   align-items: center;
 }
@@ -899,6 +942,7 @@ onMounted(load);
 .sheet-actions {
   display: flex;
   justify-content: flex-end;
+  gap: 6px;
 }
 
 .join-row {

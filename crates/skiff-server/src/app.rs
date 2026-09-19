@@ -4,6 +4,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -67,6 +68,10 @@ pub struct AppState {
     pub started_ms: i64,
     pub log: LogFn,
     pub cert_fingerprint: Option<String>,
+    /// 最近一次管理端轮询 /admin/devices 的时间（unix ms）——"有人在看
+    /// 管理页"的判定依据：心跳据此建议节点把间隔切到快档（拓扑/速率
+    /// 展示更跟手），超时无人查看回落常态档。内存态，重启即回到常态档。
+    pub last_admin_observe_ms: AtomicU64,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -149,6 +154,7 @@ pub async fn start(opts: ServerOptions) -> anyhow::Result<RunningServer> {
         started_ms: unix_ms(),
         log: opts.log.clone(),
         cert_fingerprint: fingerprint.clone(),
+        last_admin_observe_ms: AtomicU64::new(0),
     });
 
     // Presence -> WS broadcast sidecar.
@@ -647,8 +653,21 @@ async fn heartbeat(State(state): State<SharedState>, req: Request<Body>) -> Resp
     if let Some(applied) = hb.settings_revision {
         let _ = state.repo.mark_settings_applied(device.id, applied);
     }
+    // 自适应心跳间隔：近期有管理端轮询 /admin/devices（有人在看管理页）
+    // → 建议快档，否则常态档。PRESENCE_TIMEOUT 是固定常量、与心跳频率
+    // 无关，快档不会收紧在线判定。建议随每次心跳响应重发（声明式），
+    // 观察结束/服务端重启后节点在一个周期内自然回落。
+    let last_observe = state.last_admin_observe_ms.load(Ordering::Relaxed) as i64;
+    let since_observe = unix_ms() - last_observe;
+    let observed = (0..=skiff_core::consts::ADMIN_OBSERVER_TTL_MS).contains(&since_observe);
+    let heartbeat_secs = if observed {
+        skiff_core::consts::HEARTBEAT_FAST_SECS
+    } else {
+        skiff_core::consts::HEARTBEAT_SLOW_SECS
+    };
     Json(HeartbeatResponse {
         observed_udp_endpoint: state.presence.observed_endpoint(device.id),
+        heartbeat_secs,
     })
     .into_response()
 }
@@ -1407,6 +1426,12 @@ async fn admin_list_devices(State(state): State<SharedState>, req: Request<Body>
     if !state.auth_admin(&req) {
         return err(StatusCode::UNAUTHORIZED, "鉴权失败：请检查管理员令牌");
     }
+    // "有人在看管理页"信号：拓扑页自动刷新每 5s 轮询本端点，命中即让
+    // 心跳建议切快档（见 heartbeat handler）。需管理员令牌，只有授权
+    // 查看者能触发。
+    state
+        .last_admin_observe_ms
+        .store(unix_ms() as u64, Ordering::Relaxed);
     let devices = state.repo.list_devices().unwrap_or_default();
     let all_members = state.repo.all_memberships().unwrap_or_default();
     let out: Vec<AdminDevice> = devices

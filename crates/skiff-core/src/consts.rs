@@ -15,6 +15,17 @@ pub const DEFAULT_MTU: u32 = 1300;
 
 /// Presence: a peer is online if seen (WS connected or refreshed) within this window.
 pub const PRESENCE_TIMEOUT: Duration = Duration::from_secs(45);
+/// 心跳间隔（常态档）。自适应：服务端在心跳响应里下发当期间隔——
+/// 管理页正被查看（轮询 /admin/devices）时建议快档，无人查看回落常态档。
+pub const HEARTBEAT_SLOW_SECS: u32 = 15;
+/// 心跳间隔（被查看时的快档）：拓扑/速率展示更跟手，速率差分窗口随之变 5s。
+pub const HEARTBEAT_FAST_SECS: u32 = 5;
+/// 节点对服务端建议间隔的钳制下限（防异常值把节点打成高频轮询）。
+pub const HEARTBEAT_MIN_SECS: u32 = 5;
+/// 节点对服务端建议间隔的钳制上限。
+pub const HEARTBEAT_MAX_SECS: u32 = 60;
+/// 服务端"正在被查看"判定窗口：管理页 5s 轮询一次，超过 12s 未命中视为无人查看。
+pub const ADMIN_OBSERVER_TTL_MS: i64 = 12_000;
 /// Target re-registration cadence for the UDP relay.
 pub const RELAY_REGISTER_INTERVAL: Duration = Duration::from_secs(25);
 /// Path keep-alive ping interval.
