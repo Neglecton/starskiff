@@ -118,10 +118,7 @@ impl TestHarness {
         // 瘦配置：网络成员与行为配置由服务端权威下发，文件不落。
         let cfg = NodeConfig {
             server: self.base_url(),
-            mode: skiff_core::models::ClientMode::Proxy,
-            mtu: resp["mtu"].as_u64().unwrap_or(1300) as u32,
             data_dir: data_dir.to_string_lossy().into_owned(),
-            listen: vec!["udp://0.0.0.0:0".to_string()],
             log_file: None,
             identity: Identity {
                 device_id: resp["deviceId"].as_u64().unwrap(),
@@ -234,10 +231,7 @@ impl TestHarness {
         std::fs::create_dir_all(&data_dir).unwrap();
         let cfg = NodeConfig {
             server: self.base_url(),
-            mode: skiff_core::models::ClientMode::Proxy,
-            mtu: resp["mtu"].as_u64().unwrap_or(1300) as u32,
             data_dir: data_dir.to_string_lossy().into_owned(),
-            listen: vec!["udp://0.0.0.0:0".to_string()],
             log_file: None,
             identity: Identity {
                 device_id: resp["deviceId"].as_u64().unwrap(),

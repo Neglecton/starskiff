@@ -534,7 +534,7 @@ onBeforeUnmount(() => {
 .topo-body {
   position: relative;
   border: 1px solid var(--sk-border);
-  border-radius: 12px;
+  border-radius: var(--sk-radius);
   background:
     radial-gradient(circle at 1px 1px, var(--sk-topology-grid) 1px, transparent 0) 0 0 / 22px 22px,
     var(--sk-surface);
@@ -591,7 +591,7 @@ onBeforeUnmount(() => {
 
 .topo-node.selected circle {
   stroke-width: 3.5;
-  filter: drop-shadow(0 0 4px rgba(37, 99, 235, 0.6));
+  filter: drop-shadow(0 0 4px rgba(30, 41, 59, 0.35));
 }
 
 .topo-panel {

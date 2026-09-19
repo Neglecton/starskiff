@@ -124,22 +124,6 @@ impl ControlClient {
 
     /// 把遗留本地配置值收编为服务端托管（仅填充未托管字段；返回合并
     /// 后的最新配置）。
-    pub async fn adopt_settings(&self, candidate: &DeviceSettings) -> Option<DeviceSettings> {
-        let resp = self
-            .http
-            .put(self.url("/api/settings"))
-            .bearer_auth(&self.device_token)
-            .json(candidate)
-            .send()
-            .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        resp.json().await.ok()
-    }
-
-    /// 拉取服务端权威的网络成员名单（节点启动名单的唯一来源）。
     pub async fn get_memberships(&self) -> Option<Vec<MembershipInfo>> {
         let resp = self
             .http

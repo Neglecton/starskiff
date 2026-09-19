@@ -158,8 +158,8 @@ onMounted(load);
 </script>
 
 <template>
-  <div>
-    <n-form class="form-toolbar token-toolbar" inline label-placement="top" @submit.prevent="generate">
+  <div class="panel-card">
+    <n-form class="form-toolbar token-toolbar" label-placement="top" @submit.prevent="generate">
       <n-form-item class="token-field token-network" :label="$t('tabs.networks')">
         <n-select v-model:value="form.network" :options="networks" />
       </n-form-item>
@@ -216,6 +216,10 @@ onMounted(load);
 </template>
 
 <style scoped>
+.form-action {
+  margin-left: auto;
+}
+
 .token-field {
   margin-bottom: 0;
 }

@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::secret::Secret;
 
-use crate::consts::DEFAULT_MTU;
 
 /// 16-byte opaque network identifier. Serialized as 32 lowercase hex chars.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -567,31 +566,23 @@ pub struct Identity {
     pub server_cert_pin: Option<String>,
 }
 
-/// starskiff.json —— 瘦节点配置：连接信息 + 本机部署参数 + 身份。
-/// 一切网络行为配置（成员关系/exposes/socks/forwards/force 开关/托管
-/// mtu）均由服务端权威下发（GET /api/memberships + GET /api/settings），
-/// 启动时拉取应用，不在文件持久化；遗留文件中的旧字段在加载时忽略、
-/// 首次启动自动收编为服务端托管值。
+/// starskiff.json —— 终态瘦节点配置：连接信息 + 本机部署参数 + 身份。
+/// **除 server/identity 外的一切配置（mode/mtu/listen/socks/forwards/
+/// exposes/路径策略/成员关系）均由服务端权威下发**（GET /api/memberships
+/// 与 GET /api/settings），启动时拉取应用，不在文件持久化。
+/// dataDir 与 logFile 是本机部署参数（决定 stop.flag/日志/状态文件位置，
+/// master 进程在拉取服务端配置之前就需要它们），保留在文件。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeConfig {
     #[serde(default)]
     pub server: String,
-    #[serde(default = "default_mode")]
-    pub mode: ClientMode,
-    /// 本机参数语义：TUN 设备的默认 MTU（服务端托管值可覆盖，重启生效）。
-    #[serde(default = "default_mtu")]
-    pub mtu: u32,
+    /// 数据目录（空串 = 默认目录：Windows %APPDATA%/Starskiff、
+    /// Linux ~/.config/starskiff）。本机参数，不进服务端托管。
     #[serde(default)]
     pub data_dir: String,
-    /// 监听地址列表（URL 形式，可绑定指定网卡/IPv6，每协议可多条）：
-    /// `"udp://0.0.0.0:24933"` / `"tcp://[::]:24933"` / `"udp://192.168.1.5:24934"`。
-    /// 端口 0 = 随机。通配地址绑定失败沿用容错（UDP 回退随机/TCP 跳过），
-    /// 指定 IP 绑定失败为致命错误。服务端托管值（DeviceSettings.listen）
-    /// 可覆盖本列表（重启生效）。旧的 listenUdpPort/listenTcpPort 数字
-    /// 字段已废弃，加载时忽略。
-    #[serde(default = "default_listen")]
-    pub listen: Vec<String>,
+    /// 日志文件路径（None = service 场景落 dataDir/service.log，前台仅
+    /// 控制台）。本机参数，不进服务端托管。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_file: Option<String>,
     pub identity: Identity,
@@ -618,11 +609,9 @@ impl NodeConfig {
     }
 }
 
-fn default_mtu() -> u32 {
-    DEFAULT_MTU
-}
-
-fn default_listen() -> Vec<String> {
+/// 监听地址的编译期默认（DeviceSettings.listen 未下发时的回退值；
+/// 曾是 NodeConfig.listen 的字段默认，裁剪后仍作为托管缺省值存在）。
+pub fn default_listen() -> Vec<String> {
     let p = crate::consts::DEFAULT_LISTEN_PORT;
     vec![format!("udp://0.0.0.0:{p}"), format!("tcp://0.0.0.0:{p}")]
 }
@@ -647,10 +636,6 @@ pub fn parse_listen_url(s: &str) -> Result<(ListenProto, std::net::SocketAddr), 
 pub enum ListenProto {
     Tcp,
     Udp,
-}
-
-fn default_mode() -> ClientMode {
-    ClientMode::Proxy
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -906,19 +891,17 @@ mod tests {
         assert!(parse_listen_url("0.0.0.0:24933").is_err());
         assert!(parse_listen_url("sctp://0.0.0.0:24933").is_err());
         assert!(parse_listen_url("udp://[::]:notaport").is_err());
-        // NodeConfig 默认 listen 数组 + 旧数字字段忽略。
+        // NodeConfig 已无 listen 字段：旧键（数字/URL 数组）加载时忽略；
+        // 未托管回退值由 default_listen() 提供（DeviceSettings 侧消费）。
         let cfg: NodeConfig = serde_json::from_str(
-            r#"{"server":"http://x","listenUdpPort":12345,"identity":{"deviceId":1,"name":"n","deviceToken":"t","signPublicKey":"a","signPrivateKey":"b","dhPublicKey":"c","dhPrivateKey":"d"}}"#,
+            r#"{"server":"http://x","listenUdpPort":12345,"listen":["udp://127.0.0.1:1"],"identity":{"deviceId":1,"name":"n","deviceToken":"t","signPublicKey":"a","signPrivateKey":"b","dhPublicKey":"c","dhPrivateKey":"d"}}"#,
         )
         .unwrap();
-        assert_eq!(cfg.listen.len(), 2);
-        assert!(cfg.listen[0].starts_with("udp://0.0.0.0:"));
-        assert!(cfg.listen[1].starts_with("tcp://0.0.0.0:"));
-        let cfg: NodeConfig = serde_json::from_str(
-            r#"{"server":"http://x","listen":["udp://127.0.0.1:1"],"identity":{"deviceId":1,"name":"n","deviceToken":"t","signPublicKey":"a","signPrivateKey":"b","dhPublicKey":"c","dhPrivateKey":"d"}}"#,
-        )
-        .unwrap();
-        assert_eq!(cfg.listen, vec!["udp://127.0.0.1:1".to_string()]);
+        assert!(cfg.validate().is_ok());
+        let def = default_listen();
+        assert_eq!(def.len(), 2);
+        assert!(def[0].starts_with("udp://0.0.0.0:"));
+        assert!(def[1].starts_with("tcp://0.0.0.0:"));
     }
 
     #[test]
@@ -927,9 +910,6 @@ mod tests {
             r#"{"server":"http://127.0.0.1:24930","identity":{"deviceId":7,"name":"n","deviceToken":"skd_t","signPublicKey":"aa","signPrivateKey":"bb","dhPublicKey":"cc","dhPrivateKey":"dd"}}"#,
         )
         .unwrap();
-        assert_eq!(cfg.mode, ClientMode::Proxy);
-        assert_eq!(cfg.listen.len(), 2);
-        assert_eq!(cfg.mtu, 1300);
         assert!(cfg.validate().is_ok());
 
         // 遗留字段（networks/socks/forwards/force）在加载时被忽略——

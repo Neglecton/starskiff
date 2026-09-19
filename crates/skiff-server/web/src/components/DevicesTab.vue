@@ -55,7 +55,7 @@ function pathsCell(row, nameById) {
     const direct = p.path.startsWith('Direct');
     return h('div', { class: 'path-cell', key: p.deviceId }, [
       h('span', { class: 'mono' }, nameById.get(p.deviceId) || p.deviceId),
-      h('span', { class: 'path-dot', style: `background: ${direct ? '#059669' : '#D97706'}` }),
+      h('span', { class: ['path-dot', direct ? 'direct' : 'relay'] }),
       h('span', { style: 'opacity: .55; font-size: 12px' }, `${p.path} · ${direct ? t('devices.direct') : t('devices.relay')}`),
     ]);
   });
@@ -162,6 +162,7 @@ onMounted(load);
 </script>
 
 <template>
+  <div class="panel-card">
     <n-data-table
       :columns="columns"
       :data="rows"
@@ -175,4 +176,5 @@ onMounted(load);
         <div class="table-empty">{{ $t('devices.empty') }}</div>
       </template>
     </n-data-table>
+  </div>
 </template>

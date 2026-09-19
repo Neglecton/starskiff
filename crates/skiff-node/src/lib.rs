@@ -197,12 +197,11 @@ pub async fn start_engine(config_path: PathBuf, cfg: NodeConfig, log: LogFn) -> 
         cfg.identity.server_cert_pin.as_deref(),
     );
     let settings = engine::bootstrap_settings_pub(&control, &config_path, &log).await;
-    let effective_mode = engine::effective_mode_of(&settings, &cfg);
-    let file_mtu = cfg.mtu;
+    let effective_mode = engine::effective_mode_of(&settings);
 
     let (data_sink, outbound_rx): (DataSink, Option<tokio::sync::mpsc::Receiver<Vec<u8>>>) = if effective_mode == ClientMode::Tun {
         let (ip, cidr, _) = tun_first_network(&control, &log).await?;
-        let mtu = settings.mtu.unwrap_or(file_mtu);
+        let mtu = settings.mtu.unwrap_or(skiff_core::consts::DEFAULT_MTU);
         let (device, rx) = tun::TunDevice::start(ip, cidr, mtu, log.clone())?;
         let device = Arc::new(device);
         let sink: DataSink = Box::new(move |packet: &[u8]| device.write_packet(packet));

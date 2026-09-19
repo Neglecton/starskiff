@@ -145,7 +145,7 @@ ERROR(4):    [msgLen u8][msg utf-8]（截断 200B）
 
 **监听地址（listen）**：URL 数组，每协议可多条、可绑定指定网卡与 IPv6（`udp://0.0.0.0:24933` / `tcp://[::]:24933` / `udp://192.168.1.5:24934`；端口 0=随机）。通配地址绑定失败沿用容错（UDP 回退随机端口/TCP 跳过——多节点同机依赖）；**指定 IP 绑定失败为致命错误**，走失败上报→回滚。UdpMesh 多 socket：primary（首项）承担中继注册/默认发送；PONG 沿到达 socket 回复、直连数据经学习端点时的同一 socket 发送（NAT 映射一致）；探测从全部 UDP socket 喷射。**mode=tun 需管理员/root**（无权限时启动失败自动回滚并显示原因；服务端预检拒绝多网络成员设备的 tun 下发）。
 
-推送为 at-most-once：节点在收到 `settings_changed` 与每次 WS `connected` 时自拉，`revision` 单调递增做幂等去重（多网络节点多连接重复投递安全）。`PUT /api/settings`（设备令牌鉴权）为**收编**端点：仅用请求值填充当前未托管的字段（字段级合并、已托管字段不可被节点覆盖、无可收编项不递增 revision），用于旧版文件遗留行为值的零感迁移。
+推送为 at-most-once：节点在收到 `settings_changed` 与每次 WS `connected` 时自拉，`revision` 单调递增做幂等去重（多网络节点多连接重复投递安全）。配置全托管：`GET /api/settings` 为节点唯一配置来源（未下发字段回退编译期默认值），节点侧不提供写端点。
 
 #### 路径策略（PathPolicy）
 

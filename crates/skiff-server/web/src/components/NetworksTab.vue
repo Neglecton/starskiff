@@ -90,8 +90,8 @@ onMounted(load);
 </script>
 
 <template>
-  <div>
-    <n-form class="form-toolbar" inline label-placement="top" @submit.prevent="create">
+  <div class="panel-card">
+    <n-form class="form-toolbar" label-placement="top" @submit.prevent="create">
       <n-form-item class="form-field" :label="$t('networks.name')">
         <n-input v-model:value="form.name" :placeholder="$t('networks.namePh')" @keyup.enter="create" />
       </n-form-item>

@@ -282,66 +282,6 @@ impl Repo {
         Ok(Some(rolled))
     }
 
-    /// 收编（adopt）：仅用候选值填充**当前未托管**的字段（字段级合并），
-    /// 已托管字段保持服务端值不动。用于节点把遗留本地配置零感迁移为
-    /// 服务端托管。返回合并后的最新配置。
-    pub fn adopt_device_settings(
-        &self,
-        device_id: u64,
-        candidate: &DeviceSettings,
-    ) -> Result<DeviceSettings, RepoError> {
-        // 读-合并-写单事务 + revision 守卫（AGENTS #22/#23）：跨两次加锁的
-        // 读判写窗口内，并发管理员 PUT 的新版本会被基于过期基线的合并
-        // 静默覆盖（管理员刚解除托管的字段被节点收编值改回去）。守卫 0
-        // 行命中即放弃本次收编——幂等，节点下次启动重试。
-        let outcome: Option<(DeviceSettings, i64)> = self.db.with_tx(|tx| -> Result<Option<(DeviceSettings, i64)>, RepoError> {
-            let row = tx
-                .query_row(
-                    "SELECT revision, json FROM device_settings WHERE device_id = ?1",
-                    params![device_id as i64],
-                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-                )
-                .optional()?;
-            let (current, base_rev) = match row {
-                Some((rev, json)) => {
-                    let mut s: DeviceSettings = serde_json::from_str(&json)
-                        .map_err(|e| RepoError::Conflict(format!("device_settings JSON 无效: {e}")))?;
-                    s.revision = rev; // 列是 revision 的权威来源
-                    (s, rev)
-                }
-                None => (DeviceSettings::default(), 0),
-            };
-            let merged = adopt_merge(&current, candidate);
-            if merged == current {
-                return Ok(None); // 无可收编项：不产生新 revision
-            }
-            let mut stored = merged.clone();
-            stored.revision = 0; // json 内不存 revision，列权威（同 set_device_settings）
-            let json = serde_json::to_string(&stored)
-                .map_err(|e| RepoError::Conflict(format!("序列化失败: {e}")))?;
-            let next = base_rev + 1;
-            let hit = tx.execute(
-                "INSERT INTO device_settings(device_id, revision, json, updated_at)
-                 VALUES(?1, ?2, ?3, ?4)
-                 ON CONFLICT(device_id) DO UPDATE SET
-                    revision = excluded.revision, json = excluded.json, updated_at = excluded.updated_at
-                 WHERE device_settings.revision = ?5",
-                params![device_id as i64, next, json, unix_ms(), base_rev],
-            )?;
-            if hit == 0 {
-                return Ok(None); // 并发已变更：守卫生效，放弃收编
-            }
-            Ok(Some((merged, next)))
-        })?;
-        match outcome {
-            Some((mut merged, next)) => {
-                merged.revision = next;
-                Ok(merged)
-            }
-            None => self.get_device_settings(device_id),
-        }
-    }
-
     /// 保存托管配置：事务内 revision+1 后整体覆盖，返回落库后的值。
     pub fn set_device_settings(
         &self,
@@ -989,46 +929,6 @@ impl Repo {
     }
 }
 
-/// adopt 的纯合并逻辑（收编只填**未托管**字段；提取为自由函数便于单测）。
-fn adopt_merge(current: &DeviceSettings, candidate: &DeviceSettings) -> DeviceSettings {
-    let mut merged = current.clone();
-    if merged.path_policy.is_none() {
-        merged.path_policy = candidate.path_policy;
-    }
-    if merged.peer_policies.is_none() {
-        merged.peer_policies = candidate.peer_policies.clone();
-    } else if let Some(cur) = &mut merged.peer_policies
-        && let Some(cand) = &candidate.peer_policies
-    {
-        for pp in cand {
-            if !cur.iter().any(|x| x.device_id == pp.device_id) {
-                cur.push(pp.clone());
-            }
-        }
-    }
-    if merged.mtu.is_none() {
-        merged.mtu = candidate.mtu;
-    }
-    if merged.socks_listen.is_none() {
-        merged.socks_listen = candidate.socks_listen.clone();
-    }
-    if merged.forwards.is_none() {
-        merged.forwards = candidate.forwards.clone();
-    }
-    if merged.exposes.is_none() {
-        merged.exposes = candidate.exposes.clone();
-    } else if let Some(cur) = &mut merged.exposes
-        && let Some(cand) = &candidate.exposes
-    {
-        for ne in cand {
-            if !cur.iter().any(|x| x.network_id == ne.network_id) {
-                cur.push(ne.clone());
-            }
-        }
-    }
-    merged
-}
-
 /// 守卫式成员移除：单条条件 DELETE（成员数 > 1 才允许删）+ 事务内归因
 /// （不属于 / 最后一个）。并发 leave 同一设备的两个网络时，单连接 Mutex
 /// 串行化 + 守卫保证不会把成员关系删光（AGENTS #22）。
@@ -1258,37 +1158,6 @@ mod tests {
         // 合法地址成功。
         repo.set_membership_ip_atomic(net_a, dev, "10.20.0.77", &skiff_core::ipam::Cidr::parse("10.20.0.0/24").unwrap())
             .unwrap();
-    }
-
-    /// adopt：已托管字段不被收编覆盖（管理员解除托管后节点的旧值不得被
-    /// 静默改回）；收编产生新 revision；无可收编项不动 revision。
-    #[test]
-    fn adopt_respects_managed_fields_and_revision() {
-        let repo = temp_repo();
-        let net = repo.create_network("adp", "10.30.0.0/24").unwrap();
-        let token = repo.create_token(net.id, 5, 86_400_000, None).unwrap();
-        let dev = repo
-            .enroll(&token.token, "adp-d", &"ab".repeat(32), &"cd".repeat(32), None)
-            .unwrap();
-        let managed = DeviceSettings {
-            socks_listen: Some("127.0.0.1:1999".into()),
-            ..DeviceSettings::default()
-        };
-        let saved = repo.set_device_settings(dev.device_id, &managed).unwrap();
-        assert_eq!(saved.revision, 1);
-        // 节点候选携带不同 socks：已托管字段必须保持服务端值。
-        let candidate = DeviceSettings {
-            socks_listen: Some("127.0.0.1:1".into()),
-            mtu: Some(1400),
-            ..DeviceSettings::default()
-        };
-        let merged = repo.adopt_device_settings(dev.device_id, &candidate).unwrap();
-        assert_eq!(merged.socks_listen, Some("127.0.0.1:1999".into()));
-        assert_eq!(merged.mtu, Some(1400), "未托管字段被收编");
-        assert_eq!(merged.revision, 2);
-        // 再次 adopt 相同候选：无新 revision。
-        let again = repo.adopt_device_settings(dev.device_id, &candidate).unwrap();
-        assert_eq!(again.revision, 2);
     }
 
     /// mark_settings_applied 的 revision 守卫：节点 applied=1 期间管理员

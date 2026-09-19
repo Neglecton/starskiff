@@ -1,6 +1,18 @@
 <script setup>
 import { computed, inject, onMounted, ref, watch } from 'vue';
-import { useDialog, useMessage } from 'naive-ui';
+import { NIcon, useDialog, useMessage } from 'naive-ui';
+import {
+  ArrowForwardOutline,
+  GitNetworkOutline,
+  GlobeOutline,
+  HardwareChipOutline,
+  PowerOutline,
+  RefreshOutline,
+  SaveOutline,
+  SettingsOutline,
+  TrashOutline,
+  WifiOutline,
+} from '@vicons/ionicons5';
 import { useI18n } from 'vue-i18n';
 import { api } from '../api';
 
@@ -14,32 +26,30 @@ const deviceId = ref(null);
 const loading = ref(false);
 const saving = ref(false);
 const acting = ref(false);
-// 网络成员管理：全部网络（join 下拉）与待提交的 join 参数。
 const allNetworks = ref([]);
 const joinNet = ref(null);
 const joinIp = ref('');
+const draftListen = ref('udp://0.0.0.0:');
+const draftForward = ref({ listen: '127.0.0.1:', proto: 'tcp', destHost: '', destPort: null });
 
-// 托管开关：未勾选 = 该项沿用节点本地配置（PUT 时省略字段）。
-const managed = ref({
-  pathPolicy: false,
-  peerPolicies: false,
-  mode: false,
-  listen: false,
-  mtu: false,
-  socks: false,
-  forwards: false,
-  exposes: {}, // networkId -> bool
-});
+// 全托管：无“是否托管”开关，保存即全量下发。未下发（null）字段在表单
+// 中以编译期默认值呈现。
+const DEFAULT_LISTEN = ['udp://0.0.0.0:24933', 'tcp://0.0.0.0:24933'];
+// 保存确认弹窗：可取消；内嵌“同步对端反向策略”勾选（按对端覆盖入口）。
+const showConfirm = ref(false);
+const syncReverse = ref(false);
 const form = ref({
   pathPolicy: 'auto',
-  peerPolicies: [], // { deviceId, policy }
+  peerPolicies: [],
   mode: 'proxy',
-  listen: [], // URL 字符串列表
+  listen: [],
   mtu: 1300,
   socksEnabled: true,
-  socksAddr: '127.0.0.1:1080',
-  forwards: [], // { listen, proto, dest }
-  exposes: {}, // networkId -> [{ port, proto, dest }]
+  socksHost: '127.0.0.1',
+  socksPort: 1080,
+  forwardsEnabled: true,
+  forwards: [],
+  exposes: {},
 });
 
 const modeOptions = computed(() => [
@@ -47,8 +57,33 @@ const modeOptions = computed(() => [
   { value: 'tun', label: t('settings.modeTun') },
 ]);
 
-function addListen() {
-  form.value.listen.push('udp://0.0.0.0:24933');
+const protoOptions = computed(() => [
+  { value: 'tcp', label: 'tcp' },
+  { value: 'udp', label: 'udp' },
+]);
+
+function splitHostPort(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return { host: '', port: null };
+  if (s.startsWith('[')) {
+    const end = s.indexOf(']');
+    if (end > 0) {
+      const host = s.slice(0, end + 1);
+      const rest = s.slice(end + 1);
+      const port = rest.startsWith(':') ? Number(rest.slice(1)) : null;
+      return { host, port: Number.isFinite(port) ? port : null };
+    }
+  }
+  const i = s.lastIndexOf(':');
+  if (i <= 0) return { host: s, port: null };
+  const port = Number(s.slice(i + 1));
+  return { host: s.slice(0, i), port: Number.isFinite(port) ? port : null };
+}
+
+function joinHostPort(host, port) {
+  const h = String(host || '').trim();
+  if (port == null || port === '') return h;
+  return `${h}:${port}`;
 }
 
 const deviceOptions = computed(() =>
@@ -59,7 +94,6 @@ const deviceOptions = computed(() =>
 );
 const current = computed(() => devices.value.find((d) => d.id === deviceId.value));
 
-// 配置收敛状态：期望 revision（服务端） vs 节点心跳上报的已应用 revision。
 const statusTag = computed(() => {
   const d = current.value;
   if (!d) return null;
@@ -76,24 +110,16 @@ const statusTag = computed(() => {
 });
 
 const networkList = computed(() => current.value?.networks ?? []);
+const cidrOf = (networkId) => allNetworks.value.find((n) => n.id === networkId)?.cidr || t('common.dash');
 
-// 路径策略六档（PathPolicy）与对端设备下拉（排除自己）。
 const policyOptions = computed(() =>
   ['auto', 'relayUdp', 'relayTcp', 'directAny', 'directUdp', 'directTcp'].map((v) => ({
     value: v,
     label: t(`settings.policy.${v}`),
   })),
 );
-const peerDeviceOptions = computed(() =>
-  devices.value.filter((d) => d.id !== deviceId.value).map((d) => ({ value: d.id, label: d.name })),
-);
 const nameOf = (id) => devices.value.find((d) => d.id === id)?.name || String(id);
 
-function addPeerPolicy() {
-  form.value.peerPolicies.push({ deviceId: null, policy: 'directTcp' });
-}
-
-// 可加入的网络 = 全部网络 - 已加入（按 id）。
 const joinOptions = computed(() => {
   const mine = new Set(networkList.value.map((n) => n.networkId));
   return allNetworks.value
@@ -105,10 +131,13 @@ async function load() {
   loading.value = true;
   try {
     devices.value = await api('GET', '/admin/devices');
+    allNetworks.value = await api('GET', '/admin/networks');
     if (deviceId.value && !devices.value.some((d) => d.id === deviceId.value)) {
       deviceId.value = null;
     }
-    allNetworks.value = await api('GET', '/admin/networks');
+    if (!deviceId.value && devices.value.length) {
+      deviceId.value = devices.value[0].id;
+    }
   } catch (e) {
     message.error(e.message);
   } finally {
@@ -164,56 +193,45 @@ async function loadSettings() {
   loading.value = true;
   try {
     const s = await api('GET', `/admin/devices/${deviceId.value}/settings`);
-    const m = {
-      pathPolicy: false,
-      peerPolicies: false,
-      mtu: false,
-      socks: false,
-      forwards: false,
+    const f = {
+      pathPolicy: 'auto',
+      peerPolicies: [],
+      mode: 'proxy',
+      listen: [...DEFAULT_LISTEN],
+      mtu: 1300,
+      socksEnabled: true,
+      socksHost: '127.0.0.1',
+      socksPort: 1080,
+      forwardsEnabled: false,
+      forwards: [],
       exposes: {},
     };
-    const f = { ...form.value, exposes: {}, peerPolicies: [], listen: [] };
-    if (s.mode != null) {
-      m.mode = true;
-      f.mode = s.mode;
-    }
-    if (s.listen != null) {
-      m.listen = true;
-      f.listen = s.listen.map((x) => String(x));
-    }
-    if (s.pathPolicy != null) {
-      m.pathPolicy = true;
-      f.pathPolicy = s.pathPolicy;
-    }
-    if (s.peerPolicies != null) {
-      m.peerPolicies = true;
-      f.peerPolicies = s.peerPolicies.map((x) => ({ ...x }));
-    }
-    if (s.mtu != null) {
-      m.mtu = true;
-      f.mtu = s.mtu;
-    }
+    f.mode = s.mode || 'proxy';
+    if (s.listen != null && s.listen.length) f.listen = s.listen.map((x) => String(x));
+    if (s.pathPolicy != null) f.pathPolicy = s.pathPolicy;
+    if (s.peerPolicies != null) f.peerPolicies = s.peerPolicies.map((x) => ({ ...x }));
+    if (s.mtu != null) f.mtu = s.mtu;
     if (s.socksListen != null) {
-      m.socks = true;
       f.socksEnabled = s.socksListen !== '';
-      f.socksAddr = s.socksListen || '127.0.0.1:1080';
+      const parsed = splitHostPort(s.socksListen || '127.0.0.1:1080');
+      f.socksHost = parsed.host || '127.0.0.1';
+      f.socksPort = parsed.port ?? 1080;
     }
     if (s.forwards != null) {
-      m.forwards = true;
-      f.forwards = s.forwards.map((x) => ({ ...x }));
+      f.forwardsEnabled = s.forwards.length > 0;
+      f.forwards = s.forwards.map((x) => {
+        const dest = splitHostPort(x.dest);
+        return {
+          listen: String(x.listen || ''),
+          proto: x.proto || 'tcp',
+          destHost: dest.host,
+          destPort: dest.port,
+        };
+      });
     }
-    for (const ne of s.exposes ?? []) {
-      m.exposes[ne.networkId] = true;
-      f.exposes[ne.networkId] = ne.rules.map((r) => ({ ...r }));
-    }
-    // 设备所属但未托管的网络初始化为空规则集。
-    for (const net of networkList.value) {
-      if (!(net.networkId in m.exposes)) {
-        m.exposes[net.networkId] = false;
-        f.exposes[net.networkId] = [];
-      }
-    }
-    managed.value = m;
+    const exposed = {};
+    for (const ne of s.exposes ?? []) exposed[ne.networkId] = ne.rules.map((r) => ({ ...r }));
+    for (const net of networkList.value) f.exposes[net.networkId] = exposed[net.networkId] ?? [];
     form.value = f;
   } catch (e) {
     message.error(e.message);
@@ -222,46 +240,45 @@ async function loadSettings() {
   }
 }
 
-watch(deviceId, () => loadSettings());
+watch(deviceId, (id) => {
+  if (id) loadSettings();
+});
 
 function buildBody() {
-  const body = {};
-  if (managed.value.mode) body.mode = form.value.mode || 'proxy';
-  if (managed.value.listen) {
-    body.listen = form.value.listen.map((x) => String(x).trim()).filter(Boolean);
-  }
-  if (managed.value.pathPolicy) body.pathPolicy = form.value.pathPolicy || 'auto';
-  if (managed.value.peerPolicies) {
-    body.peerPolicies = form.value.peerPolicies
+  // 全托管：PUT 全量替换，恒提交全部字段（表单即真值）。
+  return {
+    mode: form.value.mode || 'proxy',
+    listen: form.value.listen.map((x) => String(x).trim()).filter(Boolean),
+    pathPolicy: form.value.pathPolicy || 'auto',
+    // 按对端覆盖不在页面常驻：已存在的值原样写回，设置入口在保存弹窗
+    // 的“同步对端反向”勾选。
+    peerPolicies: form.value.peerPolicies
       .filter((p) => p.deviceId != null)
-      .map((p) => ({ deviceId: p.deviceId, policy: p.policy || 'auto' }));
-  }
-  if (managed.value.mtu) body.mtu = Number(form.value.mtu);
-  if (managed.value.socks) {
-    body.socksListen = form.value.socksEnabled ? String(form.value.socksAddr).trim() : '';
-  }
-  if (managed.value.forwards) {
-    body.forwards = form.value.forwards.map((x) => ({
-      listen: String(x.listen).trim(),
-      proto: x.proto || 'tcp',
-      dest: String(x.dest).trim(),
-    }));
-  }
-  const managedNets = Object.entries(managed.value.exposes).filter(([, on]) => on);
-  if (managedNets.length) {
-    body.exposes = managedNets.map(([netId]) => ({
+      .map((p) => ({ deviceId: p.deviceId, policy: p.policy || 'auto' })),
+    mtu: Number(form.value.mtu),
+    socksListen: form.value.socksEnabled
+      ? joinHostPort(form.value.socksHost, form.value.socksPort)
+      : '',
+    forwards: form.value.forwardsEnabled
+      ? form.value.forwards
+          .map((x) => ({
+            listen: String(x.listen).trim(),
+            proto: x.proto || 'tcp',
+            dest: joinHostPort(x.destHost, x.destPort),
+          }))
+          .filter((x) => x.listen && x.dest)
+      : [],
+    exposes: Object.entries(form.value.exposes).map(([netId]) => ({
       networkId: netId,
       rules: (form.value.exposes[netId] || []).map((r) => ({
         port: Number(r.port),
         proto: r.proto || 'tcp',
         dest: String(r.dest).trim(),
       })),
-    }));
-  }
-  return body;
+    })),
+  };
 }
 
-// 保存后短暂轮询设备列表，让收敛状态尽快反映出来。
 async function pollStatus(times = 4) {
   for (let i = 0; i < times; i++) {
     await new Promise((r) => setTimeout(r, 1500));
@@ -273,45 +290,34 @@ async function pollStatus(times = 4) {
   }
 }
 
-// 需要提示对称设置的对端覆盖（非 auto 才有方向意义）。
-function overridesNeedingReverse() {
-  if (!managed.value.peerPolicies) return [];
-  return form.value.peerPolicies.filter((p) => p.deviceId != null && p.policy && p.policy !== 'auto');
-}
+// 其他设备（对端反向勾选的对象）。
+const others = computed(() => devices.value.filter((d) => d.id !== deviceId.value));
+const policyLabel = (v) => t(`settings.policy.${v || 'auto'}`);
 
-// 在对端设备上写入反向覆盖（peer → 本机），保留对端其它托管字段。
-async function applyReverse(overrides) {
+// 对每个其他设备：把“指向本机”的出口策略覆盖设为 policy（auto = 清除）。
+// 对端到其它节点的隧道不受影响（只动指向本机的条目）。
+async function applyReverse(policy) {
   const me = deviceId.value;
-  for (const ov of overrides) {
-    const target = await api('GET', `/admin/devices/${ov.deviceId}/settings`);
+  for (const d of others.value) {
+    const target = await api('GET', `/admin/devices/${d.id}/settings`);
     const { revision: _rev, ...rest } = target;
     const list = (target.peerPolicies || []).filter((x) => x.deviceId !== me);
-    list.push({ deviceId: me, policy: ov.policy });
-    await api('PUT', `/admin/devices/${ov.deviceId}/settings`, { ...rest, peerPolicies: list });
+    if (policy !== 'auto') list.push({ deviceId: me, policy });
+    await api('PUT', `/admin/devices/${d.id}/settings`, { ...rest, peerPolicies: list });
   }
 }
 
 function save() {
   if (!deviceId.value) return;
-  const overrides = overridesNeedingReverse();
-  if (overrides.length) {
-    dialog.warning({
-      title: t('settings.reverseTitle'),
-      content: t('settings.reversePrompt', { list: overrides.map((o) => nameOf(o.deviceId)).join(t('devices.separator')) }),
-      positiveText: t('settings.reverseYes'),
-      negativeText: t('settings.reverseNo'),
-      onPositiveClick: () => doSave(overrides),
-      onNegativeClick: () => {
-        doSave([]);
-      },
-    });
-  } else {
-    doSave([]);
-  }
+  syncReverse.value = false;
+  showConfirm.value = true;
 }
 
-/// 等待下发闭环：轮询 /admin/devices 直至节点确认（appliedRevision 追平）、
-/// 失败（settingsErrorRevision 匹配，已自动回滚）或超时。
+async function confirmSave() {
+  showConfirm.value = false;
+  await doSave(syncReverse.value);
+}
+
 async function waitApplyOutcome(rev, timeoutMs = 45000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -335,19 +341,18 @@ async function waitApplyOutcome(rev, timeoutMs = 45000) {
   return { kind: 'timeout' };
 }
 
-async function doSave(reverseList) {
+async function doSave(syncReversePolicy) {
   saving.value = true;
   try {
     const saved = await api('PUT', `/admin/devices/${deviceId.value}/settings`, buildBody());
     const rev = saved.revision;
-    if (reverseList.length) {
-      await applyReverse(reverseList);
+    if (syncReversePolicy) {
+      await applyReverse(form.value.pathPolicy || 'auto');
     }
-    // 下发闭环：等待节点应用确认 / 失败回滚 / 超时。
     const out = await waitApplyOutcome(rev);
     if (out.kind === 'ok') {
       let msg = t('settings.applyOk') + ` (r${out.applied})`;
-      if (reverseList.length) msg += `；${t('settings.reverseDone')}`;
+      if (syncReversePolicy) msg += `；${t('settings.reverseDone')}`;
       message.success(msg);
     } else if (out.kind === 'failed') {
       message.error(`${t('settings.applyFailed')} (r${rev})：${out.error}`);
@@ -397,18 +402,32 @@ function restart() {
   });
 }
 
-function addForward() {
-  form.value.forwards.push({ listen: '127.0.0.1:0', proto: 'tcp', dest: '' });
+function addListen() {
+  const url = draftListen.value.trim();
+  if (!url) return;
+  form.value.listen.push(url);
+  draftListen.value = 'udp://0.0.0.0:';
 }
+
+function addForward() {
+  const d = draftForward.value;
+  const dest = joinHostPort(d.destHost, d.destPort);
+  if (!String(d.listen).trim() || !dest) return;
+  form.value.forwards.push({
+    listen: String(d.listen).trim(),
+    proto: d.proto || 'tcp',
+    destHost: d.destHost,
+    destPort: d.destPort,
+  });
+  draftForward.value = { listen: '127.0.0.1:', proto: 'tcp', destHost: '', destPort: null };
+}
+
 function delForward(i) {
   form.value.forwards.splice(i, 1);
 }
-function addExpose(netId) {
-  if (!form.value.exposes[netId]) form.value.exposes[netId] = [];
-  form.value.exposes[netId].push({ port: null, proto: 'tcp', dest: '127.0.0.1:' });
-}
-function delExpose(netId, i) {
-  form.value.exposes[netId].splice(i, 1);
+
+function refresh() {
+  deviceId.value ? loadSettings() : load();
 }
 
 registerLoader(load);
@@ -417,318 +436,548 @@ onMounted(load);
 
 <template>
   <div class="settings-tab">
-    <div class="toolbar">
-      <n-select
-        v-model:value="deviceId"
-        :options="deviceOptions"
-        :placeholder="t('settings.pickDevice')"
-        filterable
-        style="width: 280px"
-      />
-      <n-tag v-if="statusTag" :type="statusTag.type" size="small" :bordered="false">
-        {{ statusTag.text }}
-      </n-tag>
-      <div class="spacer" />
-      <n-button size="small" :loading="loading" @click="deviceId ? loadSettings() : load()">
-        {{ t('topology.refresh') }}
-      </n-button>
+    <div class="page-head">
+      <h2 class="page-title">
+        <NIcon size="20"><SettingsOutline /></NIcon>
+        {{ t('settings.title') }}
+      </h2>
+      <div class="page-head-actions">
+        <span class="current-label">{{ t('settings.currentNode') }}：</span>
+        <n-select
+          v-model:value="deviceId"
+          :options="deviceOptions"
+          :placeholder="t('settings.pickDevice')"
+          filterable
+          size="small"
+          class="device-select"
+        />
+        <n-tag v-if="statusTag" :type="statusTag.type" size="small" :bordered="false">
+          {{ statusTag.text }}
+        </n-tag>
+      </div>
     </div>
 
-    <n-alert v-if="deviceId" type="info" :show-icon="false" style="margin: 8px 0">
-      {{ t('settings.emptyHint') }}
-    </n-alert>
+    <p v-if="!deviceId" class="empty-hint">{{ t('settings.pickDevice') }}</p>
 
-    <template v-if="deviceId">
-      <!-- 网络成员管理（服务端权威） -->
-      <n-card size="small" :title="t('settings.memberships')" style="margin-bottom: 12px">
-        <div v-for="net in networkList" :key="net.networkId" class="field-row">
-          <span class="mono">{{ net.networkName }}</span>
-          <n-tag size="small" type="info" :bordered="false">{{ net.ip }}</n-tag>
-          <div class="spacer" />
-          <n-button
-            size="tiny"
-            quaternary
-            type="error"
-            :loading="acting"
-            @click="leaveNetwork(net)"
-          >
-            {{ t('settings.leave') }}
-          </n-button>
+    <template v-else>
+      <section class="sec">
+        <div class="sec-head">
+          <div class="sec-title">
+            <NIcon size="18"><GitNetworkOutline /></NIcon>
+            {{ t('settings.memberships') }}
+          </div>
         </div>
-        <div class="field-row">
-          <n-select
-            v-model:value="joinNet"
-            :options="joinOptions"
-            :placeholder="t('settings.pickNet')"
-            filterable
-            size="small"
-            style="width: 260px"
-          />
-          <n-input
-            v-model:value="joinIp"
-            size="small"
-            :placeholder="t('settings.joinIpPh')"
-            style="width: 170px"
-          />
-          <n-button
-            size="small"
-            type="primary"
-            secondary
-            :disabled="!joinNet"
-            :loading="acting"
-            @click="joinNetwork"
-          >
-            {{ t('settings.join') }}
-          </n-button>
-        </div>
-      </n-card>
-
-      <!-- 热生效区 -->
-      <n-card size="small" :title="t('settings.hotSection')" style="margin-bottom: 12px">
-        <div class="field-row">
-          <n-checkbox v-model:checked="managed.pathPolicy" />
-          <n-select
-            v-model:value="form.pathPolicy"
-            :options="policyOptions"
-            :disabled="!managed.pathPolicy"
-            size="small"
-            style="width: 230px"
-          />
-          <span class="hint">{{ t('settings.policyHint') }}</span>
-        </div>
-        <div class="field-row">
-          <n-checkbox v-model:checked="managed.peerPolicies" />
-          <span>{{ t('settings.peerPolicies') }}</span>
-        </div>
-        <template v-if="managed.peerPolicies">
-          <div v-for="(pp, i) in form.peerPolicies" :key="i" class="rule-row">
+        <div class="sheet">
+          <div class="sheet-head">
+            <span>{{ t('settings.netName') }}</span>
+            <span>{{ t('settings.netCidr') }}</span>
+            <span>{{ t('settings.nodeIp') }}</span>
+            <span>{{ t('networks.actions') }}</span>
+          </div>
+          <div v-for="net in networkList" :key="net.networkId" class="sheet-row">
+            <span>{{ net.networkName }}</span>
+            <span class="mono">{{ cidrOf(net.networkId) }}</span>
+            <span class="mono">{{ net.ip }}</span>
+            <span class="sheet-actions">
+              <n-button size="tiny" secondary :loading="acting" @click="leaveNetwork(net)">
+                <template #icon><NIcon><TrashOutline /></NIcon></template>
+                {{ t('settings.leave') }}
+              </n-button>
+            </span>
+          </div>
+          <div v-if="!networkList.length" class="sheet-empty">{{ t('devices.noNetwork') }}</div>
+          <div class="join-row">
             <n-select
-              v-model:value="pp.deviceId"
-              :options="peerDeviceOptions"
-              :placeholder="t('settings.pickPeer')"
+              v-model:value="joinNet"
+              :options="joinOptions"
+              :placeholder="t('settings.pickNet')"
               filterable
               size="small"
-              style="width: 220px"
             />
-            <n-select v-model:value="pp.policy" :options="policyOptions" size="small" style="width: 210px" />
-            <n-button size="tiny" quaternary type="error" @click="form.peerPolicies.splice(i, 1)">
-              {{ t('settings.del') }}
+            <n-input v-model:value="joinIp" size="small" :placeholder="t('settings.joinIpPh')" />
+            <n-button size="small" type="primary" :disabled="!joinNet" :loading="acting" @click="joinNetwork">
+              {{ t('settings.join') }}
             </n-button>
           </div>
-          <n-button size="tiny" dashed @click="addPeerPolicy">{{ t('settings.addPeerPolicy') }}</n-button>
-        </template>
+        </div>
+      </section>
 
-        <div class="section-label">{{ t('settings.exposes') }}</div>
-        <div v-for="net in networkList" :key="net.networkId" class="net-block">
-          <div class="field-row">
-            <n-checkbox v-model:checked="managed.exposes[net.networkId]" />
-            <span class="mono">{{ t('settings.exposesFor', { net: net.networkName }) }}</span>
+      <div class="trio">
+        <section class="sec">
+          <div class="sec-head">
+            <div class="sec-title">
+              <NIcon size="18"><ArrowForwardOutline /></NIcon>
+              {{ t('settings.egressPolicy') }}
+            </div>
           </div>
-          <template v-if="managed.exposes[net.networkId]">
-            <div v-for="(rule, i) in form.exposes[net.networkId] || []" :key="i" class="rule-row">
-              <n-input-number
-                v-model:value="rule.port"
-                size="tiny"
-                :placeholder="t('settings.port')"
-                :min="1"
-                :max="65535"
-                style="width: 110px"
-              />
-              <n-input v-model:value="rule.proto" size="tiny" style="width: 74px" />
-              <n-input
-                v-model:value="rule.dest"
-                size="tiny"
-                :placeholder="t('settings.dest')"
-                style="width: 220px"
-              />
-              <n-button size="tiny" quaternary type="error" @click="delExpose(net.networkId, i)">
+          <n-select v-model:value="form.pathPolicy" :options="policyOptions" />
+        </section>
+        <section class="sec">
+          <div class="sec-head">
+            <div class="sec-title">
+              <NIcon size="18"><SettingsOutline /></NIcon>
+              {{ t('settings.mode') }}
+              <n-tag size="tiny" :bordered="false" type="warning" class="restart-flag">
+                {{ t('settings.restartSection') }}
+              </n-tag>
+            </div>
+          </div>
+          <n-select v-model:value="form.mode" :options="modeOptions" />
+        </section>
+        <section class="sec">
+          <div class="sec-head">
+            <div class="sec-title">
+              <NIcon size="18"><HardwareChipOutline /></NIcon>
+              {{ t('settings.mtu') }}
+              <n-tag size="tiny" :bordered="false" type="warning" class="restart-flag">
+                {{ t('settings.restartSection') }}
+              </n-tag>
+            </div>
+          </div>
+          <n-input-number v-model:value="form.mtu" :min="576" :max="65500" style="width: 100%" />
+          <div class="sec-hint">{{ t('settings.mtuHint') }}</div>
+        </section>
+      </div>
+
+      <div class="duo">
+        <section class="sec">
+          <div class="sec-head">
+            <div class="sec-title">
+              <NIcon size="18"><WifiOutline /></NIcon>
+              {{ t('settings.listen') }}
+              <n-tag size="tiny" :bordered="false" type="warning" class="restart-flag">
+                {{ t('settings.restartSection') }}
+              </n-tag>
+            </div>
+          </div>
+          <div class="list-block">
+            <div v-for="(u, i) in form.listen" :key="i" class="list-row">
+              <n-input v-model:value="form.listen[i]" size="small" :placeholder="t('settings.listenPh')" />
+              <n-button size="tiny" secondary @click="form.listen.splice(i, 1)">
+                <template #icon><NIcon><TrashOutline /></NIcon></template>
                 {{ t('settings.del') }}
               </n-button>
             </div>
-            <n-button size="tiny" dashed @click="addExpose(net.networkId)">
-              {{ t('settings.addRule') }}
-            </n-button>
-          </template>
-        </div>
-        <div v-if="!networkList.length" style="opacity: .55">{{ t('devices.noNetwork') }}</div>
-      </n-card>
+            <div class="list-row">
+              <n-input
+                v-model:value="draftListen"
+                size="small"
+                :placeholder="t('settings.listenPh')"
+                @keyup.enter="addListen"
+              />
+              <n-button size="small" type="primary" :disabled="!draftListen.trim()" @click="addListen">
+                {{ t('settings.add') }}
+              </n-button>
+            </div>
+          </div>
+        </section>
 
-      <!-- 重启生效区 -->
-      <n-card size="small" :title="t('settings.restartSection')" style="margin-bottom: 12px">
-        <div class="field-row">
-          <n-checkbox v-model:checked="managed.mode" />
-          <n-select
-            v-model:value="form.mode"
-            :options="modeOptions"
-            :disabled="!managed.mode"
-            size="small"
-            style="width: 260px"
-          />
-          <span>{{ t('settings.mode') }}</span>
+        <section class="sec">
+          <div class="sec-head">
+            <div class="sec-title">
+              <NIcon size="18"><GlobeOutline /></NIcon>
+              {{ t('settings.socks') }}
+              <n-tag size="tiny" :bordered="false" type="warning" class="restart-flag">
+                {{ t('settings.restartSection') }}
+              </n-tag>
+            </div>
+            <div class="sec-tools">
+              <label class="enable-label">
+                {{ t('settings.socksEnabled') }}
+                <n-switch size="small" v-model:checked="form.socksEnabled" />
+              </label>
+            </div>
+          </div>
+          <div class="socks-grid">
+            <div>
+              <div class="field-label">{{ t('settings.socksHost') }}</div>
+              <n-input v-model:value="form.socksHost" :disabled="!form.socksEnabled" />
+            </div>
+            <div>
+              <div class="field-label">{{ t('settings.socksPort') }}</div>
+              <n-input-number
+                v-model:value="form.socksPort"
+                :min="1"
+                :max="65535"
+                :disabled="!form.socksEnabled"
+                style="width: 100%"
+              />
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <section class="sec">
+        <div class="sec-head">
+          <div class="sec-title">
+            <NIcon size="18"><GitNetworkOutline /></NIcon>
+            {{ t('settings.forwards') }}
+            <n-tag size="tiny" :bordered="false" type="warning" class="restart-flag">
+              {{ t('settings.restartSection') }}
+            </n-tag>
+          </div>
+          <div class="sec-tools">
+            <label class="enable-label">
+              {{ t('settings.fwdEnabled') }}
+              <n-switch size="small" v-model:checked="form.forwardsEnabled" />
+            </label>
+          </div>
         </div>
-        <div class="field-row">
-          <n-checkbox v-model:checked="managed.listen" />
-          <span>{{ t('settings.listen') }}</span>
-        </div>
-        <template v-if="managed.listen">
-          <div v-for="(u, i) in form.listen" :key="i" class="rule-row">
-            <n-input
-              v-model:value="form.listen[i]"
+        <div class="sheet fwd-sheet" :class="{ disabled: !form.forwardsEnabled }">
+          <div class="sheet-head">
+            <span>{{ t('settings.fwdListen') }}</span>
+            <span>{{ t('settings.fwdProto') }}</span>
+            <span>{{ t('settings.fwdDest') }}</span>
+            <span>{{ t('settings.fwdDestPort') }}</span>
+            <span>{{ t('networks.actions') }}</span>
+          </div>
+          <div v-for="(f, i) in form.forwards" :key="i" class="sheet-row">
+            <n-input v-model:value="f.listen" size="small" :disabled="!form.forwardsEnabled" />
+            <n-select
+              v-model:value="f.proto"
+              :options="protoOptions"
               size="small"
-              :placeholder="t('settings.listenPh')"
-              style="width: 320px"
+              :disabled="!form.forwardsEnabled"
             />
-            <n-button size="tiny" quaternary type="error" @click="form.listen.splice(i, 1)">
-              {{ t('settings.del') }}
-            </n-button>
+            <n-input v-model:value="f.destHost" size="small" :disabled="!form.forwardsEnabled" />
+            <n-input-number
+              v-model:value="f.destPort"
+              size="small"
+              :min="1"
+              :max="65535"
+              :disabled="!form.forwardsEnabled"
+              style="width: 100%"
+            />
+            <span class="sheet-actions">
+              <n-button size="tiny" secondary :disabled="!form.forwardsEnabled" @click="delForward(i)">
+                <template #icon><NIcon><TrashOutline /></NIcon></template>
+                {{ t('settings.del') }}
+              </n-button>
+            </span>
           </div>
-          <n-button size="tiny" dashed @click="addListen">{{ t('settings.addListen') }}</n-button>
-        </template>
-        <div class="field-row" style="margin-top: 8px">
-          <span class="hint">{{ t('settings.restartNote') }}</span>
-        </div>
-        <div class="field-row">
-          <n-checkbox v-model:checked="managed.socks" />
-          <n-checkbox
-            v-model:checked="form.socksEnabled"
-            size="small"
-            :disabled="!managed.socks"
-          >
-            {{ t('settings.socksEnabled') }}
-          </n-checkbox>
-          <span>{{ t('settings.socks') }}</span>
-          <n-input
-            v-model:value="form.socksAddr"
-            size="tiny"
-            :disabled="!managed.socks || !form.socksEnabled"
-            :placeholder="t('settings.socksAddr')"
-            style="width: 200px"
-          />
-        </div>
-        <div class="field-row">
-          <n-checkbox v-model:checked="managed.mtu" />
-          <n-input-number
-            v-model:value="form.mtu"
-            size="tiny"
-            :min="576"
-            :max="65500"
-            :disabled="!managed.mtu"
-            style="width: 130px"
-          />
-          <span>{{ t('settings.mtu') }}</span>
-        </div>
-
-        <div class="section-label">{{ t('settings.forwards') }}</div>
-        <div class="field-row">
-          <n-checkbox v-model:checked="managed.forwards" />
-        </div>
-        <template v-if="managed.forwards">
-          <div v-for="(f, i) in form.forwards" :key="i" class="rule-row">
+          <div class="sheet-row">
             <n-input
-              v-model:value="f.listen"
-              size="tiny"
+              v-model:value="draftForward.listen"
+              size="small"
               :placeholder="t('settings.fwdListen')"
-              style="width: 180px"
+              :disabled="!form.forwardsEnabled"
             />
-            <n-input v-model:value="f.proto" size="tiny" style="width: 74px" />
+            <n-select
+              v-model:value="draftForward.proto"
+              :options="protoOptions"
+              size="small"
+              :disabled="!form.forwardsEnabled"
+            />
             <n-input
-              v-model:value="f.dest"
-              size="tiny"
-              :placeholder="t('settings.fwdDest')"
-              style="width: 180px"
+              v-model:value="draftForward.destHost"
+              size="small"
+              :placeholder="t('settings.fwdDestPh')"
+              :disabled="!form.forwardsEnabled"
             />
-            <n-button size="tiny" quaternary type="error" @click="delForward(i)">
-              {{ t('settings.del') }}
-            </n-button>
+            <n-input-number
+              v-model:value="draftForward.destPort"
+              size="small"
+              :min="1"
+              :max="65535"
+              :placeholder="t('settings.fwdPortPh')"
+              :disabled="!form.forwardsEnabled"
+              style="width: 100%"
+            />
+            <span class="sheet-actions">
+              <n-button
+                size="small"
+                type="primary"
+                :disabled="!form.forwardsEnabled"
+                @click="addForward"
+              >
+                {{ t('settings.add') }}
+              </n-button>
+            </span>
           </div>
-          <n-button size="tiny" dashed @click="addForward">{{ t('settings.addRule') }}</n-button>
-        </template>
-      </n-card>
+        </div>
+      </section>
 
-      <div class="toolbar">
-        <n-button type="primary" :loading="saving" @click="save">{{ t('settings.save') }}</n-button>
-        <n-button :loading="acting" @click="reconnect">{{ t('settings.reconnect') }}</n-button>
-        <n-button type="warning" secondary :loading="acting" @click="restart">
-          {{ t('settings.restart') }}
-        </n-button>
+      <div class="foot">
+        <div class="foot-actions">
+          <n-button type="primary" :loading="saving" @click="save">
+            <template #icon><NIcon><SaveOutline /></NIcon></template>
+            {{ t('settings.save') }}
+          </n-button>
+          <n-button secondary :loading="acting" @click="reconnect">
+            <template #icon><NIcon><RefreshOutline /></NIcon></template>
+            {{ t('settings.reconnect') }}
+          </n-button>
+          <n-button secondary :loading="acting" @click="restart">
+            <template #icon><NIcon><PowerOutline /></NIcon></template>
+            {{ t('settings.restart') }}
+          </n-button>
+          <n-button secondary :loading="loading" @click="refresh">
+            <template #icon><NIcon><RefreshOutline /></NIcon></template>
+            {{ t('topology.refresh') }}
+          </n-button>
+        </div>
       </div>
     </template>
+
+    <!-- 保存确认弹窗：可取消；内嵌“同步对端反向”勾选（按对端覆盖的
+         唯一入口——小功能不常驻配置页）。 -->
+    <n-modal
+      v-model:show="showConfirm"
+      preset="card"
+      :title="t('settings.confirmTitle')"
+      :style="{ width: '480px', maxWidth: '92vw' }"
+    >
+      <p class="confirm-body">{{ t('settings.confirmBody', { device: current?.name ?? '' }) }}</p>
+      <n-checkbox v-if="others.length" v-model:checked="syncReverse" class="confirm-check">
+        {{ t('settings.syncReverse', { policy: policyLabel(form.pathPolicy) }) }}
+      </n-checkbox>
+      <template #footer>
+        <div class="confirm-actions">
+          <n-button size="small" @click="showConfirm = false">{{ t('common.cancel') }}</n-button>
+          <n-button size="small" type="primary" :loading="saving" @click="confirmSave">
+            {{ t('settings.confirmPush') }}
+          </n-button>
+        </div>
+      </template>
+    </n-modal>
   </div>
 </template>
 
 <style scoped>
+.restart-flag {
+  margin-left: 8px;
+}
+.confirm-body {
+  margin: 0 0 10px;
+}
+.confirm-check {
+  display: flex;
+}
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
 .settings-tab {
-  width: min(100%, 900px);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
 }
 
-.settings-tab :deep(.n-card) {
-  border-color: var(--sk-border);
+.page-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.page-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.page-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.current-label {
+  color: var(--sk-text-muted);
+  font-size: 13px;
+}
+
+.device-select {
+  width: min(100%, 280px);
+}
+
+.empty-hint {
+  margin: 8px 0 0;
+  color: var(--sk-text-muted);
+  font-size: 13px;
+}
+
+.sec {
+  padding: 16px 18px 18px;
+  border: 1px solid var(--sk-border);
+  border-radius: var(--sk-radius);
   background: var(--sk-surface);
 }
 
-.settings-tab .toolbar {
+.sec-head {
   display: flex;
   align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  margin-bottom: 10px;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
 }
 
-.toolbar .spacer { flex: 1; }
-
-.field-row,
-.rule-row {
-  display: flex;
+.sec-title {
+  display: inline-flex;
   align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  margin: 8px 0;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 700;
 }
 
-.field-row > .hint,
-.rule-row > .hint {
+.sec-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.enable-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--sk-text);
+  font-size: 13px;
+}
+
+.sec-hint {
+  margin-top: 8px;
   color: var(--sk-text-muted);
   font-size: 12px;
 }
 
-.section-label {
-  margin: 18px 0 6px;
-  color: var(--sk-text);
+.trio,
+.duo {
+  display: grid;
+  gap: 14px;
+}
+
+.trio {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.duo {
+  grid-template-columns: 1.15fr 1fr;
+}
+
+.sheet {
+  display: flex;
+  flex-direction: column;
+}
+
+.sheet-head,
+.sheet-row {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr 1fr 120px;
+  gap: 12px;
+  align-items: center;
+}
+
+.fwd-sheet .sheet-head,
+.fwd-sheet .sheet-row {
+  grid-template-columns: 1.2fr 110px 1fr 110px 120px;
+}
+
+.sheet-head {
+  padding: 0 4px 10px;
+  color: var(--sk-text-muted);
+  font-size: 12px;
+}
+
+.sheet-row {
+  padding: 10px 4px;
+  border-top: 1px solid var(--sk-border);
+}
+
+.sheet-empty {
+  padding: 12px 4px;
+  color: var(--sk-text-muted);
   font-size: 13px;
-  font-weight: 700;
 }
 
-.net-block {
-  padding: 6px 0 6px 12px;
-  border-left: 2px solid var(--sk-border);
-  margin: 8px 0;
+.sheet-actions {
+  display: flex;
+  justify-content: flex-end;
 }
 
-.rule-row :deep(.n-input),
-.rule-row :deep(.n-input-number),
-.rule-row :deep(.n-select) {
-  max-width: 100%;
+.join-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 180px 88px;
+  gap: 8px;
+  align-items: center;
+  padding: 12px 4px 0;
+  border-top: 1px solid var(--sk-border);
 }
 
-@media (max-width: 640px) {
-  .settings-tab .toolbar > :not(.spacer),
-  .field-row > :not(.spacer),
-  .rule-row > :not(.spacer) {
-    max-width: 100%;
+.list-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.list-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.socks-grid {
+  display: grid;
+  grid-template-columns: 1fr 120px;
+  gap: 12px;
+}
+
+.field-label {
+  margin-bottom: 6px;
+  color: var(--sk-text-muted);
+  font-size: 12px;
+}
+
+.disabled {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+.foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.foot-note {
+  margin: 0;
+  max-width: 520px;
+}
+
+.foot-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-left: auto;
+}
+
+@media (max-width: 960px) {
+  .trio,
+  .duo,
+  .socks-grid,
+  .sheet-head,
+  .sheet-row,
+  .fwd-sheet .sheet-head,
+  .fwd-sheet .sheet-row,
+  .join-row {
+    grid-template-columns: 1fr;
   }
 
-  .settings-tab .toolbar > .n-select,
-  .field-row > .n-select,
-  .field-row > .n-input,
-  .field-row > .n-input-number,
-  .rule-row > .n-input,
-  .rule-row > .n-input-number,
-  .rule-row > .n-select {
-    width: min(100%, 360px) !important;
+  .sheet-head {
+    display: none;
   }
 
-  .net-block {
-    padding-left: 8px;
+  .sheet-actions {
+    justify-content: flex-start;
   }
 }
 </style>

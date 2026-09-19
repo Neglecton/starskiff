@@ -169,8 +169,9 @@ fn main() -> anyhow::Result<()> {
                                 let udp: Vec<u16> =
                                     shared.udp.local_binds().iter().map(|a| a.port()).collect();
                                 let tcp = shared.tcp_listen_ports.lock().unwrap().clone();
+                                let data_dir = shared.data_dir();
                                 for line in skiff_node::service_install::ensure_runtime_firewall(
-                                    &udp, &tcp,
+                                    &udp, &tcp, &data_dir,
                                 ) {
                                     (shared.log)(&line);
                                 }
@@ -286,10 +287,7 @@ async fn cmd_enroll(
     // 均由服务端权威下发（启动时拉取）。
     let cfg = NodeConfig {
         server: server.trim_end_matches('/').to_string(),
-        mode: skiff_core::models::ClientMode::Proxy,
-        mtu: resp.mtu,
         data_dir: String::new(),
-        listen: skiff_node::default_listen(),
         log_file: None,
         identity: Identity {
             device_id: resp.device_id,
@@ -356,10 +354,7 @@ fn cmd_init_config(out: PathBuf, force: bool) -> anyhow::Result<()> {
     // 均由服务端权威下发，不在文件中。
     let sample = r#"{
   "server": "http://your-server:24930",
-  "mode": "proxy",
-  "mtu": 1300,
   "dataDir": "",
-  "listen": ["udp://0.0.0.0:24933", "tcp://0.0.0.0:24933"],
   "logFile": null,
   "identity": null
 }

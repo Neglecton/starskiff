@@ -12,9 +12,13 @@ function initialLang() {
 
 function initialTheme() {
   const saved = localStorage.getItem(LS_THEME);
-  if (saved === 'light' || saved === 'dark') return saved;
+  if (saved === 'light' || saved === 'dark' || saved === 'system') return saved;
   // The console opens in a predictable light theme until the user chooses otherwise.
   return 'light';
+}
+
+function systemPrefersDark() {
+  return window.matchMedia('(prefers-color-scheme: dark)').matches;
 }
 
 export const store = reactive({
@@ -23,7 +27,20 @@ export const store = reactive({
   connected: false,
   lang: initialLang(),
   theme: initialTheme(),
+  systemDark: systemPrefersDark(),
 });
+
+const mq = window.matchMedia('(prefers-color-scheme: dark)');
+const onScheme = (e) => {
+  store.systemDark = e.matches;
+};
+if (mq.addEventListener) mq.addEventListener('change', onScheme);
+else mq.addListener(onScheme);
+
+export function resolvedTheme() {
+  if (store.theme === 'system') return store.systemDark ? 'dark' : 'light';
+  return store.theme;
+}
 
 export function saveToken(token) {
   store.token = token;
@@ -36,7 +53,7 @@ export function setLang(lang) {
   localStorage.setItem(LS_LANG, lang);
 }
 
-export function toggleTheme() {
-  store.theme = store.theme === 'light' ? 'dark' : 'light';
-  localStorage.setItem(LS_THEME, store.theme);
+export function setTheme(theme) {
+  store.theme = theme;
+  localStorage.setItem(LS_THEME, theme);
 }

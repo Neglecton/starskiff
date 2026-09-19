@@ -35,11 +35,11 @@ Rust 实现的 mesh VPN：**控制面中心化、数据面去中心化**。业�
 | `admin device list` | 列出所有设备（含在线状态/路径） | `starskiff-server admin --server URL --token T device list` |
 | `admin device remove` | 移除设备 | `starskiff-server admin --server URL --token T device remove ID` |
 | `admin device set-ip` | 手动指定设备虚拟 IP（实时下发） | `starskiff-server admin --server URL --token T device set-ip DEVICE NETWORK IP` |
-| `service install` | 安装为系统服务（保存完整 serve 参数 + 自动放行防火墙） | `starskiff-server service install [--db PATH] [--api-port N] ...` | Win 需管理员 / Linux 需 root |
+| `service install` | 安装为系统服务（保存完整 serve 参数） | `starskiff-server service install [--db PATH] [--api-port N] ...` | Win 需管理员 / Linux 需 root |
 | `service start` | 启动已安装的服务 | `starskiff-server service start` | 同上 |
 | `service stop` | 停止服务 | `starskiff-server service stop` | 同上 |
 | `service status` | 查看服务运行状态 | `starskiff-server service status` | 同上 |
-| `service remove` | 移除服务（含防火墙规则清理） | `starskiff-server service remove` | 同上 |
+| `service remove` | 移除服务（含运行时防火墙规则清理） | `starskiff-server service remove` | 同上 |
 
 ### starskiff（节点客户端）
 
@@ -56,7 +56,7 @@ Rust 实现的 mesh VPN：**控制面中心化、数据面去中心化**。业�
 | `service start` | 启动已安装的服务 | `starskiff service start [--name NAME]` | 同上 |
 | `service stop` | 停止服务 | `starskiff service stop [--name NAME]` | 同上 |
 | `service status` | 查看服务运行状态 | `starskiff service status [--name NAME]` | 同上 |
-| `service remove` | 移除服务（含防火墙规则清理） | `starskiff service remove [--name NAME] [-c starskiff.json]` | 同上 |
+| `service remove` | 移除服务（含运行时防火墙规则清理） | `starskiff service remove [--name NAME] [-c starskiff.json]` | 同上 |
 | `service run` | 内部：服务宿主入口（由 SCM/systemd 调用） | `starskiff service run -c starskiff.json` | 同上 |
 
 > `--server`/`--token` 也可用环境变量 `STARSKIFF_SERVER` / `STARSKIFF_ADMIN_TOKEN` 代替。
@@ -111,31 +111,23 @@ starskiff up -c starskiff.json                                  # 双网络同�
 
 ## 节点配置（starskiff.json）
 
-瘦配置文件只承载**连接信息 + 本机部署参数 + 设备身份**（敏感字段以 `sealed:…` 内嵌，Windows 上 DPAPI LocalMachine 字段级密封、Linux 明文）：
+终态瘦配置文件只承载**连接信息 + 本机部署参数 + 设备身份**（敏感字段以 `sealed:…` 内嵌，Windows 上 DPAPI LocalMachine 字段级密封、Linux 明文）。**除 server/identity 外的一切配置由服务器权威下发**（dataDir/logFile 是本机部署参数，保留在文件）：
 
 ```json
 {
   "server": "https://your-server:24930",
-  "mode": "proxy",
-  "mtu": 1300,
   "dataDir": "",
-  "listenUdpPort": 24933,
-  "listenTcpPort": 24933,
   "logFile": null,
   "identity": { "...": "enroll 自动生成" }
 }
 ```
 
-**其余一切网络行为配置由服务器权威下发**：网络成员（管理页或 CLI `device network add/remove`）、路径策略（`pathPolicy` 全局 + `peerPolicies` 按对端覆盖：自动/强制 UDP 中继/强制 TCP 中继/只许直连/强制 UDP 直连/强制 TCP 直连，热生效、只控本端出口）、**运行模式（`mode`：tun 需管理员/root，无权限自动回滚并显示原因）**、**监听地址（`listen`：URL 数组，每协议可多条、可绑定指定网卡/IPv6）**、`exposes`/`socksListen`/`forwards`/托管 `mtu`（管理页「设备配置」）。热改项立即生效；重启类变更**自动重启应用并等待节点应答**，配置启动失败（端口占用/无 TUN 权限等）自动回滚到上一版成功配置并在页面显示原因。节点启动时拉取名单位置与托管配置；旧版本文件中的遗留行为字段会在首次启动时自动收编为服务端托管值。`starskiff up` 与服务模式均为 master/worker 架构：管理页的重启指令由 master 以最新配置重新拉起 worker。
+**全部节点配置由服务器权威下发、管理页全托管**（无"是否托管"开关，保存即全量下发）：网络成员（管理页或 CLI `device network add/remove`）、路径策略（`pathPolicy` 全局：自动/强制 UDP 中继/强制 TCP 中继/只许直连/强制 UDP 直连/强制 TCP 直连，热生效、只控本端出口；"按对端覆盖"不常驻页面，入口在保存确认弹窗的"同步对端反向"勾选）、**运行模式（`mode`：tun 需管理员/root，无权限自动回滚并显示原因）**、**监听地址（`listen`：URL 数组，每协议可多条、可绑定指定网卡/IPv6）**、`exposes`/`socksListen`/`forwards`/`mtu`（管理页「设备配置」；重启类字段旁标注"重启生效"）。未下发的字段节点回退编译期默认值（proxy/24933/1300）。热改项立即生效；重启类变更**自动重启应用并等待节点应答**，配置启动失败（端口占用/无 TUN 权限等）自动回滚到上一版成功配置并在页面显示原因。`starskiff up` 与服务模式均为 master/worker 架构：管理页的重启指令由 master 以最新配置重新拉起 worker，master 退出时自动清理运行时防火墙规则。
 
 ```json
 {
   "server": "https://your-server:24930",
-  "mode": "proxy",
-  "mtu": 1300,
   "dataDir": "",
-  "listenUdpPort": 24933,
-  "listenTcpPort": 24933,
   "logFile": null,
   "identity": {
     "deviceId": 1314905287493620,
@@ -153,14 +145,11 @@ starskiff up -c starskiff.json                                  # 双网络同�
 | 字段 | 说明 |
 |---|---|
 | `server` | 控制面地址（必填） |
-| `mode` | `"proxy"`（非 TUN，默认：SOCKS5/转发/暴露，**支持多网络**）或 `"tun"`（完整虚拟网卡，需管理员，**当前限单网络**） |
-| `mtu` | TUN 设备默认 MTU（托管配置可覆盖） |
-| `dataDir` | 身份/状态文件目录（默认 `%APPDATA%/Starskiff` 或 `~/.config/starskiff`） |
-| `listenUdpPort` / `listenTcpPort` | 固定监听端口便于他人直连（默认 24933） |
+| `dataDir` | 数据目录（stop.flag/状态文件/运行时防火墙状态；默认 `%APPDATA%/Starskiff` 或 `~/.config/starskiff`） |
 | `logFile` | 滚动日志文件路径（服务模式下默认 `<dataDir>/service.log`） |
 | `identity` | 设备身份（enroll 自动生成；`sealed:` 字段勿手改） |
 
-身份由 `enroll` 创建；网络成员与全部行为配置（`exposes`/`socksListen`/`forwards`/`forceRelay` 等）经管理页或 AdminCli 在服务端维护，节点重启后自动拉取生效。
+身份由 `enroll` 创建；**全部行为配置（运行模式/监听地址/mtu/路径策略/socks/forwards/exposes/成员关系）经管理页或 AdminCli 在服务端维护**，节点启动与重启后自动拉取生效（含旧版本文件遗留键的忽略）。
 
 ## 路径选择
 
@@ -168,8 +157,7 @@ starskiff up -c starskiff.json                                  # 双网络同�
 - 同网段（LAN）节点可通过上报的本地地址直连；节点默认监听 **24933**（UDP/TCP 同号），被占用时 UDP 自动回退随机端口、TCP 监听禁用（不影响连通性，仅直连可用性下降）
 - 探测包含对观测端点的**邻近端口**（±1~4）尝试，覆盖端口递增型对称 NAT
 - 对端通告 TCP 监听时，UDP 被阻断的网络里会自动尝试**直连 TCP**隧道
-- Windows 下 `service install` 自动放行防火墙入站规则（按程序+端口，随服务卸载删除）；Linux 下同样自动放行（ufw → firewalld → 裸 iptables 探测级联，按端口，随服务卸载删除；裸 iptables 为运行时规则会提示持久化建议，云厂商安全组需在控制台放行 24930-24933）；前台运行请自行放行或用服务方式
-- **运行时规则同步（仅 Windows）**：节点每次启动按**当期实际生效**的监听端口重建固定名规则 `Starskiff Node UDP/TCP`（按程序+端口）——在 Web 管理页修改监听地址（listen）并重启生效后，规则自动跟进新端口；非管理员运行时跳过并记录日志（不阻断启动）。注意：第三方安全软件（如 360）的独立拦截不受系统防火墙规则影响；Linux 变更端口后需重跑 `service install` 或手动放行
+- **防火墙运行时自动管理（Windows/Linux）**：节点每次启动按**当期实际生效**的监听端口自动放行（Windows 固定名规则 `Starskiff Node UDP/TCP`；Linux 走 ufw → firewalld → iptables 级联，按端口），在 Web 管理页修改监听地址并重启生效后规则自动跟进；节点退出时自动清理规则（master 进程负责，崩溃重启期间保持放行）；无管理员/root 权限时跳过并记录日志警告（不影响运行）。注意：第三方安全软件（如 360）的独立拦截不受系统防火墙规则影响；`service install` 不再预建端口规则；云厂商安全组需在控制台放行 24930-24933
 - `forceRelay` / `forceDirect` 可全局强制
 - 完整 UDP 打洞（对称↔对称）未实现，此类节点保持中继（设计内行为）；Web 管理页"设备"表可查看每个节点到各对端的实际路径分布
 

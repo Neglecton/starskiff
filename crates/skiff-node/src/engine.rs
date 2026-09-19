@@ -461,11 +461,8 @@ pub struct EffectiveListen {
 
 /// 生效监听：托管 listen 全量替换文件默认；逐条解析 URL，按协议分组
 /// （保持列表顺序，primary=首个）。
-pub fn effective_listen_addrs(settings: &DeviceSettings, cfg: &NodeConfig) -> anyhow::Result<EffectiveListen> {
-    let raw: Vec<String> = match settings.listen.as_ref() {
-        Some(list) if !list.is_empty() => list.clone(),
-        _ => cfg.listen.clone(),
-    };
+pub fn effective_listen_addrs(settings: &DeviceSettings) -> anyhow::Result<EffectiveListen> {
+    let raw: Vec<String> = effective_listen_raw(settings);
     let mut udp = Vec::new();
     let mut tcp = Vec::new();
     for item in &raw {
@@ -484,8 +481,8 @@ pub fn effective_listen_addrs(settings: &DeviceSettings, cfg: &NodeConfig) -> an
 
 /// 生效运行模式：托管 mode 覆盖文件默认（枚举化后由 serde+编译器保证
 /// 合法值穷举，无需手动解析——字符串时期曾两路径语义相反，AGENTS #21）。
-pub fn effective_mode_of(settings: &DeviceSettings, cfg: &NodeConfig) -> ClientMode {
-    settings.mode.unwrap_or(cfg.mode)
+pub fn effective_mode_of(settings: &DeviceSettings) -> ClientMode {
+    settings.mode.unwrap_or(ClientMode::Proxy)
 }
 
 impl NodeEngine {
@@ -515,7 +512,7 @@ impl NodeEngine {
         log: LogFn,
     ) -> anyhow::Result<Arc<NodeEngine>> {
         cfg.validate().map_err(|e| anyhow::anyhow!(e))?;
-        let effective_mode = effective_mode_of(&settings, &cfg);
+        let effective_mode = effective_mode_of(&settings);
         let dh_priv: [u8; 32] = hex::decode(cfg.identity.dh_private_key.expose())
             .map_err(|_| anyhow::anyhow!("身份中的 DH 私钥无效"))?
             .try_into()
@@ -533,7 +530,7 @@ impl NodeEngine {
         if control.insecure_http {
             (log)("警告：控制面使用明文 http://（服务器 --no-tls 模式？）");
         }
-        let effective_listen = effective_listen_addrs(&settings, &cfg)?;
+        let effective_listen = effective_listen_addrs(&settings)?;
         let udp = UdpMesh::bind(&effective_listen.udp, events_tx.clone(), Arc::clone(&log)).await?;
         if udp
             .used_fallback_port
@@ -580,7 +577,7 @@ impl NodeEngine {
             peer_policies: DashMap::new(),
             runtime_socks: Mutex::new(None),
             runtime_forwards: Mutex::new(Vec::new()),
-            runtime_mtu: AtomicU32::new(cfg.mtu),
+            runtime_mtu: AtomicU32::new(skiff_core::consts::DEFAULT_MTU),
             runtime_mode: Mutex::new(effective_mode),
             runtime_listen: Mutex::new(effective_listen.raw.clone()),
             tcp_listen_port: AtomicU16::new(0),
@@ -658,7 +655,7 @@ impl NodeEngine {
         let effective_forwards = settings.forwards.clone().unwrap_or_default();
         *shared.runtime_socks.lock().unwrap() = effective_socks.clone();
         *shared.runtime_forwards.lock().unwrap() = effective_forwards.clone();
-        shared.runtime_mtu.store(settings.mtu.unwrap_or(cfg.mtu), Ordering::Relaxed);
+        shared.runtime_mtu.store(settings.mtu.unwrap_or(skiff_core::consts::DEFAULT_MTU), Ordering::Relaxed);
 
         // Proxy-mode listeners: SOCKS5 + forwarders.
         if effective_mode == ClientMode::Proxy {
@@ -1158,26 +1155,11 @@ pub async fn bootstrap_settings_pub(
 
 async fn bootstrap_settings(
     control: &ControlClient,
-    config_path: &std::path::Path,
+    _config_path: &std::path::Path,
     log: &LogFn,
 ) -> DeviceSettings {
-    let candidate = legacy_seed(config_path);
-    if !candidate.is_empty()
-        && let Some(merged) = control.adopt_settings(&candidate).await
-    {
-        (log)("遗留本地配置已收编为服务端托管");
-        // 收编成功即重写瘦配置：NodeConfig 序列化不含遗留键，遗留值
-        // 已上移服务端托管——不重写则遗留键永留文件、每次启动重复
-        // 收编（幂等但违背瘦配置契约，legacy_seed 注释承诺的"文件被
-        // 重写后遗留键消失"此前从未实现）。
-        if let Ok(cfg) = crate::node_config::load(config_path)
-            && let Err(e) = crate::node_config::save(config_path, &cfg)
-        {
-            (log)(&format!("配置瘦化重写失败（不影响运行，下次启动重试）：{e}"));
-        }
-        return merged;
-    }
-    // 收编失败（罕见）：继续走拉取，下次启动再收编。
+    // 配置全托管：直接拉取（服务器不可达时节点无法工作，无限重试）。
+    // 遗留收编（adopt）已随 NodeConfig 终态瘦身移除——未上线无兼容负担。
     loop {
         if let Some(s) = control.get_settings().await {
             return s;
@@ -1185,47 +1167,6 @@ async fn bootstrap_settings(
         (log)("cannot fetch settings; retrying in 3s");
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
-}
-
-/// 从配置文件原始 JSON 提取遗留行为字段的**非默认值**作为收编候选
-///（NodeConfig 已不解析这些字段，此处按原始键读取；默认值不收编，
-/// 保持服务端托管面最小）。文件被重写后遗留键消失，收编自动停止。
-fn legacy_seed(path: &std::path::Path) -> DeviceSettings {
-    let mut out = DeviceSettings::default();
-    let Ok(text) = std::fs::read_to_string(path) else { return out };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return out };
-    if v["forceRelay"].as_bool() == Some(true) {
-        out.path_policy = Some(PathPolicy::RelayUdp);
-    } else if v["forceDirect"].as_bool() == Some(true) {
-        out.path_policy = Some(PathPolicy::DirectAny);
-    }
-    if let Some(mtu) = v["mtu"].as_u64().filter(|m| *m != u64::from(skiff_core::consts::DEFAULT_MTU)) {
-        out.mtu = Some(mtu as u32);
-    }
-    if let Some(socks) = v["socksListen"].as_str().filter(|s| *s != "127.0.0.1:1080") {
-        out.socks_listen = Some(socks.to_string());
-    }
-    if let Some(fwd) = v["forwards"].as_array().filter(|a| !a.is_empty())
-        && let Ok(rules) = serde_json::from_value::<Vec<ForwardRule>>(serde_json::Value::Array(fwd.clone()))
-    {
-        out.forwards = Some(rules);
-    }
-    if let Some(nets) = v["networks"].as_array() {
-        let mut list = Vec::new();
-        for n in nets {
-            let Some(rules_v) = n["exposes"].as_array().filter(|a| !a.is_empty()) else { continue };
-            let Some(id) = n["networkId"].as_str().and_then(NetId::from_hex) else { continue };
-            if let Ok(rules) = serde_json::from_value::<Vec<ExposeRule>>(serde_json::Value::Array(rules_v.clone()))
-                && !rules.is_empty()
-            {
-                list.push(NetworkExposes { network_id: id, rules });
-            }
-        }
-        if !list.is_empty() {
-            out.exposes = Some(list);
-        }
-    }
-    out
 }
 
 /// 把托管配置应用到运行态。路径策略（全局+对端覆盖）与 exposes 热生效；
@@ -1290,7 +1231,7 @@ fn apply_runtime_settings(shared: &Arc<EngineShared>, settings: &DeviceSettings,
     if startup {
         // 启动基准：生效模式与监听地址（重启类 diff 的比对基准）。
         *shared.runtime_listen.lock().unwrap() =
-            crate::engine::effective_listen_raw(settings, &shared.cfg.lock().unwrap().clone());
+            crate::engine::effective_listen_raw(settings);
     }
     let mut restart_needed = false;
     if !startup {
@@ -1334,10 +1275,11 @@ fn apply_runtime_settings(shared: &Arc<EngineShared>, settings: &DeviceSettings,
 }
 
 /// 生效监听原始 URL 列表（托管全量替换文件默认；空列表视为未托管走默认）。
-pub fn effective_listen_raw(settings: &DeviceSettings, cfg: &NodeConfig) -> Vec<String> {
+pub fn effective_listen_raw(settings: &DeviceSettings) -> Vec<String> {
     match settings.listen.as_ref() {
         Some(list) if !list.is_empty() => list.clone(),
-        _ => cfg.listen.clone(),
+        // 未下发 = 编译期默认（NodeConfig.listen 已裁剪，服务端为唯一来源）。
+        _ => skiff_core::models::default_listen(),
     }
 }
 
@@ -1773,7 +1715,7 @@ fn write_status(shared: &Arc<EngineShared>, path: &std::path::Path) {
         .collect();
     let (server, mode) = {
         let cfg = shared.cfg.lock().unwrap();
-        (cfg.server.clone(), cfg.mode.as_str().to_string())
+        (cfg.server.clone(), shared.runtime_mode.lock().unwrap().as_str().to_string())
     };
     let forwards = shared
         .runtime_forwards
@@ -1837,27 +1779,6 @@ fn log_stats(shared: &Arc<EngineShared>) {
 mod tests {
     use super::*;
 
-    fn test_cfg(mode: ClientMode) -> NodeConfig {
-        NodeConfig {
-            server: "http://127.0.0.1:1".into(),
-            mode,
-            mtu: 1280,
-            data_dir: String::new(),
-            listen: vec!["udp://0.0.0.0:0".into()],
-            log_file: None,
-            identity: skiff_core::models::Identity {
-                device_id: 1,
-                name: "t".into(),
-                device_token: skiff_core::secret::Secret::new("x"),
-                sign_public_key: String::new(),
-                sign_private_key: skiff_core::secret::Secret::new("x"),
-                dh_public_key: String::new(),
-                dh_private_key: skiff_core::secret::Secret::new("x"),
-                server_cert_pin: None,
-            },
-        }
-    }
-
     fn settings_with_mode(mode: Option<ClientMode>) -> DeviceSettings {
         DeviceSettings {
             mode,
@@ -1870,7 +1791,7 @@ mod tests {
     #[test]
     fn managed_proxy_overrides_file_tun() {
         assert_eq!(
-            effective_mode_of(&settings_with_mode(Some(ClientMode::Proxy)), &test_cfg(ClientMode::Tun)),
+            effective_mode_of(&settings_with_mode(Some(ClientMode::Proxy))),
             ClientMode::Proxy
         );
     }
@@ -1878,17 +1799,18 @@ mod tests {
     #[test]
     fn managed_tun_overrides_file_proxy() {
         assert_eq!(
-            effective_mode_of(&settings_with_mode(Some(ClientMode::Tun)), &test_cfg(ClientMode::Proxy)),
+            effective_mode_of(&settings_with_mode(Some(ClientMode::Tun))),
             ClientMode::Tun
         );
     }
 
-    /// 未托管（None）沿用文件值。
+    /// 未托管（None）= 编译期默认 Proxy（NodeConfig 已无 mode 字段，
+    /// 服务端为唯一来源，缺省即默认值）。
     #[test]
-    fn unmanaged_mode_falls_back_to_file() {
+    fn unmanaged_mode_falls_back_to_default() {
         assert_eq!(
-            effective_mode_of(&settings_with_mode(None), &test_cfg(ClientMode::Tun)),
-            ClientMode::Tun
+            effective_mode_of(&settings_with_mode(None)),
+            ClientMode::Proxy
         );
     }
 }

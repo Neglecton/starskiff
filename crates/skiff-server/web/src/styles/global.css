@@ -1,7 +1,7 @@
 /* Semantic tokens keep custom UI consistent with Naive UI in both themes. */
 :root {
   color-scheme: light;
-  --sk-page-bg: #f8fafc;
+  --sk-page-bg: #f4f6f8;
   --sk-header-bg: rgba(255, 255, 255, 0.92);
   --sk-surface: #ffffff;
   --sk-surface-soft: #f1f5f9;
@@ -10,7 +10,10 @@
   --sk-text: #1e293b;
   --sk-text-muted: #64748b;
   --sk-topology-grid: rgba(100, 116, 139, 0.12);
-  --sk-brand: #2563eb;
+  --sk-brand: #334155;
+  --sk-ink: #1e293b;
+  --sk-ink-hover: #334155;
+  --sk-ink-pressed: #0f172a;
   --sk-topology-label: #475569;
   --sk-topology-rtt: #64748b;
   --sk-direct-udp: #047857;
@@ -18,7 +21,9 @@
   --sk-relay-tcp: #7e22ce;
   --sk-relay-udp: #b45309;
   --sk-offline: #64748b;
-  --sk-shadow: 0 12px 32px rgba(15, 23, 42, 0.08);
+  --sk-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+  --sk-radius: 16px;
+  --sk-radius-sm: 12px;
 }
 
 .theme-dark {
@@ -32,7 +37,10 @@
   --sk-text: #f8fafc;
   --sk-text-muted: #94a3b8;
   --sk-topology-grid: rgba(148, 163, 184, 0.1);
-  --sk-brand: #60a5fa;
+  --sk-brand: #cbd5e1;
+  --sk-ink: #e2e8f0;
+  --sk-ink-hover: #f8fafc;
+  --sk-ink-pressed: #cbd5e1;
   --sk-topology-label: #cbd5e1;
   --sk-topology-rtt: #94a3b8;
   --sk-direct-udp: #34d399;
@@ -59,8 +67,12 @@ button, input, textarea, select {
 }
 
 :focus-visible {
-  outline: 2px solid #3b82f6;
+  outline: 2px solid var(--sk-ink);
   outline-offset: 2px;
+}
+
+.muted {
+  color: var(--sk-text-muted);
 }
 
 /* Monospace for ids / tokens / CIDRs. */
@@ -85,6 +97,14 @@ button, input, textarea, select {
   flex: none;
 }
 
+.path-dot.direct {
+  background: var(--sk-direct-udp);
+}
+
+.path-dot.relay {
+  background: var(--sk-relay-udp);
+}
+
 /* Long tokens: break-all so narrow screens stay usable. */
 .token-text {
   word-break: break-all;
@@ -102,7 +122,7 @@ button, input, textarea, select {
   justify-content: space-between;
   gap: 16px;
   flex-wrap: wrap;
-  min-height: 65px;
+  min-height: 64px;
   box-sizing: border-box;
   padding: 12px clamp(16px, 4vw, 40px);
   border-bottom: 1px solid var(--sk-border);
@@ -116,7 +136,7 @@ button, input, textarea, select {
   align-items: baseline;
   gap: 10px;
   margin: 0;
-  font-size: 19px;
+  font-size: 18px;
   font-weight: 700;
   letter-spacing: -0.02em;
 }
@@ -130,7 +150,7 @@ button, input, textarea, select {
 .header-actions {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 8px;
   flex-wrap: wrap;
 }
 
@@ -145,9 +165,14 @@ button, input, textarea, select {
 
 .page-content .n-data-table {
   border: 1px solid var(--sk-border);
-  border-radius: 10px;
+  border-radius: var(--sk-radius-sm);
   overflow: hidden;
   background: var(--sk-surface);
+}
+
+.page-content .panel-card .n-data-table {
+  border: none;
+  border-radius: 0;
 }
 
 .table-empty {
@@ -162,6 +187,38 @@ button, input, textarea, select {
   align-items: flex-end;
   gap: 10px;
   flex-wrap: wrap;
+  /* Guard against Naive UI's runtime `inline` form CSS (width:100% on a
+     content-box element + horizontal padding overflows the clipping panel). */
+  box-sizing: border-box;
+}
+
+.panel-card {
+  border: 1px solid var(--sk-border);
+  border-radius: var(--sk-radius);
+  background: var(--sk-surface);
+  overflow: hidden;
+}
+
+.panel-card .form-toolbar {
+  padding: 16px 18px 8px;
+}
+
+.panel-body {
+  padding: 16px 18px 18px;
+}
+
+.proto-pill {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: 1px solid var(--sk-border);
+  background: var(--sk-surface-soft);
+  color: var(--sk-text);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
 }
 
 @media (max-width: 640px) {

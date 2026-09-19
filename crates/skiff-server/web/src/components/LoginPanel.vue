@@ -63,7 +63,7 @@ onMounted(() => {
 <style scoped>
 .login-card {
   width: min(400px, 100%);
-  border-radius: 16px;
+  border-radius: var(--sk-radius);
   box-shadow: var(--sk-shadow);
 }
 

@@ -146,6 +146,16 @@ fn linux_firewall(unit: &str, ports: &[(u16, &str)], add: bool) -> Result<(), St
             let comment = format!("starskiff-{unit}-{proto}");
             let spec = format!("--dport={port}");
             let (verb, pos) = if add { ("-I", "1") } else { ("-D", "-p") };
+            // 存在性检查（-C）保证 add 幂等：运行时同步每次 worker 启动
+            // 都会调用，无条件 -I 会在 INPUT 链堆积重复规则。
+            if add {
+                let check: Vec<&str> = vec![
+                    "-C", "INPUT", "-p", proto, &spec, "-j", "ACCEPT", "-m", "comment", "--comment", &comment,
+                ];
+                if run_tool("iptables", &check, timeout).is_ok() {
+                    continue; // 规则已存在
+                }
+            }
             // delete mirrors the add rule text (iptables -D matches the rule,
             // not a position), so the argument shapes differ slightly:
             let args: Vec<&str> = if add {

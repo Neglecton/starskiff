@@ -20,17 +20,17 @@ npm run dev        # 本地开发服务器（API 需另行指定地址登录）
 ```
 src/
 ├── main.js            # createApp + i18n + naive 注册
-├── App.vue            # 主题/语言 Provider、登录态切换、header（语言/主题/断开）
+├── App.vue            # 主题/语言 Provider、登录态切换、header（语言/浅-系统-深/断开）
 ├── api.js             # fetch 封装（X-Admin-Token；按 Content-Type 解析，兼容纯文本成功响应）
-├── store.js           # reactive store：token/语言/主题（localStorage 持久化）
+├── store.js           # reactive store：token/语言/主题（localStorage 持久化；theme 含 system）
 ├── i18n/              # vue-i18n + zh-CN / en-US 语言包（store.lang 驱动，同步 document.lang）
-├── styles/global.css  # 全局样式（等宽 .mono、header 等）
-└── components/        # LoginPanel / StatCards / NetworksTab / DevicesTab / TokensTab
+├── styles/global.css  # 语义 token、header、卡片、表格
+└── components/        # LoginPanel / StatCards / TopologyTab / NetworksTab / DevicesTab / TokensTab / SettingsTab
 ```
 
 ## 约定
 
 - 用户可见文案一律走 i18n（`src/i18n/locales/`），禁止硬编码中英文；Naive UI 组件文案随 `n-config-provider` 的 locale 同步。
-- 主题默认浅色；手动切换后持久化，颜色通过 `themeOverrides`（App.vue）和页面语义 token 统一管理。
+- 主题默认浅色；可选浅色 / 跟随系统 / 深色，手动选择后持久化。颜色通过 `themeOverrides`（App.vue）和页面语义 token 统一管理。
 - 表格列的 render 用 `computed` 包裹 `t()`，保证切换语言即时生效。
 - 图标用 `@vicons/ionicons5`（内联打包），不用 emoji。

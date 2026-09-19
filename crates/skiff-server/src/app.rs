@@ -341,7 +341,7 @@ fn router(state: SharedState) -> Router {
         .route("/api/enroll", post(enroll))
         .route("/api/config", get(get_config))
         .route("/api/peers", get(get_peers))
-        .route("/api/settings", get(get_device_settings).put(adopt_device_settings))
+        .route("/api/settings", get(get_device_settings))
         .route("/api/settings/fail", post(report_settings_fail))
         .route("/api/memberships", get(list_memberships))
         .route("/api/heartbeat", post(heartbeat))
@@ -700,45 +700,6 @@ async fn report_settings_fail(State(state): State<SharedState>, req: Request<Bod
             (StatusCode::OK, Json(json!({ "rolledBackTo": rolled.revision }))).into_response()
         }
         Ok(None) => (StatusCode::OK, Json(json!({ "rolledBackTo": null }))).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    }
-}
-
-/// PUT /api/settings/adopt — 节点把遗留本地配置值收编为服务端托管：
-/// 仅填充当前未托管的字段（字段级合并，已托管字段不被节点覆盖）。
-async fn adopt_device_settings(State(state): State<SharedState>, req: Request<Body>) -> Response {
-    let Some(device) = state.auth_device(&req) else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    let body = axum::body::to_bytes(req.into_body(), 256 * 1024)
-        .await
-        .unwrap_or_default();
-    let Ok(mut payload) = serde_json::from_slice::<DeviceSettings>(&body) else {
-        return err(StatusCode::BAD_REQUEST, "invalid body");
-    };
-    payload.revision = 0; // 服务端权威
-    if let Err(msg) = payload.validate() {
-        return err(StatusCode::BAD_REQUEST, msg);
-    }
-    match state.repo.adopt_device_settings(device.id, &payload) {
-        Ok(merged) => {
-            if merged.revision > 0 && !merged.is_empty() {
-                (state.log)(&format!(
-                    "SETTINGS_ADOPT device={}({}) revision={}",
-                    device.name, device.id, merged.revision
-                ));
-                state.hub.send_to_device(
-                    device.id,
-                    WsEvent {
-                        event_type: ws_events::SETTINGS_CHANGED.to_string(),
-                        network_id: None,
-                        device_id: Some(device.id),
-                        message: Some(merged.revision.to_string()),
-                    },
-                );
-            }
-            Json(merged).into_response()
-        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }

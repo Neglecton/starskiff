@@ -57,7 +57,7 @@ pub fn action_for_exit(code: i32, consecutive_restarts: u32, uptime: Duration) -
 }
 
 /// 只解析 dataDir（不做 validate：无法启动的配置也要能算出 stop.flag 路径）。
-fn data_dir_of(config: &Path) -> PathBuf {
+pub(crate) fn data_dir_of(config: &Path) -> PathBuf {
     let text = std::fs::read_to_string(config).unwrap_or_default();
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
         && let Some(dir) = v["dataDir"].as_str().filter(|s| !s.is_empty())
@@ -98,6 +98,21 @@ async fn graceful_stop(child: &mut tokio::process::Child, config: &Path, log: &L
 /// Ctrl+C / `starskiff down`）。`worker_log_file` 透传给 worker 的
 /// `--log-file`（`up --log-file x.log` 场景）。
 pub async fn run(
+    config: PathBuf,
+    worker_log_file: Option<PathBuf>,
+    log: LogFn,
+    stop_rx: watch::Receiver<bool>,
+) -> i32 {
+    let code = run_inner(config.clone(), worker_log_file, log.clone(), stop_rx).await;
+    // master 最终退出前清理运行时防火墙规则（AGENTS #17：系统配置不
+    // 遗留）——worker 崩溃重启期间不清理，只有 master 真正退出才执行。
+    for line in crate::service_install::cleanup_runtime_firewall(&data_dir_of(&config)) {
+        (log)(&line);
+    }
+    code
+}
+
+async fn run_inner(
     config: PathBuf,
     worker_log_file: Option<PathBuf>,
     log: LogFn,

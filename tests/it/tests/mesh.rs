@@ -587,25 +587,29 @@ async fn path_policy_switches_routes() {
     }
     let a_tcp = free_tcp_port();
     let b_tcp = free_tcp_port();
-    h.set_settings(&sa, serde_json::json!({ "socksListen": "127.0.0.1:0" })).await;
+    // listen 已全托管：固定 TCP 监听端口经启动前 PUT 下发（bootstrap 即
+    // 拉取生效），不再走文件 tune。
     h.set_settings(
-        &sb,
-        serde_json::json!({ "exposes": [{
-            "networkId": net_id.to_hex(),
-            "rules": [{ "port": 9090, "proto": "tcp", "dest": format!("127.0.0.1:{echo_port}") }]
-        }]}),
+        &sa,
+        serde_json::json!({
+            "socksListen": "127.0.0.1:0",
+            "listen": ["udp://0.0.0.0:0", format!("tcp://127.0.0.1:{a_tcp}")]
+        }),
     )
     .await;
-    let ea = h
-        .start_engine(&sa, |c| {
-            c.listen.push(format!("tcp://127.0.0.1:{a_tcp}"));
-        })
-        .await;
-    let eb = h
-        .start_engine(&sb, |c| {
-            c.listen.push(format!("tcp://127.0.0.1:{b_tcp}"));
-        })
-        .await;
+    h.set_settings(
+        &sb,
+        serde_json::json!({
+            "exposes": [{
+                "networkId": net_id.to_hex(),
+                "rules": [{ "port": 9090, "proto": "tcp", "dest": format!("127.0.0.1:{echo_port}") }]
+            }],
+            "listen": ["udp://0.0.0.0:0", format!("tcp://127.0.0.1:{b_tcp}")]
+        }),
+    )
+    .await;
+    let ea = h.start_engine(&sa, |_| {}).await;
+    let eb = h.start_engine(&sb, |_| {}).await;
     let _ec = h.start_engine(&sc, |_| {}).await;
     h.until(|| {
         ea.peers().iter().any(|(_, p)| p.name() == "pol-b" && p.online())
@@ -769,19 +773,13 @@ async fn direct_tcp_pin_probes_connect_and_carries_ping_pong() {
     let h = TestHarness::create().await;
     let pa = h.enroll_node("dtcp-a", None).await;
     let pb = h.enroll_node("dtcp-b", None).await;
-    // 端口 0 = 随机：并行测试会争抢默认 24933，后启动的节点 TCP 监听
-    // 被容错跳过（tcp_listen_port=None），探测无从发起。
-    let ea = h
-        .start_engine(&pa, |c| c.listen = vec!["udp://0.0.0.0:0".into(), "tcp://0.0.0.0:0".into()])
-        .await;
-    let eb = h
-        .start_engine(&pb, |c| c.listen = vec!["udp://0.0.0.0:0".into(), "tcp://0.0.0.0:0".into()])
-        .await;
-
-    // 双侧 pin directTcp：不走中继、无 UDP 喷射，连通性完全取决于 TCP
-    // 探测建连。
-    h.set_settings(&pa, serde_json::json!({ "pathPolicy": "directTcp" })).await;
-    h.set_settings(&pb, serde_json::json!({ "pathPolicy": "directTcp" })).await;
+    // 端口 0 = 随机（并行测试会争抢默认 24933）；listen 全托管，启动前
+    // PUT（bootstrap 即拉到 pin + 随机端口，无启动后改配置的窗口）。
+    let rnd_listen = serde_json::json!(["udp://0.0.0.0:0", "tcp://0.0.0.0:0"]);
+    h.set_settings(&pa, serde_json::json!({ "pathPolicy": "directTcp", "listen": rnd_listen })).await;
+    h.set_settings(&pb, serde_json::json!({ "pathPolicy": "directTcp", "listen": rnd_listen })).await;
+    let ea = h.start_engine(&pa, |_| {}).await;
+    let eb = h.start_engine(&pb, |_| {}).await;
     h.until(|| {
         *ea.shared.path_policy.lock().unwrap() == skiff_core::models::PathPolicy::DirectTcp
             && *eb.shared.path_policy.lock().unwrap() == skiff_core::models::PathPolicy::DirectTcp
@@ -1097,78 +1095,6 @@ async fn same_device_across_two_networks_lands_in_right_session() {
     }
 }
 
-/// 遗留配置收编端到端（曾零覆盖）：旧格式文件的非默认值（forceRelay /
-/// socksListen / forwards）在首次启动经 adopt 收编为服务端托管，之后
-/// 文件被重写为瘦配置、遗留键消失。
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn legacy_file_values_are_adopted_and_file_rewritten_thin() {
-    let h = TestHarness::create().await;
-    let pa = h.enroll_node("legacy-a", None).await;
-    let dev_id = h.device_id_of(&pa);
-
-    // 写入遗留字段（旧格式）。
-    let mut v: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&pa).unwrap()).unwrap();
-    v["forceRelay"] = serde_json::json!(true);
-    v["socksListen"] = serde_json::json!("127.0.0.1:12377");
-    v["forwards"] = serde_json::json!([{
-        "listen": "127.0.0.1:15001", "proto": "tcp", "dest": "10.99.0.2:80"
-    }]);
-    std::fs::write(&pa, serde_json::to_string_pretty(&v).unwrap()).unwrap();
-
-    // 直调 NodeEngine::start：harness 的 start_engine 会先按瘦配置重写
-    // 文件，把注入的遗留键在引擎读到之前抹掉——收编路径必须从原始遗留
-    // 文件启动。
-    let cfg = skiff_node::node_config::load(&pa).unwrap();
-    let log: skiff_core::logging::LogFn = std::sync::Arc::new(|_| {});
-    let sink: skiff_node::engine::DataSink = Box::new(|_| {});
-    let _ea = skiff_node::engine::NodeEngine::start(pa.clone(), cfg, sink, log)
-        .await
-        .expect("engine starts with legacy file");
-
-    // 等收编落库：服务端托管出现遗留值。
-    let base = h.base_url();
-    let admin_token = h.admin_token.clone();
-    let admin_client = h.admin.clone();
-    h.until_with_timeout(
-        move || {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    let s: serde_json::Value = admin_client
-                        .get(format!("{base}/admin/devices/{dev_id}/settings"))
-                        .header("X-Admin-Token", &admin_token)
-                        .send()
-                        .await
-                        .unwrap()
-                        .json()
-                        .await
-                        .unwrap();
-                    s["pathPolicy"] == serde_json::json!("relayUdp")
-                        && s["socksListen"] == serde_json::json!("127.0.0.1:12377")
-                        && s["forwards"].as_array().is_some_and(|a| a.len() == 1)
-                        && s["socksListen"] == serde_json::json!("127.0.0.1:12377")
-                        && s["forwards"].as_array().is_some_and(|a| a.len() == 1)
-                })
-            })
-        },
-        Duration::from_secs(15),
-    )
-    .await;
-
-    // 文件被重写为瘦配置：遗留键消失。
-    h.until(|| {
-        std::fs::read_to_string(&pa)
-            .ok()
-            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-            .is_some_and(|after| {
-                after.get("forceRelay").is_none()
-                    && after.get("socksListen").is_none()
-                    && after.get("forwards").is_none()
-            })
-    })
-    .await;
-}
-
 /// 多地址 listen 语义：通配端口被占→回退随机（标志置位）+ 指定地址共存
 /// 多绑定；TCP 指定地址独立绑定。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1179,15 +1105,16 @@ async fn multi_address_listen_fallback_and_extra_binds() {
     let guard = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
     let occupied = guard.local_addr().unwrap().port();
 
-    let ea = h
-        .start_engine(&pa, |c| {
-            c.listen = vec![
-                format!("udp://0.0.0.0:{occupied}"),
-                "udp://127.0.0.1:0".into(),
-                "tcp://127.0.0.1:0".into(),
-            ];
-        })
-        .await;
+    h.set_settings(
+        &pa,
+        serde_json::json!({ "listen": [
+            format!("udp://0.0.0.0:{occupied}"),
+            "udp://127.0.0.1:0",
+            "tcp://127.0.0.1:0"
+        ]}),
+    )
+    .await;
+    let ea = h.start_engine(&pa, |_| {}).await;
     assert!(
         ea.shared.udp.used_fallback_port.load(std::sync::atomic::Ordering::Relaxed),
         "被占通配端口应回退随机"
@@ -1204,8 +1131,9 @@ async fn multi_address_listen_fallback_and_extra_binds() {
 async fn unassigned_ip_listen_is_fatal() {
     let h = TestHarness::create().await;
     let pa = h.enroll_node("mfail-a", None).await;
-    let mut cfg = skiff_node::node_config::load(&pa).unwrap();
-    cfg.listen = vec!["udp://203.0.113.1:0".into()]; // TEST-NET-3，不在本机
+    // listen 全托管：先 PUT 再启动（bootstrap 拉到 TEST-NET-3 地址）。
+    h.set_settings(&pa, serde_json::json!({ "listen": ["udp://203.0.113.1:0"] })).await;
+    let cfg = skiff_node::node_config::load(&pa).unwrap();
     let log: skiff_core::logging::LogFn = std::sync::Arc::new(|_| {});
     let sink: skiff_node::engine::DataSink = Box::new(|_| {});
     let result = skiff_node::engine::NodeEngine::start(pa.clone(), cfg, sink, log).await;
