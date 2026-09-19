@@ -28,6 +28,9 @@ pub fn install(
     #[cfg_attr(not(windows), allow(unused_variables))] start_mode: &str,
     #[cfg_attr(not(windows), allow(unused_variables))] display: Option<&str>,
     no_restart: bool,
+    // 透传给 `service run`（→ worker）的滚动日志文件；服务模式下唯一
+    // 的文件日志来源（SCM 不接收 stdout）。
+    log_file: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     let name = service_name(name);
     NodeConfig::load(config).map_err(|e| anyhow!("{e}"))?;
@@ -49,10 +52,31 @@ pub fn install(
         if sc_query.is_some() {
             anyhow::bail!("服务 {name} 已存在");
         }
-        // sc.exe binPath escaping: inner quotes escaped with \", whole value
-        // wrapped in quotes by the argument itself.
-        let cfg_text = config.to_string_lossy();
-        let bin_value = format!("\\\"{exe}\\\" service run -c \\\"{cfg_text}\\\"");
+        // binPath 两步写（双机实测收敛的工程事实）：
+        // 1) `sc create` 只传**最短 binPath（exe 纯路径）**——CreateService
+        //    对创建时传入的长命令行（含 `-c`/`--log-file` 参数）存在拒绝
+        //    （后续 StartService 恒报 87 参数错误，Server 2022 与 Win11 双
+        //    机复现，与服务程序无关：cmd.exe 同样中招）；
+        // 2) 再用 `reg add` 覆盖 ImagePath 为完整命令行——服务启动时 SCM
+        //    从注册表读取，无此限制（同串 reg 写入后全生命周期 RUNNING、
+        //    worker 正常产出日志已实测）。
+        // ImagePath 形态：全裸（exe 与参数均不带引号，系统带参服务同款），
+        // 三个路径都不能含空格——安装期显式校验，优于装出一个永远 87 的服务。
+        let cfg_text = config.to_string_lossy().to_string();
+        let lf_text = log_file
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        for (label, p) in [("程序", exe.as_ref()), ("配置", &cfg_text), ("日志", &lf_text)] {
+            if !p.is_empty() && p.contains(' ') {
+                anyhow::bail!(
+                    "{label}路径含空格，服务 binPath 无法安全传递（SCM 对 ImagePath 引号的限制）：{p}。请移动到无空格路径后重装"
+                );
+            }
+        }
+        let mut bin_value = format!("{exe} service run -c {cfg_text}");
+        if !lf_text.is_empty() {
+            bin_value.push_str(&format!(" --log-file {lf_text}"));
+        }
         let start_flag = match start_mode {
             "delayed" => "delayed-auto",
             "demand" => "demand",
@@ -63,9 +87,25 @@ pub fn install(
             &[
                 "create",
                 &name,
-                &format!("binpath= \"{bin_value}\""),
+                &format!("binpath= {exe}"),
                 "start=",
                 start_flag,
+            ],
+            timeout,
+        )?;
+        // 第二步：reg 覆盖完整 ImagePath（见上方两步写注释）。
+        run_tool(
+            "reg",
+            &[
+                "add",
+                &format!(r"HKLM\SYSTEM\CurrentControlSet\Services\{name}"),
+                "/v",
+                "ImagePath",
+                "/t",
+                "REG_EXPAND_SZ",
+                "/d",
+                &bin_value,
+                "/f",
             ],
             timeout,
         )?;
@@ -107,8 +147,11 @@ pub fn install(
         }
         let cfg_text = config.to_string_lossy();
         let restart = if no_restart { "no" } else { "always" };
+        let log_tail = log_file
+            .map(|lf| format!(" --log-file {}", lf.to_string_lossy()))
+            .unwrap_or_default();
         let unit = format!(
-            "[Unit]\nDescription=Starskiff mesh VPN node\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={exe} service run -c {cfg_text}\nRestart={restart}\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
+            "[Unit]\nDescription=Starskiff mesh VPN node\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={exe} service run -c {cfg_text}{log_tail}\nRestart={restart}\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
         );
         std::fs::write(&unit_path, unit)?;
         run_tool("systemctl", &["daemon-reload"], timeout)?;

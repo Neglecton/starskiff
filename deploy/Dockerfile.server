@@ -25,6 +25,10 @@ FROM alpine:3
 COPY --from=build /src/target/release/starskiff-server /app/starskiff-server
 EXPOSE 24930 24932/tcp 24931/udp
 VOLUME /data
-# 首次启动用 `docker run … init` 生成数据库并打印管理令牌（仅一次），
-# 之后长期 serve。
+# 令牌获取无需手动 init：serve 首次启动（卷内无数据库）自动生成管理令牌
+# 并打印到容器日志（仅一次），docker logs 捞"管理员令牌（仅显示一次）"
+# 那行保存即可。如需先交互式生成再长期运行（ENTRYPOINT 含 serve，init
+# 必须 --entrypoint 覆盖）：
+#   docker run --rm -it --entrypoint /app/starskiff-server \
+#     -v <卷>:/data <镜像> init --db /data/starskiff.sqlite
 ENTRYPOINT ["/app/starskiff-server", "serve", "--db", "/data/starskiff.sqlite"]

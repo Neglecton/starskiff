@@ -107,6 +107,9 @@ enum ServiceCmd {
         no_restart: bool,
         #[arg(long)]
         display: Option<String>,
+        /// 滚动日志文件（SCM 不接收 stdout，服务模式的唯一文件日志）。
+        #[arg(long)]
+        log_file: Option<PathBuf>,
     },
     Remove {
         #[arg(long)]
@@ -121,6 +124,8 @@ enum ServiceCmd {
     Run {
         #[arg(short, long, default_value = "starskiff.json")]
         config: PathBuf,
+        #[arg(long)]
+        log_file: Option<PathBuf>,
     },
 }
 
@@ -371,31 +376,44 @@ fn cmd_init_config(out: PathBuf, force: bool) -> anyhow::Result<()> {
 fn cmd_service(cmd: ServiceCmd) -> anyhow::Result<()> {
     use skiff_node::service_install as si;
     match cmd {
-        ServiceCmd::Install { config, name, start, no_restart, display } => {
-            si::install(name.as_deref(), config.as_path(), &start, display.as_deref(), no_restart)
+        ServiceCmd::Install { config, name, start, no_restart, display, log_file } => {
+            si::install(
+                name.as_deref(),
+                config.as_path(),
+                &start,
+                display.as_deref(),
+                no_restart,
+                log_file.as_deref(),
+            )
         }
         ServiceCmd::Remove { name, config } => si::remove(name.as_deref(), config.as_ref()),
         ServiceCmd::Start { name } => si::start(name.as_deref()),
         ServiceCmd::Stop { name } => si::stop(name.as_deref()),
         ServiceCmd::Status { name } => si::status(name.as_deref()),
-        ServiceCmd::Run { config } => {
+        ServiceCmd::Run { config, log_file } => {
             // master 不严格校验配置（worker 负责校验并报错，由 master 退避
             // 重启消化；服务保持 RUNNING，避免 SCM 日志被刷屏）。
-            let log = skiff_node::make_logger_from_config_file(None, &config, true);
+            let log = skiff_node::make_logger_from_config_file(log_file.as_deref(), &config, true);
             #[cfg(windows)]
             {
                 let name = name_of_from(&config);
                 let config_for_body = config.clone();
                 let log_for_body: LogFn = log.clone();
                 let code = skiff_node::win_service::run(&name, move |stop| {
-                    skiff_node::service_body_blocking(config_for_body.clone(), stop, log_for_body.clone())
+                    skiff_node::service_body_blocking(
+                        config_for_body.clone(),
+                        log_file.clone(),
+                        stop,
+                        log_for_body.clone(),
+                    )
                 });
                 std::process::exit(code);
             }
             #[cfg(not(windows))]
             {
                 let runtime = tokio::runtime::Runtime::new()?;
-                let code = runtime.block_on(skiff_node::run_engine_with_signals(config, log));
+                let code =
+                    runtime.block_on(skiff_node::run_engine_with_signals(config, log_file, log));
                 std::process::exit(code);
             }
         }

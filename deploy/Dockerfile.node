@@ -4,10 +4,16 @@
 #
 #   docker build -f deploy/Dockerfile.node -t starskiff .
 #
-# 默认 proxy 模式（SOCKS/端口转发，无需特权）。首次 enroll 需交互式生成
-# 身份：先 `docker run … enroll --server https://… --token skk_…` 写入
-# /data/starskiff.json，再 up。TUN 模式需宿主设备与权限：
-#   docker run --device /dev/net/tun --cap-add NET_ADMIN …
+# 用法（默认 proxy 模式，无需特权）：
+#   1) 一次性注册（ENTRYPOINT 是 up，enroll 必须 --entrypoint 覆盖）：
+#      docker run --rm -it --entrypoint /app/starskiff -v skiff-node:/data starskiff \
+#          enroll -c /data/starskiff.json --server https://<server>:24930 --token skk_…
+#   2) 长期运行：docker run -d --restart unless-stopped -v skiff-node:/data starskiff
+# 推荐在 Linux 宿主上用 --network host：SOCKS（默认 127.0.0.1:1080）、端口
+# 转发与 P2P UDP 监听全部直接可用；bridge 网络需 -p 24933:24933 -p
+# 24933:24933/udp（被直连），且经管理页把 socksListen 托管为 0.0.0.0:1080
+# 并 -p 1080:1080 才能从宿主访问。
+# TUN 模式需宿主设备与权限：--device /dev/net/tun --cap-add NET_ADMIN。
 FROM node:20-slim AS web
 WORKDIR /web
 COPY crates/skiff-server/web/package.json crates/skiff-server/web/package-lock.json ./

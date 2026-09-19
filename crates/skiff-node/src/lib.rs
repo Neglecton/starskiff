@@ -117,7 +117,11 @@ pub async fn run_engine_until_stopped(
 
 /// Linux `service run` master：SIGTERM/SIGINT 优雅停止 worker。
 #[cfg(not(windows))]
-pub async fn run_engine_with_signals(config_path: PathBuf, log: LogFn) -> i32 {
+pub async fn run_engine_with_signals(
+    config_path: PathBuf,
+    log_file: Option<PathBuf>,
+    log: LogFn,
+) -> i32 {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = match signal(SignalKind::terminate()) {
         Ok(s) => s,
@@ -134,7 +138,7 @@ pub async fn run_engine_with_signals(config_path: PathBuf, log: LogFn) -> i32 {
         }
     };
     let (stop_tx, stop_rx) = watch::channel(false);
-    let mut join = tokio::spawn(supervisor::run(config_path, None, log, stop_rx));
+    let mut join = tokio::spawn(supervisor::run(config_path, log_file, log, stop_rx));
     tokio::select! {
         code = &mut join => code.unwrap_or(EXIT_ERROR),
         _ = sigterm.recv() => {
@@ -153,6 +157,7 @@ pub async fn run_engine_with_signals(config_path: PathBuf, log: LogFn) -> i32 {
 /// 异常由 master 就地重启消化，服务保持 RUNNING）。
 pub fn service_body_blocking(
     config: PathBuf,
+    log_file: Option<PathBuf>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     log: LogFn,
 ) -> i32 {
@@ -168,7 +173,7 @@ pub fn service_body_blocking(
     };
     rt.block_on(async {
         let (stop_tx, stop_rx) = watch::channel(false);
-        let join = tokio::spawn(supervisor::run(config, None, log, stop_rx));
+        let join = tokio::spawn(supervisor::run(config, log_file, log, stop_rx));
         loop {
             if stop.load(std::sync::atomic::Ordering::SeqCst) {
                 let _ = stop_tx.send(true);

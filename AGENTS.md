@@ -65,6 +65,7 @@ tests/it              Harness（进程内 server+节点）+ mesh.rs 六场景
 21. **字符串枚举 match 必须穷举合法值，`_`/else 只留缺省**：`Some("tun") => Tun, _ => 文件值` 曾吞掉同样合法的 `Some("proxy")`，且另一处同一解析写成 `else => Proxy`——两路径语义相反（启动按文件、运行时按托管，白转一圈重启圈）。合法值逐个显式列举；同一 wire 字符串在多处解析必须收敛为同一语义（最好单一函数）；双向变更都要测（proxy→tun 测了、tun→proxy 漏测过）。
 22. **"读-判-写"存储操作默认写成单条条件 UPDATE / 事务内守卫**：先 SELECT 再无条件 UPDATE 必开并发窗口（心跳 appliedRevision 判定与管理员 PUT 交错，未验证配置被固化进 last_good，回滚回到坏配置自身）。凡带 revision/版本判定的写入，WHERE 里带守卫条件，把正确性交给数据库原子性而非调用方时序；测试直接锁定守护语义（过期 revision 不生效），不追求复现竞态。
 23. **修完时序/竞态 bug 按不变式穷举写入路径，而非止于症状消失**：T3 堵住 worker 代答入口后回滚循环消失，但服务端心跳 TOCTOU 同样能把未验证配置固化进 last_good（同 #22）。修完后自问"还有谁能把坏值写进这个字段/状态"，逐个入口闭合。
+24. **Windows 服务安装必须两步写 binPath（service_install.rs）**：`sc create` 创建时**直传长命令行（含 `-c`/`--log-file` 等参数）会让后续 StartService 恒报 87 参数错误**（CreateService 层限制，Server 2022 与 Win11 双机复现，与服务程序无关——cmd.exe 纯 exe 传参同中招），且 binPath 值里的引号（无论 `\"` 字面还是包裹引号）都会存进 ImagePath 让 SCM 解析失败；正确做法是 `sc create` 只传 exe 纯路径，再用 `reg add` 覆盖 ImagePath 为完整命令行（**全裸无引号**，启动时 SCM 从注册表读取无此限制）。三个路径（exe/config/log）都不能含空格，安装期校验报错。排障教训：`sc start` 87 ≠ 参数引号一种成因，用"exe 存在/缺失"对照（缺失报 2 = 解析已通过）与预装服务对照逐步收敛，别在引号变体里空转。
 
 ## 结构化日志（稳定性/性能分析）
 

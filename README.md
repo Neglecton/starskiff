@@ -167,7 +167,7 @@ starskiff up -c starskiff.json                                  # 双网络同�
 
 ```powershell
 # 管理员 PowerShell，先完成 enroll 并准备好 starskiff.json
-starskiff service install -c C:\path\starskiff.json   # 默认开机自启 + 崩溃自动重启
+starskiff service install -c C:\path\starskiff.json --log-file C:\path\log\node.log
 starskiff service start
 starskiff service status
 starskiff service stop
@@ -175,7 +175,7 @@ starskiff service remove
 ```
 
 - 服务以 LocalSystem 运行（TUN 模式可用），显示名/启动类型可用 `--display`、`--start auto|delayed|demand` 定制，`--no-restart` 关闭崩溃重启
-- 服务日志默认写 `<dataDir>/service.log`（config 里显式配 `logFile` 可覆盖）
+- 日志文件（master + worker 引擎日志共用滚动文件）：`--log-file` > config 的 `logFile` > 默认 `<dataDir>/service.log`
 - **服务模式用 `service stop` 停止**；`starskiff down`（stop.flag）只作用于前台模式
 - `node.json` 用 Windows DPAPI 加密（绑定本机 LocalMachine 作用域），LocalSystem 服务与安装用户共用同一身份文件
 
@@ -204,7 +204,15 @@ starskiff service stop && starskiff service remove
 
 - **GitHub Actions**（`.github/workflows/release.yml`）：推 `v*` tag 触发——GitHub Release 资产（Windows zip / Linux musl tar.gz）+ GHCR 镜像 `ghcr.io/<owner>/<repo>/starskiff-server` 与 `/starskiff`（linux/amd64，tag 版本号 + latest；手动触发只推 `sha-<短哈希>`）。首次使用需在仓库 Package 设置里允许 Actions 写入（默认 GITHUB_TOKEN 即可推送）。
 - **本地封包**：`sh deploy/package.sh`（与 CI 同构；产物在 `target/dist/`）。
-- **Docker 自建**：`docker build -f deploy/Dockerfile.server|Dockerfile.node .`（多阶段自包含：容器内构建管理页与 musl 静态二进制，不依赖预编译产物）。节点容器首次需 `enroll` 写入 `/data/starskiff.json` 再 `up`；TUN 模式需 `--device /dev/net/tun --cap-add NET_ADMIN`。
+- **Docker 自建**：`docker build -f deploy/Dockerfile.server|Dockerfile.node .`（多阶段自包含：容器内构建管理页与 musl 静态二进制，不依赖预编译产物）。server 容器直接运行即可——首次启动自动生成管理令牌并打印在容器日志（`docker logs` 查看，仅一次），无需手动 init。节点容器两步（ENTRYPOINT 是 `up`，enroll 须 `--entrypoint` 覆盖）：
+  ```bash
+  # 1) 一次性注册（身份写入卷）
+  docker run --rm -it --entrypoint /app/starskiff -v skiff-node:/data <镜像> \
+      enroll -c /data/starskiff.json --server https://<server>:24930 --token skk_…
+  # 2) 长期运行（推荐 Linux 宿主 --network host：SOCKS/端口转发/P2P 监听直接可用）
+  docker run -d --restart unless-stopped --network host -v skiff-node:/data <镜像>
+  ```
+  bridge 网络需 `-p 24933:24933 -p 24933:24933/udp`（被直连），并把 socksListen 托管为 `0.0.0.0:1080` 后 `-p 1080:1080`；TUN 模式需 `--device /dev/net/tun --cap-add NET_ADMIN`。
 - 管理页「设备」页显示各节点上报的软件版本（原样透传，不比较高低；兼容性判定走协议代次 protoVersion）。
 
 ## 结构化日志

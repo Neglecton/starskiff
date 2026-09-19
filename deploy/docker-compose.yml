@@ -11,10 +11,11 @@ services:
       - starskiff-data:/data
     restart: unless-stopped
 
-  # 节点示例：先 enroll（交互生成身份写入卷），再 up。
-  #   docker compose run --rm node /app/starskiff enroll -c /data/starskiff.json \
-  #       --server https://<server>:24930 --token skk_…
-  # TUN 模式需追加：devices: ["/dev/net/tun:/dev/net/tun"] 与 cap_add: [NET_ADMIN]。
+  # 节点：先 enroll 生成身份（一次性；ENTRYPOINT 是 up，enroll 须 --entrypoint 覆盖）：
+  #   docker compose run --rm --entrypoint /app/starskiff node \
+  #       enroll -c /data/starskiff.json --server https://<server>:24930 --token skk_…
+  # 之后 docker compose up -d 长期运行。TUN 模式需追加：
+  #   devices: ["/dev/net/tun:/dev/net/tun"] 与 cap_add: [NET_ADMIN]。
   node:
     build:
       context: ..
