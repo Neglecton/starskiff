@@ -126,7 +126,8 @@ jobs:
               -f "deploy/Dockerfile.$( [ $img = starskiff ] && echo node || echo server )" --push .
           done
       - name: Image reference summary
-        run: echo "镜像: ghcr.io/${GITHUB_REPOSITORY,,}/starskiff-server 与 /starskiff（linux/amd64）"
+        run: |
+          echo "镜像: ghcr.io/${GITHUB_REPOSITORY,,}/starskiff-server 与 /starskiff（linux/amd64）"
 
   release:
     runs-on: ubuntu-latest
