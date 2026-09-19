@@ -61,7 +61,8 @@ pub struct AppState {
     pub hub: Hub,
     pub udp_relay: Arc<UdpRelay>,
     pub tcp_relay: Arc<TcpRelay>,
-    pub admin_token: String,
+    /// 管理令牌（RwLock：rotate 端点热更新，无需重启）。
+    pub admin_token: std::sync::RwLock<String>,
     pub api_port: u16,
     pub relay_udp_port: u16,
     pub relay_tcp_port: u16,
@@ -72,6 +73,12 @@ pub struct AppState {
     /// 管理页"的判定依据：心跳据此建议节点把间隔切到快档（拓扑/速率
     /// 展示更跟手），超时无人查看回落常态档。内存态，重启即回到常态档。
     pub last_admin_observe_ms: AtomicU64,
+    /// 认证失败限流（公网暴力面，auth_throttle middleware）：per-IP
+    /// 固定窗口 (window_start_ms, count)；60s 内 ≥10 次 401 → 封 15min。
+    pub auth_failures: dashmap::DashMap<std::net::IpAddr, (i64, u32)>,
+    pub banned_until_ms: dashmap::DashMap<std::net::IpAddr, i64>,
+    /// 当前 WS 事件连接数（并发上限守卫）。
+    pub ws_conns: AtomicU64,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -83,6 +90,8 @@ pub struct RunningServer {
     pub base_url: String,
     pub cert_fingerprint: Option<String>,
     pub admin_token: String,
+    /// 启动时 token 是否本次新生成（仅新生成允许打印明文一次）。
+    pub admin_token_fresh: bool,
     /// 共享状态（repo/hub/presence/中继句柄），供集成测试断言内部计数。
     pub state: std::sync::Arc<AppState>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -99,7 +108,7 @@ impl RunningServer {
 
 pub async fn start(opts: ServerOptions) -> anyhow::Result<RunningServer> {
     let repo = Repo::open(&opts.db_path)?;
-    let admin_token = repo.get_or_create_admin_token()?;
+    let (admin_token, admin_token_fresh) = repo.get_or_create_admin_token()?;
 
     let cert = if opts.no_tls {
         None
@@ -147,7 +156,7 @@ pub async fn start(opts: ServerOptions) -> anyhow::Result<RunningServer> {
         hub: hub.clone(),
         udp_relay: udp_relay.clone(),
         tcp_relay: tcp_relay.clone(),
-        admin_token,
+        admin_token: std::sync::RwLock::new(admin_token),
         api_port: opts.api_port,
         relay_udp_port,
         relay_tcp_port,
@@ -155,6 +164,9 @@ pub async fn start(opts: ServerOptions) -> anyhow::Result<RunningServer> {
         log: opts.log.clone(),
         cert_fingerprint: fingerprint.clone(),
         last_admin_observe_ms: AtomicU64::new(0),
+        auth_failures: dashmap::DashMap::new(),
+        banned_until_ms: dashmap::DashMap::new(),
+        ws_conns: AtomicU64::new(0),
     });
 
     // Presence -> WS broadcast sidecar.
@@ -233,13 +245,15 @@ pub async fn start(opts: ServerOptions) -> anyhow::Result<RunningServer> {
     }
 
     let scheme = if opts.no_tls { "http" } else { "https" };
+    let admin_token = state.admin_token.read().unwrap().clone();
     Ok(RunningServer {
         api_port,
         relay_udp_port,
         relay_tcp_port,
         base_url: format!("{scheme}://127.0.0.1:{api_port}"),
         cert_fingerprint: fingerprint,
-        admin_token: state.admin_token.clone(),
+        admin_token,
+        admin_token_fresh,
         state,
         tasks,
     })
@@ -379,14 +393,78 @@ fn router(state: SharedState) -> Router {
             delete(admin_device_leave_network),
         )
         .route("/admin/networks/{nid}/devices/{did}/ip", post(admin_set_ip))
+        .route("/admin/rotate-token", post(admin_rotate_token))
         .route("/admin", get(|| async { Redirect::temporary("/admin/") }))
         .route("/admin/", get(admin_index))
         .route("/admin/{*path}", get(admin_static))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_throttle,
+        ))
         .with_state(state)
+}
+
+/// 认证失败限流（公网暴力面）：per-IP 固定窗口计数，60s 内 ≥10 次 401
+/// → 封 15min（封禁期直接 429，不再执行 token 比对与 DB 查询）。透明
+/// 挂全 router 最外层，401 计数覆盖管理面/设备面/WS 升级；认证成功即
+/// 清零该 IP 的失败窗口（避免历史失败累计误锁合法用户）。
+async fn auth_throttle(
+    State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<ConnAddr>,
+    req: Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    const WINDOW_MS: i64 = 60_000;
+    const MAX_FAILS: u32 = 10;
+    const BAN_MS: i64 = 15 * 60_000;
+    let ip = peer.0.ip();
+    if let Some(until) = state.banned_until_ms.get(&ip)
+        && unix_ms() < *until
+    {
+        drop(until);
+        return err(StatusCode::TOO_MANY_REQUESTS, "认证失败次数过多，请 15 分钟后再试");
+    }
+    let resp = next.run(req).await;
+    if resp.status() == StatusCode::UNAUTHORIZED {
+        let now = unix_ms();
+        let mut entry = state.auth_failures.entry(ip).or_insert((now, 0));
+        if now - entry.0 > WINDOW_MS {
+            *entry = (now, 1);
+        } else {
+            entry.1 += 1;
+            if entry.1 >= MAX_FAILS {
+                drop(entry); // 同 key 引用不重叠（AGENTS #5）
+                state.banned_until_ms.insert(ip, now + BAN_MS);
+                state.auth_failures.remove(&ip);
+                return err(StatusCode::TOO_MANY_REQUESTS, "认证失败次数过多，请 15 分钟后再试");
+            }
+        }
+    } else if resp.status().is_success() {
+        state.auth_failures.remove(&ip);
+    }
+    resp
 }
 
 fn err(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(ErrorResponse { error: msg.into() })).into_response()
+}
+
+/// 协议版本协商（enroll/join/heartbeat 三入口共用）：缺省（旧形状客户端）
+/// 宽容放行；显式上报的版本不等于当前实现即拒绝并给出可诊断的错误——
+/// 公网异版混布时"静默丢弃"（wire/relay 层对未知版本的丢弃）之前先在
+/// 控制面拦下。上线后演进线格式时递增 PROTOCOL_VERSION 并在此放宽区间。
+fn proto_version_reject(v: Option<u32>) -> Option<Response> {
+    if v.is_none_or(|v| v == skiff_core::consts::PROTOCOL_VERSION) {
+        return None;
+    }
+    Some(err(
+        StatusCode::UPGRADE_REQUIRED,
+        format!(
+            "协议版本不匹配（节点 v{}，服务端 v{}），请升级/降级 starskiff 至同版本",
+            v.unwrap_or(0),
+            skiff_core::consts::PROTOCOL_VERSION
+        ),
+    ))
 }
 
 fn extract_token(req: &Request<Body>) -> Option<String> {
@@ -441,6 +519,20 @@ fn urldecode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// 变长常数时间字符串比较：长度非秘密（token 格式固定），内容逐字节
+/// 累积异或后统一判定，不按前缀短路。
+fn ct_str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 impl AppState {
     fn auth_device(&self, req: &Request<Body>) -> Option<DeviceRow> {
         let token = extract_token(req)?;
@@ -457,7 +549,10 @@ impl AppState {
             return false;
         };
         let (bare, _) = split_token(provided);
-        bare == self.admin_token
+        // 常数时间比较（与中继 HMAC 校验同原则）：普通 == 按字节短路，
+        // 会泄露攻击者猜中前缀的长度——中继侧早已用 ct_eq，管理面不应更弱。
+        let expected = self.admin_token.read().unwrap();
+        ct_str_eq(&bare, expected.as_str())
     }
 
     /// Resolve the network for a device: ?network=<hex id or name>, else the
@@ -489,6 +584,9 @@ impl AppState {
 // ---------------------------------------------------------------------------
 
 async fn enroll(State(state): State<SharedState>, Json(req): Json<EnrollRequest>) -> Response {
+    if let Some(rej) = proto_version_reject(req.proto_version) {
+        return rej;
+    }
     let name = req.name.trim();
     if name.is_empty() || req.name.chars().count() > 64 {
         return err(StatusCode::BAD_REQUEST, "设备名长度必须在 1..64 之间");
@@ -644,6 +742,9 @@ async fn heartbeat(State(state): State<SharedState>, req: Request<Body>) -> Resp
         Ok(hb) => hb,
         Err(_) => return err(StatusCode::BAD_REQUEST, "invalid heartbeat body"),
     };
+    if let Some(rej) = proto_version_reject(hb.proto_version) {
+        return rej;
+    }
     state.presence.touch_heartbeat(device.id, &hb);
     let _ = state.repo.touch_device(device.id);
     // 下发成功应答：节点上报的 appliedRevision 追平当前 revision 时，
@@ -1037,6 +1138,9 @@ async fn join_network(State(state): State<SharedState>, req: Request<Body>) -> R
     let Ok(payload) = serde_json::from_slice::<JoinRequest>(&body) else {
         return err(StatusCode::BAD_REQUEST, "invalid body");
     };
+    if let Some(rej) = proto_version_reject(payload.proto_version) {
+        return rej;
+    }
     match state.repo.join_network(device.id, &payload.token, payload.requested_ip.as_deref()) {
         Ok(join) => {
             state.hub.broadcast_network(
@@ -1118,7 +1222,18 @@ async fn ws_events(
             "Device is not enrolled in any network.",
         );
     };
-    ws.on_upgrade(move |socket| async move {
+    // 并发 WS 上限：正常规模 = 设备数 × 网络数（每对一条），512 留足
+    // 余量；洪泛的升级请求在握手前被拒（每升级连接一个常驻任务）。
+    const MAX_WS_CONNS: u64 = 512;
+    if state.ws_conns.fetch_add(1, Ordering::Relaxed) >= MAX_WS_CONNS {
+        state.ws_conns.fetch_sub(1, Ordering::Relaxed);
+        return err(StatusCode::SERVICE_UNAVAILABLE, "事件连接数已达上限");
+    }
+    let state_for_drop = std::sync::Arc::clone(&state);
+    ws.on_failed_upgrade(move |_| {
+        state_for_drop.ws_conns.fetch_sub(1, Ordering::Relaxed);
+    })
+    .on_upgrade(move |socket| async move {
         (state.log)(&format!(
             "WS_CONNECT device={}({}) ep={}",
             device.name,
@@ -1128,12 +1243,18 @@ async fn ws_events(
         state.presence.ws_connected(device.id);
         let mut incoming = socket;
         let (mut events, events_tx) = state.hub.register(device.id, net.id);
+        // 半开检测：20s 周期 Ping（写路径顺带 flush 库排队中的 Pong），
+        // 60s 无任何入帧（含客户端 Pong）视为死链断开——节点 3s 级重连，
+        // 避免 NAT 静默丢映射后 presence 长期虚占 WS 在线。
+        let mut last_rx = std::time::Instant::now();
+        let mut ping = tokio::time::interval(Duration::from_secs(20));
+        ping.tick().await; // 首个 tick 立即完成，跳过
         loop {
             tokio::select! {
                 msg = incoming.recv() => {
                     match msg {
                         None | Some(Ok(Message::Close(_))) | Some(Err(_)) => break,
-                        Some(Ok(_)) => {} // discard client messages
+                        Some(Ok(_)) => last_rx = std::time::Instant::now(), // 含 Pong
                     }
                 }
                 evt = events.recv() => {
@@ -1150,12 +1271,22 @@ async fn ws_events(
                         }
                     }
                 }
+                _ = ping.tick() => {
+                    if last_rx.elapsed() > Duration::from_secs(60) {
+                        break; // 半开：节点侧同样检测并重连
+                    }
+                    if incoming.send(Message::Ping(Vec::new().into())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
         // 仅当仍是当前注册时注销：快重连的新连接已顶掉同 key 旧条目，
         // 旧任务收尾按 key 无条件注销会误杀新连接（闪断链）。
         state.hub.unregister_if_current(device.id, net.id, &events_tx);
         state.presence.ws_disconnected(device.id);
+        // 并发计数收尾（on_failed_upgrade 与本闭包互斥触发）。
+        state.ws_conns.fetch_sub(1, Ordering::Relaxed);
         (state.log)(&format!(
             "WS_DISCONNECT device={}({})",
             device.name, device.id
@@ -1456,6 +1587,9 @@ async fn admin_list_devices(State(state): State<SharedState>, req: Request<Body>
             let paths = record.as_ref().map(|r| r.paths.clone()).filter(|p| !p.is_empty());
             let applied_revision = record.as_ref().and_then(|r| r.applied_settings_revision);
             let restart_pending = record.as_ref().map(|r| r.restart_pending);
+            // 节点软件版本原样透传（高版本节点对旧服务端同样可见；
+            // 兼容性判定归 protoVersion，与 semver 解耦）。
+            let node_version = record.as_ref().and_then(|r| r.node_version.clone());
             // 期望 revision 与下发失败状态：从未保存过托管配置的设备不显示。
             let (settings, settings_error, settings_error_revision) =
                 state.repo.get_device_settings_full(d.id).unwrap_or_default();
@@ -1473,6 +1607,7 @@ async fn admin_list_devices(State(state): State<SharedState>, req: Request<Body>
                 restart_pending,
                 settings_error,
                 settings_error_revision,
+                node_version,
             }
         })
         .collect();
@@ -1519,6 +1654,22 @@ async fn admin_delete_device(
             (StatusCode::OK, "OK").into_response()
         }
         Ok(false) => err(StatusCode::NOT_FOUND, "设备不存在"),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// POST /admin/rotate-token —— 轮换管理令牌（用旧令牌鉴权）。新令牌仅
+/// 此一次返回；所有已登录 webui/CLI 会话立即失效（用新令牌重连即可）。
+async fn admin_rotate_token(State(state): State<SharedState>, req: Request<Body>) -> Response {
+    if !state.auth_admin(&req) {
+        return err(StatusCode::UNAUTHORIZED, "鉴权失败：请检查管理员令牌");
+    }
+    match state.repo.rotate_admin_token() {
+        Ok(new_token) => {
+            *state.admin_token.write().unwrap() = new_token.clone();
+            (state.log)("管理令牌已轮换（旧令牌立即失效）");
+            Json(json!({ "token": new_token })).into_response()
+        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }

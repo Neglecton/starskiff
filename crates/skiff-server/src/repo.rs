@@ -914,18 +914,27 @@ impl Repo {
             .ok_or_else(|| RepoError::Conflict("网络不存在".into()))
     }
 
-    /// Admin token bootstrap: get-or-create.
-    pub fn get_or_create_admin_token(&self) -> Result<String, crate::db::DbError> {
+    /// Admin token bootstrap: get-or-create. 返回值第二位标记是否本次
+    /// 新生成（仅新生成时允许把明文打印一次，见 main.rs serve 输出）。
+    pub fn get_or_create_admin_token(&self) -> Result<(String, bool), crate::db::DbError> {
         if let Some(existing) = self.get_setting("admin_token")? {
-            return Ok(existing);
+            return Ok((existing, false));
         }
         let token = skiff_core::crypto::tokens::make_admin_token();
         self.set_setting("admin_token", &token)?;
-        Ok(token)
+        Ok((token, true))
     }
 
     pub fn admin_token(&self) -> Option<String> {
         self.get_setting("admin_token").ok().flatten()
+    }
+
+    /// 无条件生成并落库新 admin token（轮换）。旧 token 立即失效
+    /// （鉴权读内存态，rotate 端点同步更新）。
+    pub fn rotate_admin_token(&self) -> Result<String, crate::db::DbError> {
+        let token = skiff_core::crypto::tokens::make_admin_token();
+        self.set_setting("admin_token", &token)?;
+        Ok(token)
     }
 }
 

@@ -23,10 +23,16 @@ use crate::presence::Presence;
 const KEY_CACHE_TTL_MS: i64 = 300_000;
 /// Registration validity: presence timeout + slack.
 const REGISTRATION_TTL_MS: i64 = PRESENCE_TIMEOUT.as_millis() as i64 + 15_000;
+/// 未知 deviceId 的负缓存：公网攻击者用随机 id 刷 REGISTER 时，miss 也
+/// 要打一次串行 SQLite 查询（DB 洪泛）；10s 内重复 miss 直接拒，不挡
+/// 正常新设备（首个 REGISTER 失败后 30s 重试周期内早已过期）。
+const KEY_NEG_CACHE_TTL_MS: i64 = 10_000;
 
 pub struct UdpRelay {
     registrations: DashMap<u64, Registration>,
     key_cache: DashMap<u64, KeyCacheEntry>,
+    /// device_id → 上次查库 miss 的时间（负缓存）。
+    key_neg_cache: DashMap<u64, i64>,
     presence: Presence,
     /// device_id -> relay key (32 raw bytes), from the devices table.
     lookup_key: Arc<dyn Fn(u64) -> Option<[u8; 32]> + Send + Sync>,
@@ -66,6 +72,7 @@ impl UdpRelay {
         Arc::new(UdpRelay {
             registrations: DashMap::new(),
             key_cache: DashMap::new(),
+            key_neg_cache: DashMap::new(),
             presence,
             lookup_key,
             register_guard,
@@ -83,15 +90,33 @@ impl UdpRelay {
         {
             return Some(hit.key);
         }
-        let key = (self.lookup_key)(device_id)?;
-        self.key_cache.insert(
-            device_id,
-            KeyCacheEntry {
-                key,
-                expires_ms: now + KEY_CACHE_TTL_MS,
-            },
-        );
-        Some(key)
+        // 负缓存命中：10s 内已确认不存在，不再打 DB。
+        if let Some(last_miss) = self.key_neg_cache.get(&device_id)
+            && now - *last_miss < KEY_NEG_CACHE_TTL_MS
+        {
+            return None;
+        }
+        match (self.lookup_key)(device_id) {
+            Some(key) => {
+                self.key_neg_cache.remove(&device_id); // 设备可能刚 enroll
+                self.key_cache.insert(
+                    device_id,
+                    KeyCacheEntry {
+                        key,
+                        expires_ms: now + KEY_CACHE_TTL_MS,
+                    },
+                );
+                Some(key)
+            }
+            None => {
+                // 容量守卫：洪泛随机 id 时负缓存自身不能成为内存放大面，
+                // 超限退化为无缓存（行为不劣于改动前）。
+                if self.key_neg_cache.len() < 100_000 {
+                    self.key_neg_cache.insert(device_id, now);
+                }
+                None
+            }
+        }
     }
 
     pub async fn serve(self: Arc<Self>, socket: UdpSocket) {
@@ -105,6 +130,7 @@ impl UdpRelay {
                     let now = unix_ms();
                     relay.registrations.retain(|_, r| r.expires_ms > now);
                     relay.key_cache.retain(|_, k| k.expires_ms > now);
+                    relay.key_neg_cache.retain(|_, t| now - *t < KEY_NEG_CACHE_TTL_MS);
                     relay.register_guard.sweep();
                 }
             });

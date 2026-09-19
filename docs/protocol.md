@@ -99,7 +99,9 @@ ERROR(4):    [msgLen u8][msg utf-8]（截断 200B）
 
 ## FLOW 子协议（非 TUN 模式）
 
-载荷（type=4 帧解密后）：`[flowId u32 LE][flags u8][payload]`
+载荷（type=4 帧解密后）：`[flowId u32 LE][seq u32 LE][flags u8][payload]`
+
+`seq` 仅对 DATA 有意义（发送方按流内字节块顺序递增，u32 自然回绕），其余 flags 恒 0；DATAGRAM 为独立数据报语义、不参与序号。**接收方对 DATA 做跳号即断流校验**：UDP 路径无应用层重传，丢块/乱序留下的字节缺口无法恢复，立即 CLOSE（回发 CLOSE 帧、双方拆流）让上层 TCP 重连自愈——杜绝"静默损坏流"。
 
 | flags | payload | 说明 |
 |---|---|---|
@@ -107,14 +109,20 @@ ERROR(4):    [msgLen u8][msg utf-8]（截断 200B）
 | OPENED_OK(2) | 空 | 接收方确认 |
 | OPENED_FAIL(3) | `[reasonLen u8][reason ≤200B]` | 无对应 expose 等 |
 | CLOSE(4) | 空 | 关闭流 |
-| DATA(5) | 字节块 | TCP 双向数据（按本地 socket 读到的块切片） |
+| DATA(5) | 字节块 | TCP 双向数据（seq 按块递增；跳号即断流） |
 | DATAGRAM(6) | `[addrLen u8]["ip:port"][数据报]` | UDP 数据报，addr 为目标虚拟 IP:端口；回程地址填本端虚拟 IP:服务端口 |
 
 - 接收方按 `dst.Port` 查找 `exposes` 规则投递到本地服务，回程沿同一 flowId
-- **FLOW 帧的传输路径与 flow 类型无关**：两类 flow 的帧都按发送方当前路径策略/CurrentPath 选路（直连 UDP / 直连 TCP / UDP 中继 / TCP 中继）。UDP 路径上**无应用层确认、重传与重组**——丢包即静默损坏流、分块（≤32KiB，`FLOW_CHUNK`）依赖 IP 分片；对完整性敏感的 bulk 场景应 pin `directTcp`/`relayTcp`（TCP 路径帧序由单写者队列保证）。数据面 UDP socket 已扩内核缓冲（4MB）缓解突发下的内核静默丢弃
+- **FLOW 帧的传输路径与 flow 类型无关**：两类 flow 的帧都按发送方当前路径策略/CurrentPath 选路（直连 UDP / 直连 TCP / UDP 中继 / TCP 中继）。**DATA 分块按路径双档**：UDP 路径 1200B（`FLOW_CHUNK_UDP`，密封后不分片——32KiB 分 ~23 片在公网丢包下丢失放大 ~23 倍），TCP 路径 32KiB（`FLOW_CHUNK`，无分片问题、大块省开销）；分块大小每块按对端当前路径动态重查。UDP 路径**无应用层重传**：丢块表现为 seq 跳号 → 断流 → 上层 TCP 重连；TCP 路径帧序由单写者队列保证。数据面 UDP socket 已扩内核缓冲（4MB）缓解突发下的内核静默丢弃
 - UDP flow 的空闲超时（5 分钟）由端口转发层负责 GC
 
 ## 控制面 API 摘要
+
+**协议版本协商**：enroll/join/heartbeat 请求携带可选 `protoVersion`（consts::PROTOCOL_VERSION）；缺省宽容放行（旧形状客户端），显式不等于服务端当前版本 → 426 + 含双方版本号的中文诊断（公网异版混布在控制面即被拦下，先于 wire/relay 层的静默丢弃）。演进线格式时递增版本并放宽兼容区间。
+
+**认证失败限流（公网暴力面防护）**：per-IP 固定窗口，60s 内 ≥10 次 401（管理面/设备面/WS 升级统一计数）→ 封禁 15min（期间直接 429，不做 token 比对与 DB 查询）；认证成功清零失败窗口。
+
+**数据面中继 pre-auth 防护**：TCP 中继并发上限全局 1024 / per-IP 64（超限立即断开），REGISTER 前帧长上限 4KB、零任务/队列分配；UDP 中继对未知 deviceId 的 REGISTER 查询带 10s 负缓存（随机 id 洪泛不再逐包打 DB）。
 
 节点侧（`Authorization: Bearer <设备令牌>` 或 `?token=`）：
 
@@ -131,7 +139,7 @@ ERROR(4):    [msgLen u8][msg utf-8]（截断 200B）
 | `POST /api/leave` | 设备移除自己在某网络的成员关系（禁止移除最后一个网络） |
 | `WS /api/events` | 推送 peers_changed / device_online / device_offline / config_changed / settings_changed / networks_changed / restart_requested / reconnect_requested（同一设备可每网络一条连接并存） |
 
-管理侧（`X-Admin-Token`，值先剥 `.<64hex>` 后缀再比对）：`/admin/summary`、`/admin/networks`（创建校验：name 1-32 位 `[a-zA-Z0-9_-]`、prefix ≤30）、`/admin/tokens`（uses 1–1000、有效期 1–8760h）、`/admin/devices`（含 settingsRevision/appliedRevision/restartPending 收敛状态）、`/admin/networks/{id}/devices/{id}/ip`（改 IP 实时下发 config_changed）、`GET|PUT /admin/devices/{id}/settings`（托管配置：PUT 全量替换，revision 服务端权威递增，保存后定向推送 settings_changed）、`POST /admin/devices/{id}/networks`（强制 join：TUN 节点超单网络预检拒绝，成功推送 networks_changed）、`DELETE /admin/devices/{id}/networks/{nid}`（强制 leave：修剪广播 + networks_changed）、`POST /admin/devices/{id}/restart|reconnect`（下发远程重启/轻量重连指令）。
+管理侧（`X-Admin-Token`，值先剥 `.<64hex>` 后缀再常数时间比对）：`/admin/summary`、`/admin/networks`（创建校验：name 1-32 位 `[a-zA-Z0-9_-]`、prefix ≤30）、`/admin/tokens`（uses 1–1000、有效期 1–8760h）、`/admin/devices`（含 settingsRevision/appliedRevision/restartPending 收敛状态）、`/admin/networks/{id}/devices/{id}/ip`（改 IP 实时下发 config_changed）、`GET|PUT /admin/devices/{id}/settings`（托管配置：PUT 全量替换，revision 服务端权威递增，保存后定向推送 settings_changed）、`POST /admin/devices/{id}/networks`（强制 join：TUN 节点超单网络预检拒绝，成功推送 networks_changed）、`DELETE /admin/devices/{id}/networks/{nid}`（强制 leave：修剪广播 + networks_changed）、`POST /admin/devices/{id}/restart|reconnect`（下发远程重启/轻量重连指令）、`POST /admin/rotate-token`（轮换管理令牌：旧令牌鉴权，新令牌仅返回一次，旧令牌立即失效——serve 启动不再打印明文，仅首次生成时显示一次）。
 
 ### 网络成员权威模型
 

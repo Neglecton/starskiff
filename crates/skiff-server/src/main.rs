@@ -86,6 +86,8 @@ enum AdminCmd {
         #[command(subcommand)]
         cmd: DeviceCmd,
     },
+    /// 轮换管理令牌（旧令牌立即失效，新令牌仅显示一次）
+    Rotate,
 }
 
 #[derive(Subcommand)]
@@ -268,15 +270,27 @@ async fn cmd_serve(
         "  中继: UDP {} / TCP {}",
         server.relay_udp_port, server.relay_tcp_port
     );
-    match &server.cert_fingerprint {
-        Some(fp) => {
-            println!("  管理令牌: {}", server.admin_token);
-            println!("  管理令牌(TLS，带指纹): {}.{}", server.admin_token, fp);
+    // 管理令牌仅在首次生成时打印一次明文（落入服务日志即长期泄露面）；
+    // 之后启动只提示去向，轮换用 admin rotate。
+    if server.admin_token_fresh {
+        match &server.cert_fingerprint {
+            Some(fp) => {
+                println!("  管理令牌（仅显示一次，请保存）: {}", server.admin_token);
+                println!(
+                    "  管理令牌(TLS，带指纹): {}.{}",
+                    server.admin_token, fp
+                );
+            }
+            None => println!(
+                "  管理令牌（仅显示一次，请保存）: {} （--no-tls 模式，流量明文）",
+                server.admin_token
+            ),
         }
-        None => println!(
-            "  管理令牌: {} （--no-tls 模式，流量明文）",
-            server.admin_token
-        ),
+    } else {
+        match &server.cert_fingerprint {
+            Some(fp) => println!("  管理令牌: 已初始化（明文见首次启动输出；轮换：admin rotate；指纹 {fp}）"),
+            None => println!("  管理令牌: 已初始化（明文见首次启动输出；轮换：admin rotate）"),
+        }
     }
 
     // Ctrl+C / SIGTERM -> shutdown.
@@ -338,6 +352,7 @@ async fn cmd_admin(server: String, token: String, cmd: AdminCmd) -> anyhow::Resu
             DeviceCmd::Restart { id } => cli.device_restart(id).await,
             DeviceCmd::Reconnect { id } => cli.device_reconnect(id).await,
         },
+        AdminCmd::Rotate => cli.rotate_token().await,
     }
 }
 

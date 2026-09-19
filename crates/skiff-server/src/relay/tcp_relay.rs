@@ -1,7 +1,8 @@
 //! TCP relay (port 24932): length-prefixed relay control channel. First
 //! frame must be an HMAC-authenticated REGISTER within 15s; a device id may
 //! hold one connection (new ones kick old ones); idle connections are closed
-//! after 12h. `Send` frames are forwarded to the target's connection as
+//! after 120s without any inbound frame (nodes keepalive every 2 heartbeat
+//! ticks). `Send` frames are forwarded to the target's connection as
 //! `Frame` frames with the destination id stripped (sender identity lives in
 //! the inner wire frame).
 
@@ -11,7 +12,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
-use skiff_core::consts::TCP_MAX_PAYLOAD;
 use skiff_core::protocol::relay_tcp::{
     self, CMD_TCP_FRAME, CMD_TCP_KEEPALIVE_RESP, FrameReassembler, RelayTcpMsg,
 };
@@ -27,7 +27,17 @@ const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
 /// 每连接写队列深度上限（帧）：128 帧 × ≤512KiB 为最坏内存上界，慢接
 /// 收方溢出即丢弃计数（背压防护，见 handle_connection 注释）。
 const RELAY_TCP_QUEUE_FRAMES: usize = 128;
-const IDLE_TIMEOUT: Duration = Duration::from_secs(12 * 3600);
+/// 连接空闲回收：节点每 2 心跳 tick（慢档 30s、快档 10s）发一次
+/// KEEPALIVE，120s = 慢档 4 个周期仍无任何入帧即回收——死链不再占用
+/// 连接槽位 12h（半开连接此前一直挂到节点侧 TCP 重传超时）。
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// 全局并发连接上限（pre-auth 即拦截连接洪泛；正常规模每设备 1 连接）。
+const MAX_CONNS_TOTAL: i64 = 1024;
+/// 单 IP 并发上限（CGNAT 后多节点共享公网 IP，留足余量）。
+const MAX_CONNS_PER_IP: u32 = 64;
+/// pre-auth 首帧（REGISTER）长度上限：真实 ~60B，4KB 已极宽松——认证
+/// 通过前按 512KB 上限预分配读缓冲是纯资源耗尽面。
+const PREAUTH_MAX_FRAME: usize = 4 * 1024;
 
 struct ConnHandle {
     tx: mpsc::Sender<Vec<u8>>,
@@ -39,9 +49,33 @@ pub struct TcpRelay {
     lookup_key: Arc<dyn Fn(u64) -> Option<[u8; 32]> + Send + Sync>,
     /// REGISTER 防重放（与 UDP 中继共享同一份 nonce 记忆）。
     register_guard: crate::relay::register_guard::RegisterGuard,
-    pub forwarded_bytes: AtomicU64,
-    pub forwarded_packets: AtomicU64,
-    pub dropped_packets: AtomicU64,
+    forwarded_bytes: AtomicU64,
+    forwarded_packets: AtomicU64,
+    dropped_packets: AtomicU64,
+    /// 并发连接准入（pre-auth 资源耗尽防护）：全局计数 + per-IP 表。
+    conn_total: std::sync::atomic::AtomicI64,
+    conn_per_ip: DashMap<std::net::IpAddr, u32>,
+    last_reject_log_ms: std::sync::atomic::AtomicI64,
+}
+
+/// 并发准入守卫：drop 时释放全局与 per-IP 计数。
+struct ConnAdmission {
+    relay: Arc<TcpRelay>,
+    ip: std::net::IpAddr,
+}
+
+impl Drop for ConnAdmission {
+    fn drop(&mut self) {
+        self.relay.conn_total.fetch_sub(1, Ordering::Relaxed);
+        if let Some(mut e) = self.relay.conn_per_ip.get_mut(&self.ip) {
+            *e -= 1;
+            let zeroed = *e == 0;
+            drop(e); // 同 key 引用不重叠（AGENTS #5）
+            if zeroed {
+                self.relay.conn_per_ip.remove(&self.ip);
+            }
+        }
+    }
 }
 
 impl TcpRelay {
@@ -58,7 +92,43 @@ impl TcpRelay {
             forwarded_bytes: AtomicU64::new(0),
             forwarded_packets: AtomicU64::new(0),
             dropped_packets: AtomicU64::new(0),
+            conn_total: std::sync::atomic::AtomicI64::new(0),
+            conn_per_ip: DashMap::new(),
+            last_reject_log_ms: std::sync::atomic::AtomicI64::new(0),
         })
+    }
+
+    /// 并发准入：超限返回 None（60s 节流日志——洪泛时打日志本身会放大）。
+    fn admit(self: &Arc<Self>, ip: std::net::IpAddr, now_ms: i64) -> Option<ConnAdmission> {
+        if self.conn_total.load(Ordering::Relaxed) >= MAX_CONNS_TOTAL {
+            self.reject_log(now_ms, "total");
+            return None;
+        }
+        let mut entry = self.conn_per_ip.entry(ip).or_insert(0);
+        if *entry >= MAX_CONNS_PER_IP {
+            drop(entry);
+            self.reject_log(now_ms, "per-ip");
+            return None;
+        }
+        *entry += 1;
+        drop(entry);
+        self.conn_total.fetch_add(1, Ordering::Relaxed);
+        Some(ConnAdmission {
+            relay: Arc::clone(self),
+            ip,
+        })
+    }
+
+    fn reject_log(&self, now_ms: i64, kind: &str) {
+        let last = self.last_reject_log_ms.load(Ordering::Relaxed);
+        if now_ms - last > 60_000
+            && self
+                .last_reject_log_ms
+                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            eprintln!("TCP_RELAY_REJECT kind={kind}（并发连接超限，疑似连接洪泛）");
+        }
     }
 
     pub async fn serve(self: Arc<Self>, listener: TcpListener) {
@@ -77,14 +147,43 @@ impl TcpRelay {
     }
 
     async fn handle_connection(self: Arc<Self>, stream: TcpStream, peer: SocketAddr) {
-        let (read_half, write_half) = stream.into_split();
+        // 并发准入（pre-auth）：连接洪泛在分配任何任务/队列之前被拒。
+        let _admission = match self.admit(peer.ip(), skiff_core::logging::unix_ms()) {
+            Some(g) => g,
+            None => return, // 超限直接断开（reject_log 已节流记录）
+        };
+        let (mut read_half, mut write_half) = stream.into_split();
+        // Pre-auth：读首帧 REGISTER 并认证——此阶段零任务/零队列分配，
+        // 帧长上限 4KB（认证前不替未知客户端预分配大缓冲）。
+        let auth = self.authenticate(&mut read_half).await;
+        let device_id = match auth {
+            Ok(id) => id,
+            Err(msg) => {
+                // 错误帧直写 socket（一次性），无需队列。
+                let inner = relay_tcp::encode_cmd(CMD_ERROR, msg.as_bytes());
+                let mut framed = Vec::with_capacity(inner.len() + 4);
+                relay_tcp::write_length_prefixed(&mut framed, &inner);
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    async {
+                        write_half.write_all(&framed).await?;
+                        write_half.flush().await
+                    },
+                )
+                .await;
+                return;
+            }
+        };
+        // Post-auth：才有资格分配写队列与任务。
         // 有界写队列（背压防护）：合法设备可向慢接收方灌帧，无界队列
         // 会按入速-排空速累积直至内存耗尽。溢出丢弃并计数——加密帧丢失
         // 由上层重传/超时处理，与 UDP 中继的丢弃语义一致。
         let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(RELAY_TCP_QUEUE_FRAMES);
         let writer = tokio::spawn(writer_loop(write_half, writer_rx));
 
-        let result = self.session(read_half, writer_tx.clone(), peer).await;
+        let result = self
+            .relay_session(device_id, read_half, writer_tx.clone(), peer)
+            .await;
         if let Err(msg) = &result {
             // Mirror the C# error text contract.
             let inner = relay_tcp::encode_cmd(CMD_ERROR, msg.as_bytes());
@@ -102,14 +201,11 @@ impl TcpRelay {
         let _ = writer.await;
     }
 
-    async fn session(
-        self: &Arc<Self>,
-        mut read: OwnedReadHalf,
-        writer_tx: mpsc::Sender<Vec<u8>>,
-        peer: SocketAddr,
-    ) -> Result<u64, String> {
+    /// 读首帧 REGISTER 并完成 HMAC + nonce 认证；成功返回 device_id。
+    /// kick-old/登记/ACK 挪到 post-auth（需要写队列）。
+    async fn authenticate(&self, read: &mut OwnedReadHalf) -> Result<u64, String> {
         // First frame: REGISTER with the 56-byte body, within 15s.
-        let first = read_frame(&mut read, REGISTER_TIMEOUT)
+        let first = read_frame(read, REGISTER_TIMEOUT, PREAUTH_MAX_FRAME)
             .await
             .map_err(|_| "register timeout".to_string())?;
         let RelayTcpMsg::Register { body } = relay_tcp::parse(&first).ok_or("bad register")? else {
@@ -134,7 +230,17 @@ impl TcpRelay {
         if !self.register_guard.admit(device_id, &nonce) {
             return Err("replayed register".into());
         }
+        Ok(device_id)
+    }
 
+    /// Post-auth 主循环：登记连接（新踢旧）→ ACK → 转发/保活循环。
+    async fn relay_session(
+        self: &Arc<Self>,
+        device_id: u64,
+        mut read: OwnedReadHalf,
+        writer_tx: mpsc::Sender<Vec<u8>>,
+        peer: SocketAddr,
+    ) -> Result<u64, String> {
         // Same device reconnecting kicks the old connection.
         if let Some((_, old)) = self.connections.remove(&device_id) {
             let _ = old.tx.try_send(Vec::new()); // empty write signals close-ish; rely on drop
@@ -245,11 +351,15 @@ async fn writer_loop(mut write: OwnedWriteHalf, mut rx: mpsc::Receiver<Vec<u8>>)
 }
 
 /// Read one complete length-prefixed frame.
-async fn read_frame(read: &mut OwnedReadHalf, timeout: Duration) -> std::io::Result<Vec<u8>> {
+async fn read_frame(
+    read: &mut OwnedReadHalf,
+    timeout: Duration,
+    max_len: usize,
+) -> std::io::Result<Vec<u8>> {
     let mut header = [0u8; 4];
     tokio::time::timeout(timeout, read.read_exact(&mut header)).await??;
     let len = u32::from_le_bytes(header) as usize;
-    if len > TCP_MAX_PAYLOAD {
+    if len > max_len {
         return Err(std::io::Error::other("frame too large"));
     }
     let mut body = vec![0u8; len];

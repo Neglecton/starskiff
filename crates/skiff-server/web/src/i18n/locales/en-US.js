@@ -157,6 +157,7 @@ export default {
     status: 'Status',
     name: 'Name',
     id: 'ID',
+    version: 'Version',
     virtualIp: 'Virtual IP',
     paths: 'Path to peers',
     lastSeen: 'Last seen',

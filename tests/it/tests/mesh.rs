@@ -1246,3 +1246,182 @@ async fn heartbeat_reports_peer_rates_after_traffic() {
     assert!(tx >= 1000, "txBps 异常偏小：{tx}");
     assert!(rx >= 2000, "rxBps 异常偏小：{rx}");
 }
+
+/// 认证失败限流：同一 IP 60s 内 ≥10 次 401 → 封禁 15min（429）。
+/// 成功认证会清零失败窗口（先验证正常路径不受影响）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_auth_failures_get_throttled() {
+    let h = TestHarness::create().await;
+    // 正常请求不受影响。
+    let ok = h
+        .admin
+        .get(format!("{}/admin/networks", h.base_url()))
+        .header("X-Admin-Token", &h.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert!(ok.status().is_success());
+    // 连续 10 次错误 token（第 10 次触发封禁，响应即 429）。
+    let mut last = None;
+    for _ in 0..10 {
+        last = Some(
+            h.admin
+                .get(format!("{}/admin/networks", h.base_url()))
+                .header("X-Admin-Token", "ska_wrong_token")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+        );
+    }
+    assert_eq!(last.unwrap(), reqwest::StatusCode::TOO_MANY_REQUESTS, "第 10 次失败应直接 429");
+    // 封禁期内：正确 token 也被拒（省下比对与 DB 开销是封禁的意义）。
+    let banned = h
+        .admin
+        .get(format!("{}/admin/networks", h.base_url()))
+        .header("X-Admin-Token", &h.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(banned.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// TCP 中继 per-IP 并发上限（64）：第 65 条未认证连接被立即断开
+/// （pre-auth 资源耗尽防护——连接洪泛不再每连接钉住任务与缓冲）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_relay_per_ip_connection_cap() {
+    let h = TestHarness::create().await;
+    let addr = format!("127.0.0.1:{}", h.server.relay_tcp_port);
+    let mut conns = Vec::new();
+    let mut last_eof = false;
+    for i in 0..65 {
+        let s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        if i == 64 {
+            // connect 返回 ≠ 服务端 admit 已执行（handle_connection 在
+            // spawn 的任务里跑，调度有延迟）：最后一条前留足时间让全部
+            // 64 条完成 admit，否则计数未满、第 65 条漏过（曾偶发）。
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            // 第 65 条应被立即关闭：读到 EOF（admit 拒绝 → stream drop）。
+            let mut probe = s;
+            let mut buf = [0u8; 8];
+            use tokio::io::AsyncReadExt as _;
+            let read = tokio::time::timeout(Duration::from_secs(3), probe.read(&mut buf)).await;
+            last_eof = matches!(read, Ok(Ok(0)));
+            break;
+        }
+        conns.push(s); // 挂住前 64 条（不发 REGISTER，占住并发槽）
+    }
+    drop(conns);
+    assert!(last_eof, "超 per-IP 上限的连接应被立即断开");
+}
+
+/// admin token 轮换：新 token 立即生效、旧 token 立即失效。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_token_rotation_invalidates_old() {
+    let h = TestHarness::create().await;
+    let resp: serde_json::Value = h
+        .admin
+        .post(format!("{}/admin/rotate-token", h.base_url()))
+        .header("X-Admin-Token", &h.admin_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let new_token = resp["token"].as_str().unwrap().to_string();
+    assert!(new_token.starts_with("ska_"), "轮换应返回新 token");
+    // 旧 token 失效（401；注意别触发限流阈值——只打一次）。
+    let old = h
+        .admin
+        .get(format!("{}/admin/networks", h.base_url()))
+        .header("X-Admin-Token", &h.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(old.status(), reqwest::StatusCode::UNAUTHORIZED, "旧 token 应立即失效");
+    // 新 token 生效。
+    let new = h
+        .admin
+        .get(format!("{}/admin/networks", h.base_url()))
+        .header("X-Admin-Token", &new_token)
+        .send()
+        .await
+        .unwrap();
+    assert!(new.status().is_success(), "新 token 应立即可用");
+}
+
+/// 协议版本协商：缺省 protoVersion（旧形状）宽容放行；显式不匹配 → 426
+/// 且错误信息含双方版本（公网异版混布的可诊断拒绝，静默丢弃前置拦截）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proto_version_mismatch_is_rejected_with_diag() {
+    let h = TestHarness::create().await;
+    let cfg_path = h.enroll_node("ver-a", None).await;
+    let cfg = h.node_cfg(&cfg_path);
+    let token = cfg.identity.device_token.expose().to_string();
+    let beat = |body: serde_json::Value| {
+        let token = token.clone();
+        let url = format!("{}/api/heartbeat", h.base_url());
+        async move {
+            reqwest::Client::new()
+                .post(url)
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    // 缺省（旧形状）放行。
+    let ok = beat(serde_json::json!({ "localAddrs": [], "protoVersion": 1 })).await;
+    assert!(ok.status().is_success(), "当前版本应放行");
+    let legacy = beat(serde_json::json!({ "localAddrs": [] })).await;
+    assert!(legacy.status().is_success(), "缺省 protoVersion 应宽容放行");
+    // 显式不匹配 → 426 + 诊断信息。
+    let bad = beat(serde_json::json!({ "localAddrs": [], "protoVersion": 99 })).await;
+    assert_eq!(bad.status(), reqwest::StatusCode::UPGRADE_REQUIRED);
+    let body: serde_json::Value = bad.json().await.unwrap();
+    let msg = body["error"].as_str().unwrap();
+    assert!(msg.contains('9') && msg.contains('9'), "错误应含双方版本号");
+}
+
+/// 节点软件版本上报全链路：引擎心跳带 CARGO_PKG_VERSION，/admin/devices
+/// 原样透传（不做比较——高版本节点对旧服务端同样可见）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeat_node_version_surfaced_to_admin() {
+    let h = TestHarness::create().await;
+    let cfg_path = h.enroll_node("ver-echo", None).await;
+    let cfg = h.node_cfg(&cfg_path);
+    let token = cfg.identity.device_token.expose().to_string();
+    // 手动心跳带版本（无版本的历史请求 → 字段缺省，不误显）。
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/heartbeat", h.base_url()))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "localAddrs": [],
+            "nodeVersion": env!("CARGO_PKG_VERSION"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let devs: serde_json::Value = h
+        .admin
+        .get(format!("{}/admin/devices", h.base_url()))
+        .header("X-Admin-Token", &h.admin_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ver = devs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"].as_str() == Some("ver-echo"))
+        .unwrap()["nodeVersion"]
+        .as_str()
+        .unwrap();
+    assert_eq!(ver, env!("CARGO_PKG_VERSION"), "版本应原样透传");
+}

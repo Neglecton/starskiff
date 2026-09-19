@@ -102,6 +102,24 @@ impl AdminCli {
         Ok(value)
     }
 
+    /// POST（无请求体）并解析 JSON 响应。
+    async fn get_json_by_method(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        let resp = self.request(method, path, None).await?;
+        let status = resp.status();
+        let value = resp
+            .json::<serde_json::Value>()
+            .await
+            .context("响应不是合法 JSON")?;
+        if !status.is_success() {
+            anyhow::bail!("HTTP {status}: {value}");
+        }
+        Ok(value)
+    }
+
     async fn post_json(
         &self,
         path: &str,
@@ -288,6 +306,17 @@ impl AdminCli {
             self.expect_ok(reqwest::Method::POST, &format!("/admin/devices/{id}/restart"), None)
                 .await?
         );
+        Ok(())
+    }
+
+    /// 轮换管理令牌：新令牌仅打印一次，旧令牌（本命令所用）立即失效。
+    pub async fn rotate_token(&self) -> anyhow::Result<()> {
+        let v = self.get_json_by_method(reqwest::Method::POST, "/admin/rotate-token").await?;
+        let token = v["token"]
+            .as_str()
+            .context("响应缺少 token 字段")?;
+        println!("新管理令牌（仅显示一次，请保存）：{token}");
+        println!("旧令牌已失效；请用它更新 webui 登录与 CLI --token 参数");
         Ok(())
     }
 

@@ -57,6 +57,9 @@ const columns = computed(() => {
     },
     { title: t('devices.name'), key: 'name', minWidth: 110 },
     { title: t('devices.id'), key: 'id', width: 150, render: (r) => h('span', { class: 'mono', style: 'opacity: .55' }, String(r.id)) },
+    // 节点软件版本：原样展示（服务端不比较，高版本节点同样可见）；
+    // 从未上报过（离线/旧版）显示占位。
+    { title: t('devices.version'), key: 'nodeVersion', width: 110, render: (r) => h('span', { class: 'mono', style: 'opacity: .55' }, r.nodeVersion || t('common.dash')) },
     { title: t('devices.virtualIp'), key: 'networks', minWidth: 300, render: (r) => membershipCell(r) },
     {
       title: t('devices.config'),

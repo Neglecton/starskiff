@@ -1,0 +1,9 @@
+# 构建上下文瘦身（docker build / docker buildx）：本机产物与依赖
+# 绝不能进镜像——web/node_modules 是 Windows 垫片（node.exe），会覆盖
+# 容器内 npm ci 的产物导致 vite 启动失败；target 是 GB 级编译缓存。
+**/node_modules
+target
+.git
+dist-pkg
+*.sqlite
+*.log

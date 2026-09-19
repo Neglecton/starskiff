@@ -157,6 +157,7 @@ export default {
     status: '状态',
     name: '名称',
     id: 'ID',
+    version: '版本',
     virtualIp: '虚拟 IP',
     paths: '到各节点路径',
     lastSeen: '最近在线',

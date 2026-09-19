@@ -135,10 +135,20 @@ async fn read_loop(
     client: Arc<RelayTcpClient>,
     events: mpsc::UnboundedSender<EngineEvent>,
 ) {
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
     let mut reassembler = relay_tcp::FrameReassembler::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        match read.read(&mut buf).await {
+        // 半开检测：keepalive 每 2 心跳 tick（慢档 30s）必有一轮 RESP，
+        // 90s（3 个周期）无任何入帧视为死链——写 keepalive 进内核缓冲
+        // "成功"但对端已不可达的半开连接只有读超时能暴露。断开后由
+        // 下次 send/keepalive 懒重连。
+        let read_res = tokio::time::timeout(IDLE_TIMEOUT, read.read(&mut buf)).await;
+        let n = match read_res {
+            Err(_) => break, // idle timeout：半开/死链
+            Ok(v) => v,
+        };
+        match n {
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 let frames = match reassembler.feed(&buf[..n]) {

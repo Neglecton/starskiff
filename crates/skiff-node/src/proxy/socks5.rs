@@ -151,10 +151,13 @@ async fn handle_connect(
     let (mut tcp_rd, mut tcp_wr) = stream.into_split();
     let writer = {
         let flow = Arc::clone(&flow);
+        let shared = Arc::clone(&shared);
         tokio::spawn(async move {
             let mut buf = vec![0u8; PUMP_BUF];
             loop {
-                match tcp_rd.read(&mut buf).await {
+                // 分块按对端当前出口路径动态选择（UDP 路径不分片）。
+                let chunk = shared.flow_chunk_for(flow.net_id, flow.peer).min(buf.len());
+                match tcp_rd.read(&mut buf[..chunk]).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => flow.write(&buf[..n]),
                 }

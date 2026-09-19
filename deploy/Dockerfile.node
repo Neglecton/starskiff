@@ -1,0 +1,30 @@
+# starskiff 节点镜像（linux/amd64）。与 Dockerfile.server 同构（web 阶段
+# 产物只为 rust-embed 编译 server 侧管理页——节点不嵌入页面，但 workspace
+# 统一构建最简单；产物只拷 starskiff）。
+#
+#   docker build -f deploy/Dockerfile.node -t starskiff .
+#
+# 默认 proxy 模式（SOCKS/端口转发，无需特权）。首次 enroll 需交互式生成
+# 身份：先 `docker run … enroll --server https://… --token skk_…` 写入
+# /data/starskiff.json，再 up。TUN 模式需宿主设备与权限：
+#   docker run --device /dev/net/tun --cap-add NET_ADMIN …
+FROM node:20-slim AS web
+WORKDIR /web
+COPY crates/skiff-server/web/package.json crates/skiff-server/web/package-lock.json ./
+RUN npm ci --no-fund --no-audit
+COPY crates/skiff-server/web/ ./
+RUN npm run build
+
+FROM rust:1-alpine AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY tests/ tests/
+COPY --from=web /web/dist crates/skiff-server/web/dist
+RUN cargo build --release -p skiff-node -q
+
+FROM alpine:3
+COPY --from=build /src/target/release/starskiff /app/starskiff
+VOLUME /data
+WORKDIR /data
+ENTRYPOINT ["/app/starskiff", "up", "-c", "/data/starskiff.json"]

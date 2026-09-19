@@ -1,5 +1,30 @@
-FROM debian:stable-slim
-COPY publish/linux-musl/starskiff-server /app/starskiff-server
+# starskiff-server 镜像（linux/amd64；与 Dockerfile.node 同构）。
+# 三阶段：web（管理页 dist，rust-embed 编译期嵌入）→ musl 静态二进制 →
+# alpine 运行时。完全自包含：docker build 不依赖任何预编译产物。
+#
+#   docker build -f deploy/Dockerfile.server -t starskiff-server .
+#
+# 多平台注意：仅 x86_64（musl 静态 ELF）。
+FROM node:20-slim AS web
+WORKDIR /web
+COPY crates/skiff-server/web/package.json crates/skiff-server/web/package-lock.json ./
+RUN npm ci --no-fund --no-audit
+COPY crates/skiff-server/web/ ./
+RUN npm run build
+
+FROM rust:1-alpine AS build
+WORKDIR /src
+# alpine 的 host triple 即 x86_64-unknown-linux-musl：默认 target 产出静态 ELF。
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY tests/ tests/
+COPY --from=web /web/dist crates/skiff-server/web/dist
+RUN cargo build --release -p skiff-server -q
+
+FROM alpine:3
+COPY --from=build /src/target/release/starskiff-server /app/starskiff-server
 EXPOSE 24930 24932/tcp 24931/udp
 VOLUME /data
+# 首次启动用 `docker run … init` 生成数据库并打印管理令牌（仅一次），
+# 之后长期 serve。
 ENTRYPOINT ["/app/starskiff-server", "serve", "--db", "/data/starskiff.sqlite"]

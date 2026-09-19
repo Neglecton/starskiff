@@ -25,6 +25,8 @@ pub struct PresenceRecord {
     pub restart_pending: bool,
     /// 节点心跳上报的运行模式（"tun"/"proxy"）——强制 join 预检用。
     pub mode: Option<skiff_core::models::ClientMode>,
+    /// 节点心跳上报的软件版本（展示用途，原样透传不比较）。
+    pub node_version: Option<String>,
 }
 
 impl PresenceRecord {
@@ -158,6 +160,9 @@ impl PresenceStore {
             }
             if let Some(mode) = &req.mode {
                 p.mode = Some(*mode);
+            }
+            if let Some(v) = &req.node_version {
+                p.node_version = Some(v.clone());
             }
         });
     }

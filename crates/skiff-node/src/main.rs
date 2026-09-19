@@ -262,6 +262,7 @@ async fn cmd_enroll(
         sign_pubkey: String::new(),
         dh_pubkey: String::new(),
         requested_ip: ip.clone(),
+        proto_version: Some(skiff_core::consts::PROTOCOL_VERSION),
     };
     // Build the identity first so we can submit real public keys.
     let keys = NodeKeys::generate();
@@ -271,6 +272,7 @@ async fn cmd_enroll(
         sign_pubkey: keys.sign_public_hex(),
         dh_pubkey: keys.dh_public_hex(),
         requested_ip: ip.clone(),
+        proto_version: Some(skiff_core::consts::PROTOCOL_VERSION),
     };
     let resp = control.enroll(&req).await.map_err(|e| anyhow!(e))?;
 

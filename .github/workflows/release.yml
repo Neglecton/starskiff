@@ -1,0 +1,147 @@
+# 发版工作流：tag v* 触发（或手动）。产物：
+#   - GitHub Release 资产：Windows zip / Linux musl tar.gz
+#   - GHCR 镜像（linux/amd64）：ghcr.io/<owner>/<repo>/starskiff-server 与 /starskiff
+#
+# 本地等价物：deploy/package.sh（二进制）与 deploy/Dockerfile.*（镜像）。
+# GHCR 推送用内置 GITHUB_TOKEN（permissions: packages:write），无需额外密钥。
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build admin UI
+        working-directory: crates/skiff-server/web
+        run: |
+          npm ci --no-fund --no-audit
+          npm run build
+      # release 构建经 rust-embed 编译期嵌入：真实 dist 必须先于 cargo 就位
+      # （入库的 web/dist/index.html 只是占位页）。
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: crates/skiff-server/web/dist/
+
+  linux:
+    runs-on: ubuntu-latest
+    needs: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: crates/skiff-server/web/dist
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: cargo-zigbuild
+        run: python -m pip install --user cargo-zigbuild ziglang
+      - name: Build (musl static)
+        run: cargo zigbuild --release --workspace --target x86_64-unknown-linux-musl
+      - name: Package
+        run: |
+          VER=${GITHUB_REF_NAME#v}
+          [ "$GITHUB_REF_TYPE" = "tag" ] || VER=$(cargo metadata --no-deps --format-version 1 | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)
+          mkdir -p pkg/starskiff-$VER-linux-x64
+          cp target/x86_64-unknown-linux-musl/release/starskiff \
+             target/x86_64-unknown-linux-musl/release/starskiff-server \
+             README.md pkg/starskiff-$VER-linux-x64/
+          (cd pkg && tar -czf starskiff-$VER-x86_64-linux-musl.tar.gz starskiff-$VER-linux-x64)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux
+          path: pkg/*.tar.gz
+
+  windows:
+    runs-on: windows-latest
+    needs: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: crates/skiff-server/web/dist
+      - uses: dtolnay/rust-toolchain@stable
+      # crt-static 已固化在 .cargo/config.toml，产出自包含 exe。
+      - name: Build
+        run: cargo build --release --workspace
+      - name: Package
+        shell: bash
+        run: |
+          VER=${GITHUB_REF_NAME#v}
+          [ "$GITHUB_REF_TYPE" = "tag" ] || VER=$(cargo metadata --no-deps --format-version 1 | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)
+          mkdir -p pkg/starskiff-$VER-windows-x64
+          cp target/release/starskiff.exe target/release/starskiff-server.exe \
+             native/wintun/wintun.dll README.md pkg/starskiff-$VER-windows-x64/
+          (cd pkg && powershell -NoProfile -Command \
+            "Compress-Archive -Path 'starskiff-$VER-windows-x64' -DestinationPath 'starskiff-$VER-x86_64-windows.zip' -Force")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows
+          path: pkg/*.zip
+
+  docker:
+    # 镜像多阶段自建 web/cargo，不依赖 web job 的 artifact——与其并行。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build & push images (linux/amd64)
+        run: |
+          REPO_LC=${GITHUB_REPOSITORY,,}
+          # tag 触发：版本 + latest；手动触发：short-sha（不标 latest）。
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            SUFFIX="${GITHUB_REF_NAME#v} latest"
+          else
+            SUFFIX="sha-${GITHUB_SHA::7}"
+          fi
+          for img in starskiff-server starskiff; do
+            TAG_ARGS=""
+            for s in $SUFFIX; do
+              TAG_ARGS="$TAG_ARGS -t ghcr.io/$REPO_LC/$img:$s"
+            done
+            echo "== push ghcr.io/$REPO_LC/$img =="
+            docker buildx build --platform linux/amd64 $TAG_ARGS \
+              -f "deploy/Dockerfile.$( [ $img = starskiff ] && echo node || echo server )" --push .
+          done
+      - name: Image reference summary
+        run: echo "镜像: ghcr.io/${GITHUB_REPOSITORY,,}/starskiff-server 与 /starskiff（linux/amd64）"
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [linux, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-linux
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-windows
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

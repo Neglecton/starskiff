@@ -99,5 +99,5 @@ tests/it              Harness（进程内 server+节点）+ mesh.rs 六场景
 - 前向保密：静态-静态 X25519（HKDF-SHA256），已知限制；Noise IK/密钥轮换是单独大改动。
 - TUN 仅 IPv4（非 IPv4 包直接丢弃是故意的）。
 - 客户端单网络。
-- **FLOW 无应用层确认/重传/重组**：TCP flow 走 UDP 路径（中继或直连 UDP）时丢包即静默损坏流；分块 ≤32KiB（FLOW_CHUNK）依赖 IP 分片，数据面 UDP socket 已扩 4MB 内核缓冲缓解突发丢弃。完整性敏感的 bulk 场景应 pin directTcp/relayTcp。协议级重传/拥塞控制是单独大改动。
+- **FLOW 无应用层重传（跳号断流自愈）**：DATA 帧带流内序号（flow 头 9B），UDP 路径丢块/乱序表现为序号跳号 → 立即 CLOSE 断流让上层 TCP 重连（**不再静默损坏流**）。DATA 分块按路径双档：UDP 路径 1200B（FLOW_CHUNK_UDP，密封后不分片）、TCP 路径 32KiB（FLOW_CHUNK），每块按对端当前路径动态重查（EngineShared::flow_chunk_for）。协议级重传/拥塞控制仍是单独大改动。
 - **无协议版本协商/能力位**：wire/中继版本不匹配静默丢弃（未上线、双端同仓同步升级，无降级需求）。上线对外发版前需重新评估（enroll/heartbeat 加 protoVersion + 诊断）。

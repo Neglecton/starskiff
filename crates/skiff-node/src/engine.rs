@@ -172,6 +172,28 @@ pub struct EngineShared {
 }
 
 impl EngineShared {
+    /// 按对端当前出口路径选 FLOW DATA 分块：UDP 路径（直连/中继）用
+    /// FLOW_CHUNK_UDP（密封后不分片——32KiB 分 ~23 片在公网丢包下丢失
+    /// 放大 ~23 倍）；TCP 路径用 FLOW_CHUNK 大块省开销。peer 未建立
+    /// （查不到）保守走小块——初期流量经中继 UDP 的概率高。
+    pub fn flow_chunk_for(&self, net_id: NetId, peer: u64) -> usize {
+        let udp_path = self
+            .peers
+            .get(&(net_id, peer))
+            .map(|p| {
+                matches!(
+                    p.value().path(),
+                    PathKind::DirectUdp | PathKind::RelayUdp
+                )
+            })
+            .unwrap_or(true);
+        if udp_path {
+            skiff_core::consts::FLOW_CHUNK_UDP
+        } else {
+            skiff_core::consts::FLOW_CHUNK
+        }
+    }
+
     /// Resolve a virtual IP to a peer across all networks (first hit wins;
     /// overlapping CIDRs are warned about at startup).
     pub fn peer_by_ip(&self, ip: Ipv4Addr) -> Option<(NetId, Arc<PeerSession>)> {
@@ -553,7 +575,22 @@ impl NodeEngine {
 
         let (flow_out_tx, mut flow_out_rx) = mpsc::unbounded_channel::<(NetId, u64, Vec<u8>)>();
         let networks: NetworksMap = Arc::new(DashMap::new());
-        let flows = FlowManager::new(flow_out_tx, Arc::clone(&networks), log.clone());
+        // chunk_hint 需要 shared，而 flows 又是 shared 的字段——OnceLock 打破
+        // 构造环：shared 构造完成后立刻填充；hint 的实际调用都发生在运行期。
+        let shared_cell: Arc<std::sync::OnceLock<Arc<EngineShared>>> =
+            Arc::new(std::sync::OnceLock::new());
+        let hint_cell = Arc::clone(&shared_cell);
+        let flows = FlowManager::new(
+            flow_out_tx,
+            Arc::clone(&networks),
+            log.clone(),
+            Arc::new(move |net, dev| {
+                hint_cell
+                    .get()
+                    .map(|s| s.flow_chunk_for(net, dev))
+                    .unwrap_or(skiff_core::consts::FLOW_CHUNK_UDP)
+            }),
+        );
         let (relay_tcp_tx, mut relay_tcp_rx) = mpsc::unbounded_channel::<RelayTcpOut>();
 
         let shared = Arc::new(EngineShared {
@@ -598,6 +635,7 @@ impl NodeEngine {
             stopped_tx: stopped_tx.clone(),
             stopped_rx,
         });
+        let _ = shared_cell.set(Arc::clone(&shared)); // chunk_hint 生效（见上方构造注释）
 
         // FetchConfigOrFail：服务端权威名单 → 逐网络配置（无限重试）。
         let configs = fetch_configs_or_fail(&shared).await;
@@ -786,6 +824,13 @@ impl NodeEngine {
                             // 全网刷新的开销可接受）。
                             let s = Arc::clone(&shared2);
                             tokio::spawn(async move {
+                                // WS 建立即重发中继注册：服务端重启会丢全部
+                                // 内存注册表，若只等心跳的每 2 tick（慢档
+                                // 30s），期间探测目标退化为对端私网地址
+                                //（公网无效）——连接建立是"服务端已就绪"
+                                // 的最可靠信号。
+                                s.udp.send_register();
+                                s.relay_tcp.keepalive().await;
                                 refresh_peers(&s).await;
                             });
                             // settings 推送是 at-most-once：连接（含重连）
@@ -1532,9 +1577,11 @@ pub async fn heartbeat_tick(shared: &Arc<EngineShared>) {
         settings_revision: Some(shared.applied_settings_revision.load(Ordering::Relaxed) as i64),
         restart_pending: Some(shared.restart_pending.load(Ordering::Relaxed)),
         mode: Some(mode_val),
+        proto_version: Some(skiff_core::consts::PROTOCOL_VERSION),
+        node_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
     match shared.control.heartbeat(&req).await {
-        Some(resp) => {
+        Ok(resp) => {
             if let Some(ep) = resp.observed_udp_endpoint {
                 *shared.observed_endpoint.lock().unwrap() = Some(ep);
             }
@@ -1553,9 +1600,9 @@ pub async fn heartbeat_tick(shared: &Arc<EngineShared>) {
                 ));
             }
         }
-        None => {
+        Err(e) => {
             (shared.log)(&format!(
-                "HEARTBEAT_ERR uptime_s={} err=request failed",
+                "HEARTBEAT_ERR uptime_s={} err={e}",
                 (unix_ms() - shared.started_ms) / 1000
             ));
         }
@@ -1633,24 +1680,39 @@ async fn probe_peer(shared: &Arc<EngineShared>, net_id: NetId, peer: Arc<PeerSes
         let endpoints = peer.endpoints.lock().unwrap().clone();
         try_direct_tcp_probe(shared, &peer, &endpoints).await;
     }
-    if path == PathKind::DirectUdp {
-        let dead_after = (skiff_core::consts::PEER_PING_INTERVAL
-            * skiff_core::consts::PEER_PING_MISS_LIMIT)
-            .as_millis() as i64;
+    if matches!(path, PathKind::DirectUdp | PathKind::DirectTcp) {
         // 直连升级只在收到 PONG 时发生（升级前必已写入 last_pong_ms），
-        // 因此 DirectUdp 路径下 last 恒 > 0；last==0 表示从未直连成功。
+        // 因此直连路径下 last 恒 > 0；last==0 表示从未直连成功。
         // 降级仅 Auto 允许（策略档保持 pin，靠丢帧+探测自愈）。
+        // DirectTcp 半开连接（NAT 静默丢映射：写内核缓冲不报错、读永不
+        // 返回）此前无任何降级路径，黑洞流量直到 TCP 重传超时（~15min）
+        // 且 conn 存在即跳过重探——同用 PONG 超时判定，30s 内回退中继。
         let last = peer.last_pong_ms.load(Ordering::Relaxed);
-        if last > 0 && now - last > dead_after && policy == PathPolicy::Auto {
+        if direct_path_dead(now, last) && policy == PathPolicy::Auto {
+            match path {
+                PathKind::DirectUdp => *peer.direct_endpoint.lock().unwrap() = None,
+                PathKind::DirectTcp => *peer.tcp_conn.lock().unwrap() = None, // drop 关 socket
+                _ => unreachable!(),
+            }
             *peer.current_path.lock().unwrap() = PathKind::RelayUdp;
-            *peer.direct_endpoint.lock().unwrap() = None;
             (shared.log)(&format!(
-                "PATH_DOWN peer={} net={} from=DirectUdp to=RelayUdp reason=timeout",
+                "PATH_DOWN peer={} net={} from={} to=RelayUdp reason=timeout",
                 peer.name(),
-                shared.network_name(&net_id)
+                shared.network_name(&net_id),
+                path.as_str()
             ));
         }
     }
+}
+
+/// 直连死亡判定（DirectUdp/DirectTcp 共用）：曾有 PONG（last > 0）且
+/// 超过 MISS_LIMIT × PING_INTERVAL 未应答。纯函数供单测（30s 阈值语义
+/// 由常量算出，勿内联重算散落多处）。
+fn direct_path_dead(now_ms: i64, last_pong_ms: i64) -> bool {
+    let dead_after = (skiff_core::consts::PEER_PING_INTERVAL
+        * skiff_core::consts::PEER_PING_MISS_LIMIT)
+        .as_millis() as i64;
+    last_pong_ms > 0 && now_ms - last_pong_ms > dead_after
 }
 
 /// 策略档丢帧计数 + 每 peer 60s 节流日志（脱离 &EngineShared 的任务上下
@@ -1926,5 +1988,16 @@ mod tests {
             rate_bps(Some((100, 100)), (50, 200), dt5),
             (None, Some(20))
         );
+    }
+
+    /// 直连死亡判定（DirectUdp/DirectTcp 共用）：从未 PONG 不判死；
+    /// MISS_LIMIT×PING_INTERVAL（30s）为阈值边界。
+    #[test]
+    fn direct_path_dead_threshold() {
+        let now = 1_000_000i64;
+        assert!(!direct_path_dead(now, 0), "从未收到 PONG（从未直连成功）不判死");
+        assert!(!direct_path_dead(now, now - 30_000), "恰在 30s 阈值上仍未死");
+        assert!(direct_path_dead(now, now - 30_001), "超过 30s 无 PONG 判死");
+        assert!(direct_path_dead(now, now - 15 * 60_000), "半开 15min 必死");
     }
 }

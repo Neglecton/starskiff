@@ -69,6 +69,10 @@ pub struct EnrollRequest {
     pub sign_pubkey: String,
     pub dh_pubkey: String,
     pub requested_ip: Option<String>,
+    /// 节点协议代次（consts::PROTOCOL_VERSION）；缺省宽容放行（旧形状），
+    /// 显式不匹配被服务端拒绝。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proto_version: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +158,14 @@ pub struct HeartbeatRequest {
     /// 非法值在反序列化即拒绝，杜绝字符串 match 吞合法值（AGENTS #21）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<ClientMode>,
+    /// 节点协议代次（同 EnrollRequest::proto_version）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proto_version: Option<u32>,
+    /// 节点软件版本（CARGO_PKG_VERSION，如 "0.0.1-alpha"）。展示用途：
+    /// 服务端原样透传不做比较——节点版本比服务端高同样上报/显示；
+    /// 兼容性判定归 protoVersion（协议代次），与 semver 解耦。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,6 +311,9 @@ pub struct AdminDevice {
     /// 失败对应的 revision。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settings_error_revision: Option<i64>,
+    /// 节点心跳上报的软件版本（原样透传，不做比较；从未上报/离线过则无）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,6 +330,9 @@ pub struct JoinRequest {
     /// Enroll token for the target network (may carry a cert fingerprint suffix).
     pub token: String,
     pub requested_ip: Option<String>,
+    /// 节点协议代次（同 EnrollRequest::proto_version）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proto_version: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -979,6 +997,19 @@ mod tests {
         let req: HeartbeatRequest = serde_json::from_str(r#"{"localAddrs":[]}"#).unwrap();
         assert!(req.paths.is_none());
         assert!(req.listen_udp_port.is_none());
+    }
+
+    /// 节点版本字段：缺省解析 None、None 写出省略、有值 round-trip
+    ///（服务端原样透传，节点版本比服务端高同样上报）。
+    #[test]
+    fn heartbeat_request_node_version_compat() {
+        let legacy: HeartbeatRequest = serde_json::from_str(r#"{"localAddrs":[]}"#).unwrap();
+        assert!(legacy.node_version.is_none());
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("nodeVersion"));
+        let with: HeartbeatRequest =
+            serde_json::from_str(r#"{"localAddrs":[],"nodeVersion":"0.0.1-alpha"}"#).unwrap();
+        assert_eq!(with.node_version.as_deref(), Some("0.0.1-alpha"));
+        assert!(serde_json::to_string(&with).unwrap().contains("\"nodeVersion\":\"0.0.1-alpha\""));
     }
 
     /// 速率字段（txBps/rxBps）与旧格式双向兼容：缺省解析为 None、

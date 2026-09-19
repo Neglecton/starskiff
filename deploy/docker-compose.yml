@@ -11,12 +11,18 @@ services:
       - starskiff-data:/data
     restart: unless-stopped
 
-  nodea:
-    image: debian:stable-slim
-    # Build the node binary first (deploy/build-linux-musl.sh), then mount it:
-    # volumes: [ "../publish/linux-musl/starskiff:/app/starskiff:ro" ]
-    command: ["/bin/true"]
-    restart: "no"
+  # 节点示例：先 enroll（交互生成身份写入卷），再 up。
+  #   docker compose run --rm node /app/starskiff enroll -c /data/starskiff.json \
+  #       --server https://<server>:24930 --token skk_…
+  # TUN 模式需追加：devices: ["/dev/net/tun:/dev/net/tun"] 与 cap_add: [NET_ADMIN]。
+  node:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.node
+    volumes:
+      - node-data:/data
+    restart: unless-stopped
 
 volumes:
   starskiff-data:
+  node-data:

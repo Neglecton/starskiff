@@ -138,7 +138,11 @@ impl ControlClient {
         resp.json().await.ok()
     }
 
-    pub async fn heartbeat(&self, req: &HeartbeatRequest) -> Option<HeartbeatResponse> {
+    /// 失败时 Err 携带状态码与服务端错误文本（如协议版本不匹配的诊断）。
+    pub async fn heartbeat(
+        &self,
+        req: &HeartbeatRequest,
+    ) -> Result<HeartbeatResponse, String> {
         let url = self.url("/api/heartbeat");
         let resp = self
             .http
@@ -147,11 +151,16 @@ impl ControlClient {
             .json(req)
             .send()
             .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
+            .map_err(|e| format!("请求失败: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+            return Err(body["error"]
+                .as_str()
+                .map(|e| format!("HTTP {status}: {e}"))
+                .unwrap_or_else(|| format!("HTTP {status}")));
         }
-        resp.json().await.ok()
+        resp.json().await.map_err(|e| format!("响应格式无效: {e}"))
     }
 
     pub async fn join(&self, token: &str, requested_ip: Option<&str>) -> Result<skiff_core::models::JoinResponse, String> {
@@ -160,7 +169,11 @@ impl ControlClient {
             .http
             .post(url)
             .bearer_auth(&self.device_token)
-            .json(&serde_json::json!({ "token": token, "requestedIp": requested_ip }))
+            .json(&serde_json::json!({
+                "token": token,
+                "requestedIp": requested_ip,
+                "protoVersion": skiff_core::consts::PROTOCOL_VERSION,
+            }))
             .send()
             .await
             .map_err(|e| format!("请求失败: {e}"))?;
@@ -221,12 +234,16 @@ impl ControlClient {
         let client = Arc::clone(self);
         let network = network.to_string();
         tokio::spawn(async move {
+            // 重连退避：连续失败 3s ×1.5 递增、封顶 30s（服务端长时间
+            // 宕机时避免固定 3s 高频重试）；连接曾建立（干净关闭）即重置。
+            let mut backoff = Duration::from_secs(3);
             while !*stopped.borrow() {
                 if client.run_ws_once(&network, &tx).await.is_ok() {
-                    // Socket closed cleanly; brief pause before reconnect.
+                    backoff = Duration::from_secs(1);
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 } else {
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff.mul_f32(1.5)).min(Duration::from_secs(30));
                 }
             }
         });
@@ -295,22 +312,47 @@ impl ControlClient {
         >,
         tx: mpsc::UnboundedSender<WsEvent>,
     ) -> anyhow::Result<()> {
+        use futures_util::SinkExt as _;
         use futures_util::StreamExt;
-        while let Some(msg) = ws.next().await {
-            match msg {
-                Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                    if let Ok(evt) = serde_json::from_str::<WsEvent>(&text)
-                        && tx.send(evt).is_err()
-                    {
-                        return Ok(()); // engine dropped the channel
+        // 半开检测：周期发 Ping（写路径同时 flush 库自动排队的服务端
+        // Pong），60s 无任何入帧（含 Pong）视为链路已死，主动断开重连
+        // ——否则 NAT 静默丢映射时事件通道黑洞，只剩 5s 轮询兜底。
+        let mut last_rx = std::time::Instant::now();
+        let mut ping = tokio::time::interval(Duration::from_secs(25));
+        ping.tick().await; // 首个 tick 立即完成，跳过
+        loop {
+            tokio::select! {
+                msg = ws.next() => {
+                    match msg {
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                            last_rx = std::time::Instant::now();
+                            if let Ok(evt) = serde_json::from_str::<WsEvent>(&text)
+                                && tx.send(evt).is_err()
+                            {
+                                return Ok(()); // engine dropped the channel
+                            }
+                        }
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => {
+                            return Ok(());
+                        }
+                        Some(Ok(_)) => last_rx = std::time::Instant::now(), // Ping/Pong 等
+                        Some(Err(_)) => return Ok(()),
                     }
                 }
-                Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => return Ok(()),
-                Ok(_) => {}
-                Err(_) => return Ok(()),
+                _ = ping.tick() => {
+                    if last_rx.elapsed() > Duration::from_secs(60) {
+                        return Ok(()); // 半开：60s 无任何入帧，重连
+                    }
+                    if ws
+                        .send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new().into()))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
             }
         }
-        Ok(())
     }
 }
 
@@ -337,5 +379,7 @@ pub fn paths_report(reports: Vec<PeerPathReport>) -> HeartbeatRequest {
         settings_revision: None,
         restart_pending: None,
         mode: None,
+        proto_version: None,
+        node_version: None,
     }
 }

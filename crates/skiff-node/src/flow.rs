@@ -49,6 +49,10 @@ struct FlowCtx {
     net_id: NetId,
     peer: u64,
     kind: FlowKind,
+    /// DATA 发送序号（按块递增，u32 自然回绕）与接收侧期待的下一序号
+    ///（跳号即断流，见 protocol/flow.rs 头注释）。
+    next_send_seq: std::sync::atomic::AtomicU32,
+    next_recv_seq: std::sync::atomic::AtomicU32,
 }
 
 pub struct FlowManager {
@@ -67,6 +71,9 @@ pub struct FlowManager {
     exposes: DashMap<NetId, Vec<ExposeRule>>,
     networks: NetworksMap,
     log: LogFn,
+    /// 按对端当前出口路径选 DATA 分块（UDP 路径 FLOW_CHUNK_UDP 不分片，
+    /// TCP 路径 FLOW_CHUNK 大块省开销）；engine 注入（查 peer current_path）。
+    chunk_hint: Arc<dyn Fn(NetId, u64) -> usize + Send + Sync>,
 }
 
 /// Send/control half of an initiated UDP flow (cheap to clone).
@@ -131,7 +138,12 @@ impl FlowStream {
 }
 
 impl FlowManager {
-    pub fn new(flow_out: FlowOut, networks: NetworksMap, log: LogFn) -> Arc<FlowManager> {
+    pub fn new(
+        flow_out: FlowOut,
+        networks: NetworksMap,
+        log: LogFn,
+        chunk_hint: Arc<dyn Fn(NetId, u64) -> usize + Send + Sync>,
+    ) -> Arc<FlowManager> {
         let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel::<(NetId, u64, Vec<u8>)>();
         let mgr = Arc::new(FlowManager {
             flows: DashMap::new(),
@@ -142,6 +154,7 @@ impl FlowManager {
             exposes: DashMap::new(),
             networks,
             log,
+            chunk_hint,
         });
         // 串行消费者：按入队顺序逐帧处理（保序）。
         let consumer = Arc::clone(&mgr);
@@ -187,7 +200,22 @@ impl FlowManager {
             ));
             return;
         }
-        let _ = self.flow_out.send((net_id, peer, flow::encode(flow_id, flags, payload)));
+        // DATA 帧按流递增分配序号（接收侧跳号断流的依据）；其余帧恒 0。
+        let seq = if flags == flow::FLAG_DATA {
+            self.flows
+                .get(&flow_id)
+                .map(|c| {
+                    c.value()
+                        .next_send_seq
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let _ = self
+            .flow_out
+            .send((net_id, peer, flow::encode(flow_id, seq, flags, payload)));
     }
 
     /// CLOSE 帧用 flow 所属网络的密钥密封（密钥以 networkId 为派生盐），
@@ -210,7 +238,13 @@ impl FlowManager {
         let (open_tx, open_rx) = oneshot::channel::<Result<(), String>>();
         self.flows.insert(
             flow_id,
-            FlowCtx { net_id, peer, kind: FlowKind::OutTcp { open_reply: Some(open_tx), data_tx } },
+            FlowCtx {
+                net_id,
+                peer,
+                kind: FlowKind::OutTcp { open_reply: Some(open_tx), data_tx },
+                next_send_seq: std::sync::atomic::AtomicU32::new(0),
+                next_recv_seq: std::sync::atomic::AtomicU32::new(0),
+            },
         );
         // Re-send the OPEN until answered: the first UDP-carried OPEN may be
         // lost (or the peer's relay registration may lag presence).
@@ -251,7 +285,16 @@ impl FlowManager {
     pub fn open_udp(self: &Arc<Self>, net_id: NetId, peer: u64, default_dest: &str) -> Option<UdpFlowHandle> {
         let flow_id = self.new_flow_id()?;
         let (tx, rx) = mpsc::channel::<(String, Vec<u8>)>(64);
-        self.flows.insert(flow_id, FlowCtx { net_id, peer, kind: FlowKind::Udp { outbound: true, datagram_tx: tx } });
+        self.flows.insert(
+            flow_id,
+            FlowCtx {
+                net_id,
+                peer,
+                kind: FlowKind::Udp { outbound: true, datagram_tx: tx },
+                next_send_seq: std::sync::atomic::AtomicU32::new(0),
+                next_recv_seq: std::sync::atomic::AtomicU32::new(0),
+            },
+        );
         self.send_frame(net_id, peer, flow_id, flow::FLAG_OPEN, &flow::build_open(flow::PROTO_UDP, default_dest));
         (self.log)(&format!("opening udp flow {flow_id} to peer {peer} {default_dest}"));
         Some(UdpFlowHandle {
@@ -284,13 +327,29 @@ impl FlowManager {
                 // 之间必须先 drop DashMap 引用（同 key 重叠会死锁，AGENTS #5）。
                 let kill = match self.flows.get(&msg.flow_id) {
                     Some(entry) => match &entry.value().kind {
-                        FlowKind::OutTcp { data_tx, .. } => {
-                            let _ = data_tx.send(msg.payload.to_vec());
-                            false
-                        }
-                        FlowKind::InTcp { writer, .. } => {
-                            let _ = writer.send(msg.payload.to_vec());
-                            false
+                        FlowKind::OutTcp { data_tx, .. } | FlowKind::InTcp { writer: data_tx, .. } => {
+                            // 序号校验（跳号即断流）：UDP 路径丢块/乱序留下的
+                            // 字节缺口无法恢复（无重传），与其静默损坏流，不如
+                            // 立即断开让上层 TCP 重连自愈。u32 自然回绕下
+                            // wrapping_add 保持连续性。
+                            let expected = entry
+                                .value()
+                                .next_recv_seq
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            if msg.seq != expected {
+                                (self.log)(&format!(
+                                    "FLOW_SEQ_GAP flow={} expect={} got={}，断流（丢块/乱序，上层将重连）",
+                                    msg.flow_id, expected, msg.seq
+                                ));
+                                true
+                            } else {
+                                entry
+                                    .value()
+                                    .next_recv_seq
+                                    .store(expected.wrapping_add(1), std::sync::atomic::Ordering::Relaxed);
+                                let _ = data_tx.send(msg.payload.to_vec());
+                                false
+                            }
                         }
                         FlowKind::Udp { .. } => true,
                     },
@@ -347,22 +406,28 @@ impl FlowManager {
                             // OPEN 会看到 InTcp 并补发 OPENED_OK，无副作用。
                             mgr.flows.insert(
                                 flow_id,
-                                FlowCtx { net_id, peer, kind: FlowKind::InTcp { writer: writer_tx } },
+                                FlowCtx {
+                                    net_id,
+                                    peer,
+                                    kind: FlowKind::InTcp { writer: writer_tx },
+                                    next_send_seq: std::sync::atomic::AtomicU32::new(0),
+                                    next_recv_seq: std::sync::atomic::AtomicU32::new(0),
+                                },
                             );
                             let _ = mgr.connecting.remove(&flow_id);
                             mgr.send_frame(net_id, peer, flow_id, flow::FLAG_OPENED_OK, b"");
                             tokio::spawn(local_writer_loop(wr, writer_rx));
-                            // 分块上限 FLOW_CHUNK：读到多少发多少，保证
-                            // 密封后不超 UDP 数据报上限（曾为 64KiB——
-                            // 密封后 65592 > 65507，UDP 路径必失败且静默）。
+                            // 分块按对端当前出口路径动态选择（每块重查：路径
+                            // 升级/降级时块大小随之切换）——UDP 路径小块不
+                            // 分片，TCP 路径大块省开销。读到多少发多少（≤块
+                            // 上限），统一走 send_frame 的超限守卫与 seq 分配。
                             let mut buf = vec![0u8; skiff_core::consts::FLOW_CHUNK];
                             loop {
-                                match rd.read(&mut buf).await {
+                                let chunk = (mgr.chunk_hint)(net_id, peer).min(buf.len());
+                                match rd.read(&mut buf[..chunk]).await {
                                     Ok(0) | Err(_) => break,
                                     Ok(n) => {
-                                        let _ = mgr
-                                            .flow_out
-                                            .send((net_id, peer, flow::encode(flow_id, flow::FLAG_DATA, &buf[..n])));
+                                        mgr.send_frame(net_id, peer, flow_id, flow::FLAG_DATA, &buf[..n]);
                                     }
                                 }
                             }
@@ -384,7 +449,16 @@ impl FlowManager {
                     return;
                 }
                 let (datagram_tx, _discard_rx) = mpsc::channel::<(String, Vec<u8>)>(1);
-                self.flows.insert(flow_id, FlowCtx { net_id, peer, kind: FlowKind::Udp { outbound: false, datagram_tx } });
+                self.flows.insert(
+                    flow_id,
+                    FlowCtx {
+                        net_id,
+                        peer,
+                        kind: FlowKind::Udp { outbound: false, datagram_tx },
+                        next_send_seq: std::sync::atomic::AtomicU32::new(0),
+                        next_recv_seq: std::sync::atomic::AtomicU32::new(0),
+                    },
+                );
                 self.send_frame(net_id, peer, flow_id, flow::FLAG_OPENED_OK, b"");
             }
             _ => {}
@@ -482,7 +556,7 @@ mod tests {
             NetId([3; 16]),
             NetworkCtx { name: "t".into(), cidr: None, self_ip: None, ip_map: Default::default() },
         );
-        (FlowManager::new(tx, networks, Arc::new(|_| {})), rx)
+        (FlowManager::new(tx, networks, Arc::new(|_| {}), Arc::new(|_, _| skiff_core::consts::FLOW_CHUNK)), rx)
     }
 
     /// 等待 flow_out 上出现指定 (flowId, flags) 的帧。
@@ -546,6 +620,7 @@ mod tests {
 
         let open = flow::encode(
             777,
+            0,
             flow::FLAG_OPEN,
             &flow::build_open(flow::PROTO_TCP, &format!("10.3.0.5:{port}")),
         );
@@ -556,5 +631,40 @@ mod tests {
         assert!(recv_flag(&mut rx, 777, flow::FLAG_OPENED_OK).await, "重复 OPEN 未补发应答");
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(accepted.load(Ordering::Relaxed), 1, "重复 OPEN 导致了多余的本地连接");
+    }
+
+    /// DATA 序号跳号即断流：UDP 路径丢块留下的缺口无法恢复（无重传），
+    /// 必须立即 CLOSE（上层 TCP 重连自愈）而不是继续投递损坏的字节流。
+    #[tokio::test]
+    async fn data_seq_gap_kills_flow() {
+        let (mgr, mut rx) = mk_mgr();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let net = NetId([3; 16]);
+        mgr.set_exposes(
+            net,
+            vec![ExposeRule { port, proto: skiff_core::models::ProtoKind::Tcp, dest: format!("127.0.0.1:{port}") }],
+        );
+        // 本地 echo 服务（保活写半，收到的数据回写由 reader 忽略）。
+        tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                drop(s);
+            }
+        });
+        let open = flow::encode(
+            888,
+            0,
+            flow::FLAG_OPEN,
+            &flow::build_open(flow::PROTO_TCP, &format!("10.3.0.5:{port}")),
+        );
+        mgr.on_frame(net, 42, &open).await;
+        assert!(recv_flag(&mut rx, 888, flow::FLAG_OPENED_OK).await, "OPEN 未应答");
+        // 连续 seq 0、1 正常投递；seq 3（跳过 2）→ 断流 + 回发 CLOSE。
+        mgr.on_frame(net, 42, &flow::encode(888, 0, flow::FLAG_DATA, b"a")).await;
+        mgr.on_frame(net, 42, &flow::encode(888, 1, flow::FLAG_DATA, b"b")).await;
+        assert!(mgr.flows.get(&888).is_some(), "连续 seq 不应断流");
+        mgr.on_frame(net, 42, &flow::encode(888, 3, flow::FLAG_DATA, b"d")).await;
+        assert!(mgr.flows.get(&888).is_none(), "跳号 DATA 应立即拆除流");
+        assert!(recv_flag(&mut rx, 888, flow::FLAG_CLOSE).await, "断流应回发 CLOSE 通知对端");
     }
 }

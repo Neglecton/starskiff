@@ -200,6 +200,13 @@ starskiff service stop && starskiff service remove
 - ACL / 访问控制、NAT 类型探测：数据库与 API 结构已预留，尚未实现
 - TUN 模式仅支持 IPv4；wintun.dll 使用其[预编译二进制许可](native/wintun/LICENSE.txt)分发
 
+## 发版与分发
+
+- **GitHub Actions**（`.github/workflows/release.yml`）：推 `v*` tag 触发——GitHub Release 资产（Windows zip / Linux musl tar.gz）+ GHCR 镜像 `ghcr.io/<owner>/<repo>/starskiff-server` 与 `/starskiff`（linux/amd64，tag 版本号 + latest；手动触发只推 `sha-<短哈希>`）。首次使用需在仓库 Package 设置里允许 Actions 写入（默认 GITHUB_TOKEN 即可推送）。
+- **本地封包**：`sh deploy/package.sh`（与 CI 同构；产物在 `target/dist/`）。
+- **Docker 自建**：`docker build -f deploy/Dockerfile.server|Dockerfile.node .`（多阶段自包含：容器内构建管理页与 musl 静态二进制，不依赖预编译产物）。节点容器首次需 `enroll` 写入 `/data/starskiff.json` 再 `up`；TUN 模式需 `--device /dev/net/tun --cap-add NET_ADMIN`。
+- 管理页「设备」页显示各节点上报的软件版本（原样透传，不比较高低；兼容性判定走协议代次 protoVersion）。
+
 ## 结构化日志
 
 `key=value` 一行一事件，便于 grep/jq 后处理：
@@ -290,6 +297,14 @@ cd deploy && docker compose up -d --build   # 服务器容器（数据卷 /data�
 - [ ] TLS 真链路：`https://` 首连（TOFU 写回 node.json）+ 令牌指纹 pin + 错误 pin 拒绝
 - [ ] 云安全组放行 24930-24933
 - [ ] master/worker：`starskiff up` 起的是 master（监督 `__worker` 子进程）；管理页「设备配置 → 重启节点」后 worker 退出码 3、master 立即拉起新 worker（改 socksListen 等重启类配置验证生效）；`taskkill /F` worker 后 master 退避重启；`service stop` / SIGTERM / Ctrl+C 优雅停止整套进程；Windows 服务在 worker 崩溃时保持 RUNNING（SCM 日志不被刷屏）、仅在 master 自身异常退出非 0 时触发 `sc failure`
+
+## 公网加固验证清单（半开链路/限流，无法自动化）
+
+- [ ] DirectTcp 半开降级：双节点 directTcp 建链后，在对端节点侧用防火墙规则静默丢弃该 TCP 流（模拟 NAT 丢映射，不要 RST）→ 发起端流量应在 ~30s 内 PATH_DOWN 降级中继（日志 `PATH_DOWN from=DirectTcp`），恢复放行后探测重建
+- [ ] TCP 中继往返检测：拔网线/断 VPN 模拟链路死亡 → 节点 RelayTcp 应在 ~90s 内断开并懒重连（服务端 120s 空闲回收兜底）
+- [ ] WS 半开：同样静默丢包场景下事件通道 ~60s 内重连（服务端 Ping / 客户端 Pong 超时）
+- [ ] 丢块断流：UDP 路径上用 tc/netem 注入丢包，SOCKS bulk 传输应表现为断开后客户端自动重连（连接级重试），而非返回损坏数据
+- [ ] 管理面限流：错误 token 连续 10 次后应 429（15 分钟），期间正确 token 也 429；`starskiff-server admin rotate` 后旧令牌失效、serve 启动日志无明文令牌
 
 ## 刻意不做（当前版本范围外）
 

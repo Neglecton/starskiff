@@ -2108,7 +2108,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "skiff-core"
-version = "0.1.0"
+version = "0.0.1-alpha"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -2129,7 +2129,7 @@ dependencies = [
 
 [[package]]
 name = "skiff-it"
-version = "0.1.0"
+version = "0.0.1-alpha"
 dependencies = [
  "anyhow",
  "hex",
@@ -2143,7 +2143,7 @@ dependencies = [
 
 [[package]]
 name = "skiff-node"
-version = "0.1.0"
+version = "0.0.1-alpha"
 dependencies = [
  "anyhow",
  "clap",
@@ -2167,7 +2167,7 @@ dependencies = [
 
 [[package]]
 name = "skiff-server"
-version = "0.1.0"
+version = "0.0.1-alpha"
 dependencies = [
  "anyhow",
  "axum",
