@@ -330,9 +330,12 @@ function edgeTooltip(e) {
   const nameOf = (id) => nodeById.value.get(id)?.name || id;
   const speed = (r) =>
     r && (r.txBps != null || r.rxBps != null) ? ` · ↑${fmtBps(r.txBps)} ↓${fmtBps(r.rxBps)}` : '';
-  const fmt = (r) =>
-    r ? `${r.path}${typeof r.rttMs === 'number' ? ` · ${r.rttMs}ms` : ''}${speed(r)}` : t('topology.noReport');
-  return `${nameOf(e.aId)} → ${nameOf(e.bId)}: ${fmt(e.aReport)}\n${nameOf(e.bId)} → ${nameOf(e.aId)}: ${fmt(e.bReport)}`;
+  // rxLoss 是接收方视角：A→B 方向的丢包取 B 的报告。
+  const loss = (receiver) =>
+    receiver && receiver.rxLoss != null ? ` · ${t('topology.loss')} ${fmtLoss(receiver.rxLoss)}` : '';
+  const fmt = (r, receiver) =>
+    r ? `${r.path}${typeof r.rttMs === 'number' ? ` · ${r.rttMs}ms` : ''}${speed(r)}${loss(receiver)}` : t('topology.noReport');
+  return `${nameOf(e.aId)} → ${nameOf(e.bId)}: ${fmt(e.aReport, e.bReport)}\n${nameOf(e.bId)} → ${nameOf(e.aId)}: ${fmt(e.bReport, e.aReport)}`;
 }
 
 function nodeTooltip(n) {
@@ -342,14 +345,15 @@ function nodeTooltip(n) {
 // Node focus side panel rows.
 const focusRows = computed(() => {
   if (selectedId.value === null) return [];
-  const me = nodeById.value.get(selectedId.value);
   const rows = [];
   for (const e of edges.value) {
     if (e.aId !== selectedId.value && e.bId !== selectedId.value) continue;
     const otherId = e.aId === selectedId.value ? e.bId : e.aId;
     const other = nodeById.value.get(otherId);
-    // 速率取选中节点自己方向的报告（该节点视角到对端的收发）。
+    // 速率/收向丢包取选中节点自己的报告；发向丢包取对端报告
+    // （rxLoss 语义 = 报告者收到的帧缺口，即"对端→报告者"方向）。
     const my = e.aId === selectedId.value ? e.aReport : e.bReport;
+    const theirs = e.aId === selectedId.value ? e.bReport : e.aReport;
     rows.push({
       name: other?.name || String(otherId),
       ip: other?.ip || '',
@@ -358,6 +362,8 @@ const focusRows = computed(() => {
       online: other?.online,
       txBps: my?.txBps ?? null,
       rxBps: my?.rxBps ?? null,
+      lossUp: theirs?.rxLoss ?? null,
+      lossDown: my?.rxLoss ?? null,
     });
   }
   rows.sort((x, y) => (x.rtt ?? 1e9) - (y.rtt ?? 1e9));
@@ -373,9 +379,17 @@ function fmtBps(v) {
   return `${(v / 1024 / 1024 / 1024).toFixed(1)}GB/s`;
 }
 
-function fmtSpeed(row) {
-  if (row.txBps == null && row.rxBps == null) return '—';
-  return `↑ ${fmtBps(row.txBps)} · ↓ ${fmtBps(row.rxBps)}`;
+// 万分比（0..=10000）→ 百分比文本；整数不带小数位；null → 占位。
+function fmtLoss(v) {
+  if (v == null) return '—';
+  const pct = v / 100;
+  return `${Number.isInteger(pct) ? pct : pct.toFixed(1)}%`;
+}
+
+// 双向丢包：`发向 · 收向`；两侧都无样本 → 占位。
+function fmtLossPair(up, down) {
+  if (up == null && down == null) return '—';
+  return `${fmtLoss(up)}·${fmtLoss(down)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -486,17 +500,33 @@ onBeforeUnmount(() => {
         <div class="topo-panel-title">
           {{ nodeById.get(selectedId)?.name }} — {{ t('topology.focusTitle') }}
         </div>
-        <div v-for="(row, i) in focusRows" :key="i" class="topo-panel-row">
-          <span class="dot" :class="row.online ? 'on' : 'off'" />
-          <span class="mono" style="min-width: 90px">{{ row.name }}</span>
-          <span class="mono muted" style="min-width: 90px">{{ row.ip }}</span>
-          <n-tag size="small" :bordered="false" :type="row.path.startsWith('Direct') ? 'success' : 'warning'">
-            {{ row.path }}
-          </n-tag>
-          <span class="row-metrics">
-            <span class="mono muted">{{ fmtSpeed(row) }}</span>
-            <span class="mono muted">{{ row.rtt !== null ? row.rtt + 'ms' : '—' }}</span>
-          </span>
+        <div v-for="(row, i) in focusRows" :key="i" class="topo-peer-card">
+          <div class="card-head">
+            <span class="dot" :class="row.online ? 'on' : 'off'" />
+            <span class="card-name mono" :title="row.name">{{ row.name }}</span>
+            <n-tag size="small" :bordered="false" :type="row.path.startsWith('Direct') ? 'success' : 'warning'">
+              {{ row.path }}
+            </n-tag>
+          </div>
+          <div class="card-ip mono muted">{{ row.ip }}</div>
+          <div class="card-metrics">
+            <div class="metric">
+              <span class="metric-label">{{ t('topology.txLabel') }}</span>
+              <span class="metric-value mono" :title="fmtBps(row.txBps)">{{ fmtBps(row.txBps) }}</span>
+            </div>
+            <div class="metric">
+              <span class="metric-label">{{ t('topology.rxLabel') }}</span>
+              <span class="metric-value mono" :title="fmtBps(row.rxBps)">{{ fmtBps(row.rxBps) }}</span>
+            </div>
+            <div class="metric" :title="t('topology.lossHint')">
+              <span class="metric-label">{{ t('topology.loss') }}</span>
+              <span class="metric-value mono">{{ fmtLossPair(row.lossUp, row.lossDown) }}</span>
+            </div>
+            <div class="metric">
+              <span class="metric-label">{{ t('topology.rttLabel') }}</span>
+              <span class="metric-value mono">{{ row.rtt !== null ? row.rtt + 'ms' : '—' }}</span>
+            </div>
+          </div>
         </div>
         <div v-if="!focusRows.length" class="muted" style="padding: 8px 2px">{{ t('topology.noPaths') }}</div>
       </div>
@@ -621,7 +651,7 @@ onBeforeUnmount(() => {
   position: absolute;
   top: 12px;
   right: 12px;
-  width: min(340px, calc(100% - 24px));
+  width: min(360px, calc(100% - 24px));
   max-height: calc(100% - 24px);
   overflow: auto;
   box-sizing: border-box;
@@ -638,27 +668,65 @@ onBeforeUnmount(() => {
   font-size: 13px;
 }
 
-.topo-panel-row {
+/* 每对端一张卡：头行（状态点+名称+路径标签）/ IP / 4 格指标。
+   长名称只在头行省略，永不挤压指标格。 */
+.topo-peer-card {
+  padding: 8px 0;
+}
+
+.topo-peer-card + .topo-peer-card {
+  border-top: 1px dashed var(--sk-border);
+}
+
+.card-head {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 0;
-  border-bottom: 1px dashed var(--sk-border);
-  font-size: 12px;
-  /* 面板窄（≤340px）：名称/IP/标签 + 指标组放不下时整组换行。 */
-  flex-wrap: wrap;
+  min-width: 0;
 }
 
-/* 速率 + RTT 作为一组靠右；行宽不足时整组换到下一行右对齐。 */
-.row-metrics {
-  margin-left: auto;
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
+.card-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.topo-panel-row:last-child { border-bottom: none; }
+.card-ip {
+  font-size: 11px;
+  margin: 2px 0 6px 16px;
+}
+
+.card-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.metric {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  padding: 5px 6px;
+  border-radius: 6px;
+  background: var(--sk-surface-soft);
+}
+
+.metric-label {
+  font-size: 10px;
+  color: var(--sk-text-muted);
+  white-space: nowrap;
+}
+
+.metric-value {
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 .dot {
   width: 8px;

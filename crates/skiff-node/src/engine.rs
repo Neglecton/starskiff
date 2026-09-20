@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -98,8 +98,18 @@ pub enum StopReason {
     Restart,
 }
 
-/// 心跳速率差分基线：device_id → 上次采样时累计 (tx,rx) 字节。
-type HbRateMap = HashMap<u64, (u64, u64)>;
+/// 心跳差分基线的每对端计数快照：字节速率（tx/rx）与帧缺口率
+/// （rx_seen/rx_lost，来自 wire 重放窗口统计）共用同一基线时钟。
+#[derive(Clone, Copy, Debug)]
+pub struct HbCounters {
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
+    pub rx_seen: u64,
+    pub rx_lost: u64,
+}
+
+/// 心跳差分基线：device_id → 上次采样时的累计计数快照。
+type HbRateMap = HashMap<u64, HbCounters>;
 
 pub struct EngineShared {
     pub cfg: Mutex<NodeConfig>,
@@ -142,6 +152,9 @@ pub struct EngineShared {
     /// 上次心跳的速率差分基线：每对端累计 (tx,rx) 快照 + 采样时刻。
     /// 每次心跳对差分得 txBps/rxBps 后整体替换；对端消失随之清理。
     pub hb_rate_baseline: Mutex<Option<(std::time::Instant, HbRateMap)>>,
+    /// 心跳失败日志节流（60s 一条 + 期间计数；差链路下不刷屏）与恢复补报。
+    pub hb_err_last_log_ms: AtomicI64,
+    pub hb_err_count: AtomicU64,
     /// 生效路径策略：对端覆盖 ?? 全局默认 ?? Auto（服务端托管，热生效，
     /// 每帧现读）。只决定本端出口；接收方全路径接收。
     pub path_policy: Mutex<PathPolicy>,
@@ -621,6 +634,8 @@ impl NodeEngine {
             restart_pending: AtomicBool::new(false),
             heartbeat_secs: AtomicU32::new(skiff_core::consts::HEARTBEAT_SLOW_SECS),
             hb_rate_baseline: Mutex::new(None),
+            hb_err_last_log_ms: AtomicI64::new(0),
+            hb_err_count: AtomicU64::new(0),
             path_policy: Mutex::new(PathPolicy::Auto),
             peer_policies: DashMap::new(),
             runtime_socks: Mutex::new(None),
@@ -1519,6 +1534,24 @@ fn rate_bps(
     (one(prev.0, cur.0, dt_ms), one(prev.1, cur.1, dt_ms))
 }
 
+/// 帧缺口率差分（纯函数，便于单测）：窗口内 Δlost / (Δseen + Δlost)，
+/// 万分比 0..=10000（即 100.00%）。无基线（首窗）/ 窗口内无任何帧
+/// （无样本，不代表 0 丢包）/ 计数回退（防御）→ 缺省。
+fn loss_permille(prev: Option<(u64, u64)>, cur: (u64, u64)) -> Option<u16> {
+    let (p_seen, p_lost) = prev?;
+    let (c_seen, c_lost) = cur;
+    if c_seen < p_seen || c_lost < p_lost {
+        return None;
+    }
+    let d_seen = c_seen - p_seen;
+    let d_lost = c_lost - p_lost;
+    let total = (d_seen + d_lost) as u128;
+    if total == 0 {
+        return None;
+    }
+    Some((d_lost as u128 * 10_000 / total) as u16)
+}
+
 /// 单次心跳（pub 供集成测试直接触发：速率差分/间隔建议的全链路断言）。
 pub async fn heartbeat_tick(shared: &Arc<EngineShared>) {
     // Only report peers we have actually interacted with (rtt recorded):
@@ -1544,22 +1577,32 @@ pub async fn heartbeat_tick(shared: &Arc<EngineShared>) {
                     return None;
                 }
                 let dev = p.key().1;
-                let cur = (
-                    p.value().tx_bytes.load(Ordering::Relaxed),
-                    p.value().rx_bytes.load(Ordering::Relaxed),
-                );
+                let sess = p.value();
+                // codec 统计读取是短临界区（拷贝两个 u64），不与任何锁重叠。
+                let (rx_seen, rx_lost) = sess.codec.lock().unwrap().stats();
+                let cur = HbCounters {
+                    tx_bytes: sess.tx_bytes.load(Ordering::Relaxed),
+                    rx_bytes: sess.rx_bytes.load(Ordering::Relaxed),
+                    rx_seen,
+                    rx_lost,
+                };
                 let (tx_bps, rx_bps) = match dt {
-                    Some(dt) => rate_bps(prev_map.get(&dev).copied(), cur, dt),
+                    Some(dt) => rate_bps(prev_map.get(&dev).map(|c| (c.tx_bytes, c.rx_bytes)), (cur.tx_bytes, cur.rx_bytes), dt),
                     None => (None, None),
                 };
+                let rx_loss = loss_permille(
+                    prev_map.get(&dev).map(|c| (c.rx_seen, c.rx_lost)),
+                    (cur.rx_seen, cur.rx_lost),
+                );
                 next_map.insert(dev, cur);
-                let path = p.value().path().as_str().to_string();
+                let path = sess.path().as_str().to_string();
                 Some(PeerPathReport {
                     device_id: dev.to_string(),
                     path,
                     rtt_ms: Some(rtt),
                     tx_bps,
                     rx_bps,
+                    rx_loss,
                 })
             })
             .collect();
@@ -1599,12 +1642,31 @@ pub async fn heartbeat_tick(shared: &Arc<EngineShared>) {
                     "心跳间隔 {was}s → {want}s（服务端建议，管理页查看时快档）"
                 ));
             }
+            // 失败后恢复：一次性补报（期间失败数在节流条目里留痕）。
+            let fails = shared.hb_err_count.swap(0, Ordering::Relaxed);
+            if fails > 0 {
+                (shared.log)(&format!(
+                    "HEARTBEAT_RECOVERED fails={fails}（链路恢复）"
+                ));
+            }
         }
         Err(e) => {
-            (shared.log)(&format!(
-                "HEARTBEAT_ERR uptime_s={} err={e}",
-                (unix_ms() - shared.started_ms) / 1000
-            ));
+            // 差链路下心跳失败可能每拍一条（曾刷屏）：60s 节流一条并携带
+            // 期间累计数，恢复时 HEARTBEAT_RECOVERED 补报闭合。
+            let fails = shared.hb_err_count.fetch_add(1, Ordering::Relaxed) + 1;
+            let now = unix_ms();
+            let last = shared.hb_err_last_log_ms.load(Ordering::Relaxed);
+            if now - last > 60_000
+                && shared
+                    .hb_err_last_log_ms
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                (shared.log)(&format!(
+                    "HEARTBEAT_ERR uptime_s={} fails={fails} err={e}",
+                    (now - shared.started_ms) / 1000
+                ));
+            }
         }
     }
 }
@@ -1988,6 +2050,26 @@ mod tests {
             rate_bps(Some((100, 100)), (50, 200), dt5),
             (None, Some(20))
         );
+    }
+
+    /// 帧缺口率差分：窗口数学与守护（无基线/无样本/计数回退）。
+    #[test]
+    fn loss_permille_math_and_guards() {
+        // 无基线（首个窗口）→ 缺省。
+        assert_eq!(loss_permille(None, (100, 5)), None);
+        // 窗口内无帧：无样本 ≠ 0 丢包，缺省。
+        assert_eq!(loss_permille(Some((100, 5)), (100, 5)), None);
+        // 100 收 0 丢 → 0；100 收 1 丢 → 1%（万分比 100）。
+        assert_eq!(loss_permille(Some((0, 0)), (100, 0)), Some(0));
+        // 101 帧丢 1 → 10000/101 = 99（整除向下取整）。
+        assert_eq!(loss_permille(Some((0, 0)), (100, 1)), Some(99));
+        // 25% 丢包边界：300 收 100 丢 → 2500。
+        assert_eq!(loss_permille(Some((0, 0)), (300, 100)), Some(2500));
+        // 全丢：0 收 50 丢 → 10000（100.00%）。
+        assert_eq!(loss_permille(Some((0, 0)), (0, 50)), Some(10_000));
+        // 计数回退（防御，正常单调递增）→ 缺省。
+        assert_eq!(loss_permille(Some((100, 5)), (90, 5)), None);
+        assert_eq!(loss_permille(Some((100, 5)), (100, 3)), None);
     }
 
     /// 直连死亡判定（DirectUdp/DirectTcp 共用）：从未 PONG 不判死；

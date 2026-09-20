@@ -97,6 +97,10 @@ struct CodecState {
     /// 最近 N 代 (bootNonce, 重放窗口)。当前代在队尾；旧代保留水位，
     /// 对端短暂消失后 peer 会话重建也不会丢窗口。
     generations: VecDeque<([u8; BOOT_NONCE_SIZE], ReplayWindow)>,
+    /// 已淘汰代的接收统计累计（帧数/缺口数），stats() 聚合时并入——
+    /// 丢包率差分窗口不应因代淘汰（对端多次重启）而丢失历史样本。
+    retired_seen: u64,
+    retired_lost: u64,
 }
 
 /// Per-peer, per-direction AEAD codec. Clone-safe: cloning shares no state.
@@ -115,7 +119,11 @@ impl PacketCodec {
             keys,
             boot_nonce,
             send_counter: 0,
-            state: Mutex::new(CodecState { generations: VecDeque::new() }),
+            state: Mutex::new(CodecState {
+                generations: VecDeque::new(),
+                retired_seen: 0,
+                retired_lost: 0,
+            }),
         }
     }
 
@@ -176,8 +184,12 @@ impl PacketCodec {
             Some(i) => i + 1 == state.generations.len(),
             None => {
                 state.generations.push_back((peer_boot, ReplayWindow::new()));
-                if state.generations.len() > BOOT_NONCE_GENERATIONS {
-                    state.generations.pop_front();
+                if state.generations.len() > BOOT_NONCE_GENERATIONS
+                    && let Some((_, retired)) = state.generations.pop_front()
+                {
+                    let (seen, lost) = retired.stats();
+                    state.retired_seen += seen;
+                    state.retired_lost += lost;
                 }
                 true
             }
@@ -193,6 +205,19 @@ impl PacketCodec {
             return None; // 当前代内重放
         }
         Some((frame.sender_id, frame.frame_type, plain))
+    }
+
+    /// 累计接收统计 (帧数, 永久缺口帧数)，跨代持续——心跳差分即得
+    /// 本方向帧缺口率（丢包率）。只读原子安全：不触碰密钥状态。
+    pub fn stats(&self) -> (u64, u64) {
+        let state = self.state.lock().unwrap();
+        let (mut seen, mut lost) = (state.retired_seen, state.retired_lost);
+        for (_, w) in &state.generations {
+            let (s, l) = w.stats();
+            seen += s;
+            lost += l;
+        }
+        (seen, lost)
     }
 }
 
@@ -416,6 +441,77 @@ mod tests {
         bad_ver[0] = WIRE_MAGIC;
         bad_ver[1] = WIRE_VERSION + 1;
         assert!(b.try_open(&bad_ver).is_none());
+    }
+
+    #[test]
+    fn gap_stats_reflect_dropped_frames() {
+        // 帧流丢中间一帧（counter 跳号）计入缺口；迟到补位撤回。
+        let (mut a, b) = codec_pair();
+        let f1 = a.seal(7, FRAME_DATA, b"1");
+        let f2 = a.seal(7, FRAME_DATA, b"2");
+        let f3 = a.seal(7, FRAME_DATA, b"3");
+        assert!(b.try_open(&f1).is_some());
+        assert!(b.try_open(&f3).is_some()); // f2 "丢失"
+        assert_eq!(b.stats(), (2, 1));
+        assert!(b.try_open(&f2).is_some()); // 迟到补位
+        assert_eq!(b.stats(), (3, 0));
+    }
+
+    #[test]
+    fn generation_switch_not_counted_as_gap() {
+        // 对端重启换 bootNonce：新代首包成为新水位，不得计成大跳缺口。
+        let a_secret = StaticSecret::random_from_rng(OsRng);
+        let b_secret = StaticSecret::random_from_rng(OsRng);
+        let a_pub = PublicKey::from(&a_secret);
+        let b_pub = PublicKey::from(&b_secret);
+        let net = [7u8; 16];
+        let ka = SessionKeys::derive(&a_secret.to_bytes(), &a_pub.to_bytes(), &b_pub.to_bytes(), &net)
+            .unwrap();
+        let kb = SessionKeys::derive(&b_secret.to_bytes(), &b_pub.to_bytes(), &a_pub.to_bytes(), &net)
+            .unwrap();
+
+        let ka_restart = ka.clone();
+        let mut a1 = PacketCodec::new(ka);
+        let b = PacketCodec::new(kb);
+        for i in 1..=3u64 {
+            assert!(b.try_open(&a1.seal(7, FRAME_DATA, &i.to_le_bytes())).is_some());
+        }
+        let mut a2 = PacketCodec::new(ka_restart); // 新代 counter 从 1 重新开始
+        for i in 1..=2u64 {
+            assert!(b.try_open(&a2.seal(7, FRAME_DATA, &i.to_le_bytes())).is_some());
+        }
+        assert_eq!(b.stats(), (5, 0));
+    }
+
+    #[test]
+    fn stats_survive_generation_eviction() {
+        // 旧代（含缺口）被代数上限淘汰后，统计并入 retired，差分口径不丢历史。
+        let a_secret = StaticSecret::random_from_rng(OsRng);
+        let b_secret = StaticSecret::random_from_rng(OsRng);
+        let a_pub = PublicKey::from(&a_secret);
+        let b_pub = PublicKey::from(&b_secret);
+        let net = [9u8; 16];
+        let ka = SessionKeys::derive(&a_secret.to_bytes(), &a_pub.to_bytes(), &b_pub.to_bytes(), &net)
+            .unwrap();
+        let kb = SessionKeys::derive(&b_secret.to_bytes(), &b_pub.to_bytes(), &a_pub.to_bytes(), &net)
+            .unwrap();
+
+        let mut a0 = PacketCodec::new(ka.clone());
+        let b = PacketCodec::new(kb);
+        let f1 = a0.seal(7, FRAME_DATA, b"1");
+        a0.seal(7, FRAME_DATA, b"2"); // f2 不发送：制造缺口
+        let f3 = a0.seal(7, FRAME_DATA, b"3");
+        assert!(b.try_open(&f1).is_some());
+        assert!(b.try_open(&f3).is_some()); // 缺口 1
+        assert_eq!(b.stats(), (2, 1));
+
+        // 超过 BOOT_NONCE_GENERATIONS 次重启，把首代淘汰出窗口。
+        for _ in 0..BOOT_NONCE_GENERATIONS {
+            let mut a = PacketCodec::new(ka.clone());
+            assert!(b.try_open(&a.seal(7, FRAME_DATA, b"x")).is_some());
+        }
+        // 首代 (2,1) + 32 个新代各 1 帧。
+        assert_eq!(b.stats(), (2 + BOOT_NONCE_GENERATIONS as u64, 1));
     }
 
     #[test]

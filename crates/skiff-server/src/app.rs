@@ -79,6 +79,9 @@ pub struct AppState {
     pub banned_until_ms: dashmap::DashMap<std::net::IpAddr, i64>,
     /// 当前 WS 事件连接数（并发上限守卫）。
     pub ws_conns: AtomicU64,
+    /// 心跳降档滞后计数：连续无观察的心跳次数（heartbeat_hint）。初值 2
+    /// = 冷启动即"已确认无人观察"（首次心跳直接常态档，不误给快档）。
+    pub observer_misses: std::sync::atomic::AtomicU32,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -167,6 +170,7 @@ pub async fn start(opts: ServerOptions) -> anyhow::Result<RunningServer> {
         auth_failures: dashmap::DashMap::new(),
         banned_until_ms: dashmap::DashMap::new(),
         ws_conns: AtomicU64::new(0),
+        observer_misses: std::sync::atomic::AtomicU32::new(2),
     });
 
     // Presence -> WS broadcast sidecar.
@@ -467,6 +471,22 @@ fn proto_version_reject(v: Option<u32>) -> Option<Response> {
     ))
 }
 
+/// 自适应心跳建议（纯函数，供单测）：**升档即时、降档滞后**——观察窗口
+/// 内命中 → 快档且 miss 清零；超窗首次 → miss 计 1 但**维持快档**（webui
+/// 轮询 5s 一次、单次网络抖动/浏览器后台节流造成的 10s+ 空窗不该把全网
+/// 心跳打回慢档再升回来——曾以 2-5s 周期在 15↔5 间震荡）；连续第二次
+/// 超窗才真正回落。真无人查看时回落延迟 ≤ 2 个心跳周期（≤30s）。
+fn heartbeat_hint(observer_age_ms: i64, misses: u32) -> (u32, u32) {
+    let observed = (0..=skiff_core::consts::ADMIN_OBSERVER_TTL_MS).contains(&observer_age_ms);
+    if observed {
+        (skiff_core::consts::HEARTBEAT_FAST_SECS, 0)
+    } else if misses < 1 {
+        (skiff_core::consts::HEARTBEAT_FAST_SECS, 1)
+    } else {
+        (skiff_core::consts::HEARTBEAT_SLOW_SECS, misses + 1)
+    }
+}
+
 fn extract_token(req: &Request<Body>) -> Option<String> {
     if let Some(auth) = req
         .headers()
@@ -755,17 +775,17 @@ async fn heartbeat(State(state): State<SharedState>, req: Request<Body>) -> Resp
         let _ = state.repo.mark_settings_applied(device.id, applied);
     }
     // 自适应心跳间隔：近期有管理端轮询 /admin/devices（有人在看管理页）
-    // → 建议快档，否则常态档。PRESENCE_TIMEOUT 是固定常量、与心跳频率
-    // 无关，快档不会收紧在线判定。建议随每次心跳响应重发（声明式），
-    // 观察结束/服务端重启后节点在一个周期内自然回落。
+    // → 建议快档，否则常态档；降档带滞后（连续 2 次无观察才回落，见
+    // heartbeat_hint）。PRESENCE_TIMEOUT 是固定常量、与心跳频率无关，
+    // 快档不会收紧在线判定。建议随每次心跳响应重发（声明式），观察
+    // 结束/服务端重启后节点在 ≤2 个周期内自然回落。
     let last_observe = state.last_admin_observe_ms.load(Ordering::Relaxed) as i64;
     let since_observe = unix_ms() - last_observe;
-    let observed = (0..=skiff_core::consts::ADMIN_OBSERVER_TTL_MS).contains(&since_observe);
-    let heartbeat_secs = if observed {
-        skiff_core::consts::HEARTBEAT_FAST_SECS
-    } else {
-        skiff_core::consts::HEARTBEAT_SLOW_SECS
-    };
+    let misses = state.observer_misses.load(Ordering::Relaxed);
+    let (heartbeat_secs, next_misses) = heartbeat_hint(since_observe, misses);
+    state
+        .observer_misses
+        .store(next_misses, Ordering::Relaxed);
     Json(HeartbeatResponse {
         observed_udp_endpoint: state.presence.observed_endpoint(device.id),
         heartbeat_secs,
@@ -1785,4 +1805,28 @@ async fn admin_index() -> Response {
 
 async fn admin_static(Path(path): Path<String>) -> Response {
     asset_response(&path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 心跳档位滞后（消除 15↔5 震荡）：窗口内命中即时升快档并清零；
+    /// 单次超窗维持快档（miss=1）；连续第二次超窗才回落；恢复观察即清零。
+    #[test]
+    fn heartbeat_hint_hysteresis() {
+        let ttl = skiff_core::consts::ADMIN_OBSERVER_TTL_MS;
+        let fast = skiff_core::consts::HEARTBEAT_FAST_SECS;
+        let slow = skiff_core::consts::HEARTBEAT_SLOW_SECS;
+        // 观察中：快档，misses 清零（无论历史 miss 多少）。
+        assert_eq!(heartbeat_hint(0, 0), (fast, 0));
+        assert_eq!(heartbeat_hint(ttl, 99), (fast, 0));
+        // 首次超窗：维持快档（容 webui 单次轮询抖动/后台节流空窗）。
+        assert_eq!(heartbeat_hint(ttl + 1, 0), (fast, 1));
+        // 连续第二次超窗：回落常态档。
+        assert_eq!(heartbeat_hint(ttl + 1, 1), (slow, 2));
+        // 抖动场景：超窗一次后恢复观察 → 清零，永不降档。
+        assert_eq!(heartbeat_hint(ttl + 1, 0), (fast, 1));
+        assert_eq!(heartbeat_hint(1000, 1), (fast, 0));
+    }
 }

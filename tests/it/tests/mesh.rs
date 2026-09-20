@@ -1051,10 +1051,15 @@ async fn same_device_across_two_networks_lands_in_right_session() {
     let ea = h.start_engine(&pa, |_| {}).await;
     let _eb = h.start_engine(&pb, |_| {}).await;
 
-    // A 在两网各看到 B 的独立会话且均在线。
-    h.until(|| {
-        ea.peers().iter().filter(|(_, p)| p.name() == "xdup-b").filter(|(_, p)| p.online()).count() == 2
-    })
+    // A 在两网各看到 B 的独立会话且均在线。双网会话收敛要跨两个探测
+    // 周期（5s/轮），全量并行满载下 15s 默认预算偶发不足——放宽到 30s
+    //（单跑 <1s 即收敛，不影响用例速度）。
+    h.until_with_timeout(
+        || {
+            ea.peers().iter().filter(|(_, p)| p.name() == "xdup-b").filter(|(_, p)| p.online()).count() == 2
+        },
+        Duration::from_secs(30),
+    )
     .await;
     let vips: Vec<(skiff_core::models::NetId, std::net::Ipv4Addr)> = ea
         .peers()

@@ -136,6 +136,11 @@ pub struct PeerPathReport {
     pub tx_bps: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rx_bps: Option<u64>,
+    /// 本心跳窗口内对端→本端方向的帧缺口率（万分比 0..=10000，即
+    /// 100.00%）。口径：wire 重放窗口推进时的跳号扣除迟到补位，含探测
+    /// 帧。窗口内无任何帧（无样本）或首个窗口（无基线）时缺省。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_loss: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
