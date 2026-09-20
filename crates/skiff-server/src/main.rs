@@ -143,6 +143,11 @@ enum DeviceCmd {
     Reconnect {
         id: u64,
     },
+    /// 重命名设备（其它节点秒级同步新名字）
+    Rename {
+        id: u64,
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -351,6 +356,7 @@ async fn cmd_admin(server: String, token: String, cmd: AdminCmd) -> anyhow::Resu
             },
             DeviceCmd::Restart { id } => cli.device_restart(id).await,
             DeviceCmd::Reconnect { id } => cli.device_reconnect(id).await,
+            DeviceCmd::Rename { id, name } => cli.device_rename(id, &name).await,
         },
         AdminCmd::Rotate => cli.rotate_token().await,
     }

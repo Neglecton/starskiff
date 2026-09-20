@@ -474,6 +474,18 @@ impl Repo {
         })
     }
 
+    /// 管理面重命名。返回 false = 设备不存在。名字唯一性不做约束
+    /// （与 enroll 一致：设备靠 id 区分，name 仅为展示标识）。
+    pub fn rename_device(&self, id: u64, name: &str) -> Result<bool, crate::db::DbError> {
+        self.db.with(|c| {
+            let n = c.execute(
+                "UPDATE devices SET name = ?1 WHERE id = ?2",
+                params![name, id as i64],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
     // enroll tokens ----------------------------------------------------------
 
     pub fn create_token(

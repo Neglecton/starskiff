@@ -385,6 +385,7 @@ fn router(state: SharedState) -> Router {
         .route("/admin/tokens/{token}", delete(admin_revoke_token))
         .route("/admin/devices", get(admin_list_devices))
         .route("/admin/devices/{id}", delete(admin_delete_device))
+        .route("/admin/devices/{id}/name", put(admin_device_rename))
         .route(
             "/admin/devices/{id}/settings",
             put(admin_put_device_settings).get(admin_get_device_settings),
@@ -1750,6 +1751,58 @@ async fn admin_set_ip(
         },
     );
     (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+}
+
+/// PUT /admin/devices/{id}/name —— 管理面重命名设备（body: {"name": ...}）。
+/// 校验与 enroll 一致（trim 后非空、原始长度 ≤64）；对设备所属每个网络
+/// 广播 PEERS_CHANGED，其它节点 refresh_peers 原位更新会话名（WS 推送
+/// 秒级生效，丢失时 5s 轮询兜底）。
+async fn admin_device_rename(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    req: Request<Body>,
+) -> Response {
+    if !state.auth_admin(&req) {
+        return err(StatusCode::UNAUTHORIZED, "鉴权失败：请检查管理员令牌");
+    }
+    let body = axum::body::to_bytes(req.into_body(), 64 * 1024)
+        .await
+        .unwrap_or_default();
+    let Ok(payload) = serde_json::from_slice::<RenameDeviceRequest>(&body) else {
+        return err(StatusCode::BAD_REQUEST, "invalid body");
+    };
+    let Ok(device_id) = id.parse::<u64>() else {
+        return err(StatusCode::BAD_REQUEST, "无效的设备 ID");
+    };
+    let name = payload.name.trim();
+    if name.is_empty() || payload.name.chars().count() > 64 {
+        return err(StatusCode::BAD_REQUEST, "设备名长度必须在 1..64 之间");
+    }
+    match state.repo.rename_device(device_id, name) {
+        Ok(true) => {
+            let networks: Vec<NetId> = state
+                .repo
+                .memberships_of_device(device_id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|m| m.network_id)
+                .collect();
+            for net in networks {
+                state.hub.broadcast_network(
+                    &net,
+                    WsEvent {
+                        event_type: ws_events::PEERS_CHANGED.to_string(),
+                        network_id: Some(net),
+                        device_id: Some(device_id),
+                        message: Some(name.to_string()),
+                    },
+                );
+            }
+            (StatusCode::OK, "OK").into_response()
+        }
+        Ok(false) => err(StatusCode::NOT_FOUND, "设备不存在"),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 // ---------------------------------------------------------------------------

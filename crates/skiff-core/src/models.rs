@@ -327,6 +327,13 @@ pub struct SetIpRequest {
     pub ip: String,
 }
 
+/// PUT /admin/devices/{id}/name — 管理面重命名设备。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameDeviceRequest {
+    pub name: String,
+}
+
 /// POST /api/join — an already-enrolled device joins another network using
 /// an enroll token (device-token authenticated).
 #[derive(Debug, Clone, Deserialize)]

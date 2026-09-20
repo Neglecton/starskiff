@@ -6,6 +6,7 @@ import {
   GitNetworkOutline,
   GlobeOutline,
   HardwareChipOutline,
+  PersonCircleOutline,
   PowerOutline,
   RefreshOutline,
   SaveOutline,
@@ -29,6 +30,9 @@ const acting = ref(false);
 // memberships 的 IP 行内编辑草稿（networkId → 值）。独立于 devices 数据：
 // pollStatus/load 重拉设备列表时未提交的输入不丢失。
 const ipDrafts = ref({});
+// 设备名草稿（null = 未编辑，展示 current.name）。设备页保持只读，
+// 重命名统一在本页。
+const nameDraft = ref(null);
 const allNetworks = ref([]);
 const joinNet = ref(null);
 const joinIp = ref('');
@@ -215,6 +219,30 @@ async function saveIp(net) {
   }
 }
 
+/// 重命名设备（服务端权威；其它节点经推送秒级同步）。长度校验在服务端
+/// （中文错误直出），前端只拦空值/未变更。
+function draftNameOf() {
+  return (nameDraft.value ?? '').trim();
+}
+
+async function saveName() {
+  if (!deviceId.value || acting.value) return;
+  const name = draftNameOf();
+  const cur = current.value?.name;
+  if (!name || name === cur) return;
+  acting.value = true;
+  try {
+    await api('PUT', `/admin/devices/${deviceId.value}/name`, { name });
+    message.success(t('settings.nameUpdated'));
+    nameDraft.value = null;
+    await load();
+  } catch (e) {
+    message.error(e.message);
+  } finally {
+    acting.value = false;
+  }
+}
+
 async function loadSettings() {
   if (!deviceId.value) return;
   loading.value = true;
@@ -268,6 +296,7 @@ async function loadSettings() {
 }
 
 watch(deviceId, (id) => {
+  nameDraft.value = null; // 切换设备丢弃未提交的名字草稿
   if (id) loadSettings();
 });
 
@@ -487,6 +516,41 @@ onMounted(load);
     <p v-if="!deviceId" class="empty-hint">{{ t('settings.pickDevice') }}</p>
 
     <template v-else>
+      <section class="sec">
+        <div class="sec-head">
+          <div class="sec-title">
+            <NIcon size="18"><PersonCircleOutline /></NIcon>
+            {{ t('settings.deviceInfo') }}
+          </div>
+        </div>
+        <div class="list-block">
+          <div class="info-row">
+            <span class="muted">{{ t('settings.deviceName') }}</span>
+            <n-input
+              size="small"
+              :value="nameDraft ?? current?.name"
+              :placeholder="t('devices.name')"
+              @update:value="(v) => (nameDraft = v)"
+              @keyup.enter="saveName"
+            />
+            <n-button
+              size="tiny"
+              tertiary
+              type="primary"
+              :disabled="!draftNameOf() || draftNameOf() === current?.name"
+              :loading="acting"
+              @click="saveName"
+            >
+              {{ t('settings.saveName') }}
+            </n-button>
+          </div>
+          <div class="info-row plain">
+            <span class="muted">{{ t('settings.deviceId') }}</span>
+            <span class="mono">{{ current?.id }}</span>
+          </div>
+        </div>
+      </section>
+
       <section class="sec">
         <div class="sec-head">
           <div class="sec-title">
@@ -965,6 +1029,19 @@ onMounted(load);
   grid-template-columns: 1fr auto;
   gap: 8px;
   align-items: center;
+}
+
+/* 设备信息行：标签定宽 + 内容自适应；plain 变体无操作列（只读展示）。 */
+.info-row {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  font-size: 13px;
+}
+
+.info-row.plain {
+  grid-template-columns: 76px minmax(0, 1fr);
 }
 
 .socks-grid {

@@ -355,6 +355,67 @@ async fn admin_ip_change_propagates_to_peers() {
     .await;
 }
 
+/// 管理面重命名：DB 即刻生效，PEERS_CHANGED 推送让对端会话秒级换名
+///（推送丢失由 5s 轮询兜底）；校验守护（空名/超长 400、不存在 404）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_rename_propagates_to_peers() {
+    let h = TestHarness::create().await;
+    let sa = h.enroll_node("ren-a", None).await;
+    let sb_path = h.enroll_node("ren-b", None).await;
+    let sb_id = h.device_id_of(&sb_path);
+    let ea = h.start_engine(&sa, |_| {}).await;
+    let _eb = h.start_engine(&sb_path, |_| {}).await;
+
+    h.until(|| ea.peers().iter().any(|(_, p)| p.name() == "ren-b")).await;
+
+    async fn put_name(h: &TestHarness, id: u64, name: &str) -> reqwest::Response {
+        h.admin
+            .put(format!("{}/admin/devices/{id}/name", h.base_url()))
+            .header("X-Admin-Token", &h.admin_token)
+            .json(&serde_json::json!({ "name": name }))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    // 守护：空名（trim 后）与超长（>64）拒绝。
+    assert_eq!(put_name(&h, sb_id, "   ").await.status(), 400);
+    assert_eq!(put_name(&h, sb_id, &"x".repeat(65)).await.status(), 400);
+    // 不存在的设备 404。
+    let missing = put_name(&h, 999_999, "ghost").await;
+    assert_eq!(missing.status(), 404);
+
+    // 正常重命名：A 的会话名更新（WS 推送，20s 预算含轮询兜底）。
+    assert_eq!(put_name(&h, sb_id, "ren-b-two").await.status(), 200);
+    h.until_with_timeout(
+        || {
+            ea.peers().iter().any(|(_, p)| p.name() == "ren-b-two")
+                && ea.peers().iter().all(|(_, p)| p.name() != "ren-b")
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+
+    // 管理面列表立即反映新名。
+    let list = h
+        .admin
+        .get(format!("{}/admin/devices", h.base_url()))
+        .header("X-Admin-Token", &h.admin_token)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let entry = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"].as_str() == Some(sb_id.to_string().as_str()))
+        .unwrap();
+    assert_eq!(entry["name"].as_str(), Some("ren-b-two"));
+}
+
 /// 服务端托管配置（DeviceSettings）：force 开关与 exposes 热生效；
 /// 重启类字段（socksListen）写入文件并置 restart_pending；整个 PUT 是
 /// 全量替换（未包含的字段回到未托管、沿用本地值）。

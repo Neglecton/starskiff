@@ -309,6 +309,24 @@ impl AdminCli {
         Ok(())
     }
 
+    /// 重命名设备（其它节点经 PEERS_CHANGED 推送秒级同步新名字）。
+    pub async fn device_rename(&self, id: u64, name: &str) -> anyhow::Result<()> {
+        let resp = self
+            .request(
+                reqwest::Method::PUT,
+                &format!("/admin/devices/{id}/name"),
+                Some(serde_json::json!({ "name": name })),
+            )
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("HTTP {status}: {text}");
+        }
+        println!("已重命名设备 {id} → {name}");
+        Ok(())
+    }
+
     /// 轮换管理令牌：新令牌仅打印一次，旧令牌（本命令所用）立即失效。
     pub async fn rotate_token(&self) -> anyhow::Result<()> {
         let v = self.get_json_by_method(reqwest::Method::POST, "/admin/rotate-token").await?;
